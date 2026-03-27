@@ -12,6 +12,57 @@ def main() -> int:
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
+    parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip used for handshake")
+    parser.add_argument(
+        "--bfpexp-flag-line",
+        type=int,
+        default=None,
+        help="Input GPIO line number: active during BFPEXP transmission",
+    )
+    parser.add_argument(
+        "--done-line",
+        type=int,
+        default=None,
+        help="Output GPIO line number: pulsed when 512 FFT bins are consumed",
+    )
+    parser.add_argument(
+        "--flag-active-low",
+        action="store_true",
+        help="Set when BFPEXP flag signal is active-low instead of active-high",
+    )
+    parser.add_argument(
+        "--wait-low-level",
+        action="store_true",
+        help="Wait for BFPEXP flag low level instead of requiring a falling edge",
+    )
+    parser.add_argument(
+        "--done-pulse-ms",
+        type=float,
+        default=0.5,
+        help="Done pulse width in milliseconds",
+    )
+    parser.add_argument(
+        "--handshake-timeout-ms",
+        type=float,
+        default=1000.0,
+        help="Timeout waiting for FFT window trigger in milliseconds",
+    )
+    parser.add_argument(
+        "--use-i2s-tags",
+        action="store_true",
+        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream",
+    )
+    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
+    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each word")
+    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value representing idle/no data")
+    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
+    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
+    parser.add_argument(
+        "--allow-fft-without-bfpexp",
+        action="store_true",
+        help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
+    )
     args = parser.parse_args()
 
     lock = threading.Lock()
@@ -23,6 +74,21 @@ def main() -> int:
         sample_rate=args.rate,
         frame_bins=args.frame_bins,
         useful_bins=args.useful_bins,
+        gpio_chip=args.gpio_chip,
+        bfpexp_flag_line=args.bfpexp_flag_line,
+        done_line=args.done_line,
+        flag_active_high=not args.flag_active_low,
+        done_pulse_seconds=max(0.0, args.done_pulse_ms / 1000.0),
+        handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
+        wait_for_flag_falling_edge=not args.wait_low_level,
+        use_i2s_tags=args.use_i2s_tags,
+        tag_shift=args.tag_shift,
+        tag_mask=args.tag_mask,
+        payload_bits=args.payload_bits,
+        tag_idle=args.tag_idle,
+        tag_bfpexp=args.tag_bfpexp,
+        tag_fft=args.tag_fft,
+        require_bfpexp_before_fft=not args.allow_fft_without_bfpexp,
     )
     rx = FPGAFFTReceiver(cfg)
     rx.start()

@@ -44,7 +44,7 @@ ensure_line "dtoverlay=${I2S_OVERLAY}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3 python3-pip python3-venv alsa-utils
+apt-get install -y python3 python3-pip python3-venv python3-gpiod alsa-utils
 
 if [[ ! -d "${PROJECT_DIR}/.venv" ]]; then
   python3 -m venv "${PROJECT_DIR}/.venv"
