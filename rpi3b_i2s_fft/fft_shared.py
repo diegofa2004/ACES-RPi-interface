@@ -15,7 +15,14 @@ class FFTSharedState:
         self.name = name
         self._owns = create
         if create:
-            self.shm = shared_memory.SharedMemory(name=name, create=True, size=_STRUCT.size)
+            try:
+                self.shm = shared_memory.SharedMemory(name=name, create=True, size=_STRUCT.size)
+            except FileExistsError:
+                # Recover from stale segments left behind by unclean shutdowns.
+                stale = shared_memory.SharedMemory(name=name, create=False)
+                stale.close()
+                stale.unlink()
+                self.shm = shared_memory.SharedMemory(name=name, create=True, size=_STRUCT.size)
             self.write(0, 0, 0, STATUS_NO_DATA)
         else:
             self.shm = shared_memory.SharedMemory(name=name, create=False)

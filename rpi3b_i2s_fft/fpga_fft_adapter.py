@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 
 @dataclass
 class FFTAdapterConfig:
-    device: str = "hw:0,0"
+    device: str = "hw:2,0"
     sample_rate: int = 48000
     frame_bins: int = 512
     useful_bins: int = 256
@@ -47,7 +47,6 @@ class FPGAFFTReceiver:
         self._line_request = None
         self._bfpexp_line = None
         self._done_line = None
-        self._fft_tag_seen = False
 
         payload_mask = (1 << self.cfg.payload_bits) - 1
         self._payload_mask = payload_mask
@@ -201,13 +200,11 @@ class FPGAFFTReceiver:
                 if waiting_for_start:
                     if kind == "bfpexp":
                         bfpexp_seen = True
-                        self._fft_tag_seen = False
                         continue
                     if kind == "fft":
                         if self.cfg.require_bfpexp_before_fft and not bfpexp_seen:
                             continue
                         waiting_for_start = False
-                        self._fft_tag_seen = True
                         fft_pairs.append(payload)
                         if len(fft_pairs) >= self.cfg.frame_bins:
                             return np.asarray(fft_pairs, dtype=np.int32)

@@ -1,4 +1,5 @@
 import argparse
+import os
 import threading
 import time
 from collections import deque
@@ -6,9 +7,12 @@ from collections import deque
 from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
 
 
+DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Feed analyzer buffers from FPGA I2S FFT stream.")
-    parser.add_argument("-D", "--device", default="hw:0,0", help="ALSA capture device")
+    parser.add_argument("-D", "--device", default=DEFAULT_AUDIO_DEVICE, help="ALSA capture device")
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")

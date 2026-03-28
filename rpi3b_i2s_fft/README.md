@@ -12,12 +12,18 @@ This folder configures Raspberry Pi OS for I2S capture and publishes latest FFT 
 - `fpga_fft_adapter.py`: converts FPGA complex FFT bins from I2S into magnitude bins + MFCC.
 - `analyzer_from_fpga_fft.py`: example loop that fills analyzer buffers from FPGA FFT stream.
 
-## Wiring (RPi as I2S master recommended)
+## Wiring (FPGA as I2S master - recommended for this project)
+
+- FPGA I2S `sck` output -> RPi GPIO18 (pin 12) `BCLK`
+- FPGA I2S `ws` output -> RPi GPIO19 (pin 35) `LRCLK/WS`
+- FPGA I2S `sd` output -> RPi GPIO20 (pin 38) `DIN`
+- GND <-> GND
+
+Alternative (RPi as I2S master):
 
 - RPi GPIO18 (pin 12) `BCLK` -> FPGA I2S `sck` input
 - RPi GPIO19 (pin 35) `LRCLK/WS` -> FPGA I2S `ws` input
 - FPGA I2S `sd` output -> RPi GPIO20 (pin 38) `DIN`
-- GND <-> GND
 
 Optional GPIO handshake wires (if used):
 
@@ -38,6 +44,10 @@ Electrical notes:
 
 ## Setup on Raspberry Pi
 
+For FPGA-master clocking, the Pi must be configured with an I2S/ALSA overlay that matches your hardware and supports external BCLK/LRCLK input.
+The setup script uses `I2S_OVERLAY` from environment (default is `googlevoicehat-soundcard`).
+If that default does not match your FPGA-master wiring, run setup with your own overlay value.
+
 ```bash
 cd rpi3b_i2s_fft
 chmod +x setup_rpi_i2s_fft.sh
@@ -50,13 +60,55 @@ Reboot after setup:
 sudo reboot
 ```
 
+How software uses GPIO18/GPIO19:
+
+- Python code does not bit-bang these pins.
+- Device-tree overlay enables the SoC I2S peripheral and maps GPIO18/19/20 to ALT functions.
+- ALSA `arecord` reads from the configured I2S capture device (`hw:2,0`).
+- In FPGA-master mode, FPGA drives BCLK and LRCLK; the Pi I2S peripheral samples data on GPIO20 using those clocks.
+
+Where these default pins come from:
+
+- Raspberry Pi SoC exposes the PCM/I2S peripheral on a standard pinmux mapping.
+- Overlays select that peripheral function, so GPIO18/19/20/21 become PCM_CLK/PCM_FS/PCM_DIN/PCM_DOUT.
+- This project uses GPIO18 (BCLK), GPIO19 (LRCLK), and GPIO20 (DIN) for capture.
+
+How to verify pin function and clock direction on-device:
+
+1. Confirm pinmux function (should show PCM/ALT function):
+
+```bash
+pinctrl get 18
+pinctrl get 19
+pinctrl get 20
+pinctrl get 21
+```
+
+2. Confirm overlay/device was loaded:
+
+```bash
+aplay -l
+arecord -l
+```
+
+3. Confirm clocks are actually present from FPGA (FPGA-master mode):
+
+- Use a scope/logic analyzer on GPIO18 (BCLK) and GPIO19 (LRCLK).
+- In FPGA-master mode, these clocks must be driven by FPGA while capture is active.
+- If clocks are missing, Pi cannot capture regardless of Python settings.
+
+Notes:
+
+- Linux pinmux reports function selection, not electrical "input/output" direction in the same way as regular GPIO.
+- In I2S mode, the peripheral role (master/slave) and external hardware determine who drives clocks.
+
 ## Run
 
 Start daemon (adjust `-D` after checking `arecord -l`):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_daemon.py -D hw:0,0 -r 48000
+.venv/bin/python fft_i2s_daemon.py -D hw:2,0 -r 48000
 ```
 
 In another shell, read latest values:
@@ -70,7 +122,7 @@ Log full stream while still updating shared memory:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_logger.py -D hw:0,0 -r 48000 --csv fft_capture.csv
+.venv/bin/python fft_i2s_logger.py -D hw:2,0 -r 48000 --csv fft_capture.csv
 ```
 
 ## Use from another Python program
@@ -119,7 +171,7 @@ Run the adapter example:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:0,0 -r 48000 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 --frame-bins 512 --useful-bins 256
 ```
 
 GPIO handshake mode (optional):
@@ -141,7 +193,7 @@ cd rpi3b_i2s_fft
 Example (line numbers are GPIO chip offsets):
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:0,0 -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 \
 	--frame-bins 512 --useful-bins 256 \
 	--bfpexp-flag-line 23 --done-line 24
 ```
@@ -171,7 +223,7 @@ Frame start logic in tagged mode:
 Example tagged mode run:
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:0,0 -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 \
 	--frame-bins 512 --useful-bins 256 \
 	--use-i2s-tags --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
 	--tag-idle 0 --tag-bfpexp 1 --tag-fft 2 \

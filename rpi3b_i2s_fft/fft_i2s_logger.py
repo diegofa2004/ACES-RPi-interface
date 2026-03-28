@@ -1,5 +1,6 @@
 import argparse
 import csv
+import os
 import signal
 import subprocess
 import sys
@@ -9,6 +10,9 @@ from typing import Optional
 import numpy as np
 
 from fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
+
+
+DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
 
 
 def build_arecord_cmd(device: str, rate: int) -> list:
@@ -32,7 +36,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Capture I2S FFT stream, log to CSV, and publish latest real/imag to shared memory."
     )
-    parser.add_argument("-D", "--device", default="hw:0,0", help="ALSA capture device (default: hw:0,0)")
+    parser.add_argument(
+        "-D",
+        "--device",
+        default=DEFAULT_AUDIO_DEVICE,
+        help=f"ALSA capture device (default: {DEFAULT_AUDIO_DEVICE})",
+    )
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate in Hz")
     parser.add_argument("--chunk-frames", type=int, default=256, help="Frames read per chunk")
     parser.add_argument("--shm-name", default=DEFAULT_SHM_NAME, help="Shared memory block name")
