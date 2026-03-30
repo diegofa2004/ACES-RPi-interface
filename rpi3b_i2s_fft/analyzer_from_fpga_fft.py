@@ -6,16 +6,23 @@ from collections import deque
 
 try:
     from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from .i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
 except ImportError:
     from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
 
 
-DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
+DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Feed analyzer buffers from FPGA I2S FFT stream.")
-    parser.add_argument("-D", "--device", default=DEFAULT_AUDIO_DEVICE, help="ALSA capture device")
+    parser.add_argument(
+        "-D",
+        "--device",
+        default=DEFAULT_AUDIO_DEVICE,
+        help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
+    )
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
@@ -81,13 +88,18 @@ def main() -> int:
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
 
+    try:
+        device = resolve_audio_device(args.device)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
     lock = threading.Lock()
     buffer2 = deque(maxlen=330)  # MFCC history (15 s equivalent windowing in original code)
     buffer4 = deque(maxlen=330)  # FFT magnitude history
 
     try:
         cfg = FFTAdapterConfig(
-            device=args.device,
+            device=device,
             sample_rate=args.rate,
             frame_bins=args.frame_bins,
             useful_bins=args.useful_bins,
@@ -117,6 +129,7 @@ def main() -> int:
         print(str(exc), flush=True)
         return 1
 
+    print("Using ALSA capture device:", device)
     print("Reading FPGA FFT stream from I2S...")
     print("Press Ctrl+C to stop")
 

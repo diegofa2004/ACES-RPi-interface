@@ -9,8 +9,10 @@ import numpy as np
 try:
     from .fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
     from .i2s_stream import (
+        AUTO_AUDIO_DEVICE,
         build_arecord_cmd,
         read_exactly,
+        resolve_audio_device,
         start_arecord_process,
         stop_process,
         trim_incomplete_frames,
@@ -18,15 +20,17 @@ try:
 except ImportError:
     from fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
     from i2s_stream import (
+        AUTO_AUDIO_DEVICE,
         build_arecord_cmd,
         read_exactly,
+        resolve_audio_device,
         start_arecord_process,
         stop_process,
         trim_incomplete_frames,
     )
 
 
-DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
+DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
 
 
 def main() -> int:
@@ -37,7 +41,7 @@ def main() -> int:
         "-D",
         "--device",
         default=DEFAULT_AUDIO_DEVICE,
-        help=f"ALSA capture device (default: {DEFAULT_AUDIO_DEVICE})",
+        help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
     )
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate in Hz")
     parser.add_argument("--chunk-frames", type=int, default=256, help="Frames read per chunk")
@@ -48,6 +52,11 @@ def main() -> int:
         parser.error("--rate must be positive")
     if args.chunk_frames <= 0:
         parser.error("--chunk-frames must be positive")
+
+    try:
+        device = resolve_audio_device(args.device)
+    except RuntimeError as exc:
+        parser.error(str(exc))
 
     bytes_per_frame = 8  # 2 channels x int32
     chunk_bytes = args.chunk_frames * bytes_per_frame
@@ -63,11 +72,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_stop)
     signal.signal(signal.SIGTERM, handle_stop)
 
-    cmd = build_arecord_cmd(args.device, args.rate)
+    cmd = build_arecord_cmd(device, args.rate)
+    print("Using ALSA capture device:", device, flush=True)
     print("Starting:", " ".join(cmd), flush=True)
 
     try:
-        proc = start_arecord_process(args.device, args.rate)
+        proc = start_arecord_process(device, args.rate)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         state.close()

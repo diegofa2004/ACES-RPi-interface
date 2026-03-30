@@ -6,10 +6,10 @@ from typing import Optional, Tuple
 import numpy as np
 
 try:
-    from .i2s_stream import build_arecord_cmd, start_arecord_process, stop_process
+    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
     from .spectral_features import build_dct_matrix, build_mel_filter
 except ImportError:
-    from i2s_stream import build_arecord_cmd, start_arecord_process, stop_process
+    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
     from spectral_features import build_dct_matrix, build_mel_filter
 
 try:
@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 
 @dataclass
 class FFTAdapterConfig:
-    device: str = "hw:2,0"
+    device: str = AUTO_AUDIO_DEVICE
     sample_rate: int = 48000
     frame_bins: int = 512
     useful_bins: int = 256
@@ -98,7 +98,7 @@ class FPGAFFTReceiver:
         if gpiod is None:
             raise RuntimeError(
                 "GPIO handshake requested but python gpiod is not installed. "
-                "Install python3-gpiod on the Raspberry Pi."
+                "Install python3-libgpiod on the Raspberry Pi."
             )
 
         chip = gpiod.Chip(self.cfg.gpio_chip)
@@ -344,10 +344,12 @@ class FPGAFFTReceiver:
         return None
 
     def start(self) -> None:
-        cmd = build_arecord_cmd(self.cfg.device, self.cfg.sample_rate)
+        resolved_device = resolve_audio_device(self.cfg.device)
+        self.cfg.device = resolved_device
+        cmd = build_arecord_cmd(resolved_device, self.cfg.sample_rate)
         self._byte_buffer.clear()
         try:
-            self._proc = start_arecord_process(self.cfg.device, self.cfg.sample_rate)
+            self._proc = start_arecord_process(resolved_device, self.cfg.sample_rate)
             self._setup_gpio()
         except Exception:
             if self._proc is not None:

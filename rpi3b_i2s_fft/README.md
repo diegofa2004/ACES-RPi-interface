@@ -56,8 +56,14 @@ chmod +x setup_rpi_i2s_fft.sh
 sudo ./setup_rpi_i2s_fft.sh
 ```
 
-The setup script creates `.venv` with `--system-site-packages`, so the `python3-gpiod`
+The setup script creates `.venv` with `--system-site-packages`, so the `python3-libgpiod`
 package installed by `apt` is also visible inside the project virtualenv.
+
+For Raspberry Pi 3 Model B specifically:
+
+- the PCM/I2S pins are the same GPIO18/GPIO19/GPIO20 mapping documented below
+- the ALSA card index is not stable, so this project now auto-detects the capture device instead of assuming `hw:2,0`
+- if auto-detection still picks the wrong source, run `arecord -l` and pass `-D hw:X,Y`
 
 Reboot after setup:
 
@@ -69,7 +75,7 @@ How software uses GPIO18/GPIO19:
 
 - Python code does not bit-bang these pins.
 - Device-tree overlay enables the SoC I2S peripheral and maps GPIO18/19/20 to ALT functions.
-- ALSA `arecord` reads from the configured I2S capture device (`hw:2,0`).
+- ALSA `arecord` reads from the configured I2S capture device (auto-detected by default).
 - In FPGA-master mode, FPGA drives BCLK and LRCLK; the Pi I2S peripheral samples data on GPIO20 using those clocks.
 
 Where these default pins come from:
@@ -87,6 +93,15 @@ pinctrl get 18
 pinctrl get 19
 pinctrl get 20
 pinctrl get 21
+```
+
+If `pinctrl` is not available on your Pi 3B image, use:
+
+```bash
+raspi-gpio get 18
+raspi-gpio get 19
+raspi-gpio get 20
+raspi-gpio get 21
 ```
 
 2. Confirm overlay/device was loaded:
@@ -109,12 +124,14 @@ Notes:
 
 ## Run
 
-Start daemon (adjust `-D` after checking `arecord -l`):
+Start daemon:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_daemon.py -D hw:2,0 -r 48000
+.venv/bin/python fft_i2s_daemon.py -r 48000
 ```
+
+If the wrong capture card is selected, inspect `arecord -l` and rerun with `-D hw:X,Y`.
 
 In another shell, read latest values:
 
@@ -127,7 +144,7 @@ Log full stream while still updating shared memory:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_logger.py -D hw:2,0 -r 48000 --csv fft_capture.csv
+.venv/bin/python fft_i2s_logger.py -r 48000 --csv fft_capture.csv
 ```
 
 ## Use from another Python program
@@ -182,7 +199,7 @@ Run the adapter example:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py -r 48000 --frame-bins 512 --useful-bins 256
 ```
 
 GPIO handshake mode (optional):
@@ -194,7 +211,8 @@ GPIO handshake mode (optional):
 Dependency note for handshake mode:
 
 - GPIO mode requires Python `gpiod` module support at runtime.
-- The setup script already installs `python3-gpiod` and exposes it inside `.venv`.
+- On Raspberry Pi OS / Debian, the apt package is `python3-libgpiod`.
+- The setup script already installs `python3-libgpiod` and exposes it inside `.venv`.
 - If you use a custom virtualenv and import still fails, install it inside that env:
 
 ```bash
@@ -205,7 +223,7 @@ cd rpi3b_i2s_fft
 Example (line numbers are GPIO chip offsets):
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -r 48000 \
 	--frame-bins 512 --useful-bins 256 \
 	--bfpexp-flag-line 23 --done-line 24
 ```
@@ -235,7 +253,7 @@ Frame start logic in tagged mode:
 Example tagged mode run:
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -D hw:2,0 -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -r 48000 \
 	--frame-bins 512 --useful-bins 256 \
 	--use-i2s-tags --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
 	--tag-idle 0 --tag-bfpexp 1 --tag-fft 2 \
