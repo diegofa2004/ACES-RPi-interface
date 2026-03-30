@@ -11,6 +11,8 @@ This folder configures Raspberry Pi OS for I2S capture and publishes latest FFT 
 - `fft_shared.py`: shared-memory API used by other Python programs.
 - `fpga_fft_adapter.py`: converts FPGA complex FFT bins from I2S into magnitude bins + MFCC.
 - `analyzer_from_fpga_fft.py`: example loop that fills analyzer buffers from FPGA FFT stream.
+- `i2s_stream.py`: shared helpers for `arecord` startup, exact reads, and clean shutdown.
+- `spectral_features.py`: lightweight mel-filter and DCT helpers used for MFCC generation.
 
 ## Wiring (FPGA as I2S master - recommended for this project)
 
@@ -53,6 +55,9 @@ cd rpi3b_i2s_fft
 chmod +x setup_rpi_i2s_fft.sh
 sudo ./setup_rpi_i2s_fft.sh
 ```
+
+The setup script creates `.venv` with `--system-site-packages`, so the `python3-gpiod`
+package installed by `apt` is also visible inside the project virtualenv.
 
 Reboot after setup:
 
@@ -127,8 +132,11 @@ cd rpi3b_i2s_fft
 
 ## Use from another Python program
 
+If you import from outside this folder, add `submodules/ACES-RPi-interface` to `PYTHONPATH`
+or otherwise make the package parent directory visible to Python.
+
 ```python
-from fft_shared import FFTSharedState
+from rpi3b_i2s_fft.fft_shared import FFTSharedState
 
 state = FFTSharedState(name="fft_i2s_latest", create=False)
 item = state.read()
@@ -167,6 +175,9 @@ With FPGA FFT over I2S, use this pipeline instead:
 - magnitude bins `sqrt(real^2 + imag^2)`
 - MFCC from magnitude bins
 
+MFCC generation is implemented locally with `numpy`, so this project no longer depends
+on `librosa` or `scipy` just to build the mel filterbank and DCT basis.
+
 Run the adapter example:
 
 ```bash
@@ -183,7 +194,8 @@ GPIO handshake mode (optional):
 Dependency note for handshake mode:
 
 - GPIO mode requires Python `gpiod` module support at runtime.
-- If using the project virtualenv and import fails, install it inside `.venv`:
+- The setup script already installs `python3-gpiod` and exposes it inside `.venv`.
+- If you use a custom virtualenv and import still fails, install it inside that env:
 
 ```bash
 cd rpi3b_i2s_fft

@@ -4,7 +4,10 @@ import threading
 import time
 from collections import deque
 
-from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+try:
+    from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+except ImportError:
+    from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
@@ -69,33 +72,50 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.rate <= 0:
+        parser.error("--rate must be positive")
+    if args.frame_bins <= 0:
+        parser.error("--frame-bins must be positive")
+    if not 2 <= args.useful_bins <= args.frame_bins:
+        parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
+    if args.payload_bits <= 0:
+        parser.error("--payload-bits must be positive")
+
     lock = threading.Lock()
     buffer2 = deque(maxlen=330)  # MFCC history (15 s equivalent windowing in original code)
     buffer4 = deque(maxlen=330)  # FFT magnitude history
 
-    cfg = FFTAdapterConfig(
-        device=args.device,
-        sample_rate=args.rate,
-        frame_bins=args.frame_bins,
-        useful_bins=args.useful_bins,
-        gpio_chip=args.gpio_chip,
-        bfpexp_flag_line=args.bfpexp_flag_line,
-        done_line=args.done_line,
-        flag_active_high=not args.flag_active_low,
-        done_pulse_seconds=max(0.0, args.done_pulse_ms / 1000.0),
-        handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
-        wait_for_flag_falling_edge=not args.wait_low_level,
-        use_i2s_tags=args.use_i2s_tags,
-        tag_shift=args.tag_shift,
-        tag_mask=args.tag_mask,
-        payload_bits=args.payload_bits,
-        tag_idle=args.tag_idle,
-        tag_bfpexp=args.tag_bfpexp,
-        tag_fft=args.tag_fft,
-        require_bfpexp_before_fft=not args.allow_fft_without_bfpexp,
-    )
+    try:
+        cfg = FFTAdapterConfig(
+            device=args.device,
+            sample_rate=args.rate,
+            frame_bins=args.frame_bins,
+            useful_bins=args.useful_bins,
+            gpio_chip=args.gpio_chip,
+            bfpexp_flag_line=args.bfpexp_flag_line,
+            done_line=args.done_line,
+            flag_active_high=not args.flag_active_low,
+            done_pulse_seconds=max(0.0, args.done_pulse_ms / 1000.0),
+            handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
+            wait_for_flag_falling_edge=not args.wait_low_level,
+            use_i2s_tags=args.use_i2s_tags,
+            tag_shift=args.tag_shift,
+            tag_mask=args.tag_mask,
+            payload_bits=args.payload_bits,
+            tag_idle=args.tag_idle,
+            tag_bfpexp=args.tag_bfpexp,
+            tag_fft=args.tag_fft,
+            require_bfpexp_before_fft=not args.allow_fft_without_bfpexp,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     rx = FPGAFFTReceiver(cfg)
-    rx.start()
+    try:
+        rx.start()
+    except RuntimeError as exc:
+        print(str(exc), flush=True)
+        return 1
 
     print("Reading FPGA FFT stream from I2S...")
     print("Press Ctrl+C to stop")

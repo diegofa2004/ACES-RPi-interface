@@ -42,7 +42,7 @@ echo "Backup created at ${BACKUP_FILE}"
 
 ensure_line() {
   local line="$1"
-  if ! grep -Eq "^${line}$" "${CONFIG_FILE}"; then
+  if ! grep -Fqx "${line}" "${CONFIG_FILE}"; then
     echo "${line}" >> "${CONFIG_FILE}"
     echo "Added: ${line}"
   else
@@ -59,11 +59,21 @@ apt-get update
 apt-get install -y python3 python3-pip python3-venv python3-gpiod alsa-utils
 
 if [[ ! -d "${PROJECT_DIR}/.venv" ]]; then
-  python3 -m venv "${PROJECT_DIR}/.venv"
+  python3 -m venv --system-site-packages "${PROJECT_DIR}/.venv"
 fi
 
 "${PROJECT_DIR}/.venv/bin/pip" install --upgrade pip
 "${PROJECT_DIR}/.venv/bin/pip" install -r "${PROJECT_DIR}/requirements.txt"
+
+if ! "${PROJECT_DIR}/.venv/bin/python" -c "import gpiod" >/dev/null 2>&1; then
+  cat <<'EOF'
+
+Warning:
+The GPIO Python module is not visible inside .venv.
+If you need BFPEXP/DONE handshake support, recreate .venv with --system-site-packages
+or install gpiod inside the virtualenv manually.
+EOF
+fi
 
 cat <<EOF
 

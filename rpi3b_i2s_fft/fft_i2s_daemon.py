@@ -1,37 +1,38 @@
 import argparse
 import os
 import signal
-import subprocess
 import sys
 from typing import Optional
 
 import numpy as np
 
-from fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
+try:
+    from .fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
+    from .i2s_stream import (
+        build_arecord_cmd,
+        read_exactly,
+        start_arecord_process,
+        stop_process,
+        trim_incomplete_frames,
+    )
+except ImportError:
+    from fft_shared import DEFAULT_SHM_NAME, FFTSharedState, STATUS_NO_DATA, STATUS_OK
+    from i2s_stream import (
+        build_arecord_cmd,
+        read_exactly,
+        start_arecord_process,
+        stop_process,
+        trim_incomplete_frames,
+    )
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "hw:2,0")
 
 
-def build_arecord_cmd(device: str, rate: int) -> list:
-    return [
-        "arecord",
-        "-q",
-        "-D",
-        device,
-        "-f",
-        "S32_LE",
-        "-c",
-        "2",
-        "-r",
-        str(rate),
-        "-t",
-        "raw",
-    ]
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read I2S stereo stream and publish latest real/imag via shared memory.")
+    parser = argparse.ArgumentParser(
+        description="Read I2S stereo stream and publish latest real/imag via shared memory."
+    )
     parser.add_argument(
         "-D",
         "--device",
@@ -42,6 +43,11 @@ def main() -> int:
     parser.add_argument("--chunk-frames", type=int, default=256, help="Frames read per chunk")
     parser.add_argument("--shm-name", default=DEFAULT_SHM_NAME, help="Shared memory block name")
     args = parser.parse_args()
+
+    if args.rate <= 0:
+        parser.error("--rate must be positive")
+    if args.chunk_frames <= 0:
+        parser.error("--chunk-frames must be positive")
 
     bytes_per_frame = 8  # 2 channels x int32
     chunk_bytes = args.chunk_frames * bytes_per_frame
@@ -60,26 +66,30 @@ def main() -> int:
     cmd = build_arecord_cmd(args.device, args.rate)
     print("Starting:", " ".join(cmd), flush=True)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = start_arecord_process(args.device, args.rate)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        state.close()
+        state.unlink()
+        return 1
 
     try:
         while not stop:
             if proc.stdout is None:
                 raise RuntimeError("arecord stdout pipe is unavailable")
 
-            raw = proc.stdout.read(chunk_bytes)
+            raw = trim_incomplete_frames(read_exactly(proc.stdout, chunk_bytes), bytes_per_frame)
             if not raw:
                 state.write(0, 0, seq, STATUS_NO_DATA)
+                seq = (seq + 1) & 0xFFFFFFFF
                 if proc.poll() is not None:
-                    err = b""
-                    if proc.stderr is not None:
-                        err = proc.stderr.read()
-                    print("arecord exited. stderr:", err.decode(errors="ignore"), file=sys.stderr)
+                    print(f"arecord exited with code {proc.returncode}", file=sys.stderr)
                     return 1
                 continue
 
             data = np.frombuffer(raw, dtype=np.int32)
-            if data.size < 2:
+            if data.size < 2 or (data.size % 2) != 0:
                 continue
 
             stereo = data.reshape(-1, 2)
@@ -91,12 +101,7 @@ def main() -> int:
             seq = (seq + 1) & 0xFFFFFFFF
 
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        stop_process(proc)
         state.close()
         state.unlink()
 

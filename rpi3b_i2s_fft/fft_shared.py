@@ -32,7 +32,10 @@ class FFTSharedState:
 
     def unlink(self) -> None:
         if self._owns:
-            self.shm.unlink()
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
 
     def write(self, real: int, imag: int, seq: int, status: int = STATUS_OK) -> None:
         self.shm.buf[:_STRUCT.size] = _STRUCT.pack(int(real), int(imag), int(seq), int(status))
