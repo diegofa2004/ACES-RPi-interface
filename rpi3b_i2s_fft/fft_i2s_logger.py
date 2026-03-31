@@ -33,6 +33,27 @@ except ImportError:
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
 
 
+def decode_stereo_frames(raw: bytes) -> np.ndarray:
+    data = np.frombuffer(raw, dtype=np.int32)
+    if data.size < 2 or (data.size % 2) != 0:
+        return np.empty((0, 2), dtype=np.int32)
+    return data.reshape(-1, 2)
+
+
+def write_csv_rows(
+    writer: csv.writer,
+    stereo: np.ndarray,
+    seq_start: int,
+    *,
+    timestamp_ns_fn=time.time_ns,
+) -> int:
+    seq = seq_start
+    for row in stereo:
+        writer.writerow([timestamp_ns_fn(), seq, int(row[0]), int(row[1])])
+        seq = (seq + 1) & 0xFFFFFFFF
+    return seq
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Capture I2S FFT stream and log raw real/imag pairs to CSV."
@@ -99,17 +120,11 @@ def main() -> int:
 
                     continue
 
-                data = np.frombuffer(raw, dtype=np.int32)
-                if data.size < 2 or (data.size % 2) != 0:
+                stereo = decode_stereo_frames(raw)
+                if stereo.size == 0:
                     continue
 
-                stereo = data.reshape(-1, 2)
-                for row in stereo:
-                    real = int(row[0])
-                    imag = int(row[1])
-                    writer.writerow([time.time_ns(), seq, real, imag])
-                    seq = (seq + 1) & 0xFFFFFFFF
-
+                seq = write_csv_rows(writer, stereo, seq)
                 f_csv.flush()
 
     finally:

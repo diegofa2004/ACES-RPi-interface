@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -73,6 +74,20 @@ def _render_plot(ax, fft_cache: np.ndarray, rate: int, frame_bins: int, max_freq
     valid = yticks < max_bin
     ax.set_yticks(yticks[valid])
     ax.set_yticklabels([f"{int(freq)}" for freq in freqs_hz[valid]])
+
+
+def _load_fft_array(fft_path: Path) -> Optional[np.ndarray]:
+    try:
+        fft_cache = np.load(fft_path)
+    except (OSError, ValueError, EOFError) as exc:
+        print(f"Falha ao carregar {fft_path}: {exc}", flush=True)
+        return None
+
+    if fft_cache.ndim != 2 or fft_cache.shape[0] == 0 or fft_cache.shape[1] == 0:
+        print("fft.npy tem formato invalido para plot:", fft_cache.shape, flush=True)
+        return None
+
+    return fft_cache
 
 
 def main() -> int:
@@ -151,11 +166,10 @@ def main() -> int:
             continue
 
         print("FFT atualizada:", fft_path, flush=True)
-        fft_cache = np.load(fft_path)
+        fft_cache = _load_fft_array(fft_path)
         last_mtime = mtime
 
-        if fft_cache.ndim != 2 or fft_cache.shape[0] == 0 or fft_cache.shape[1] == 0:
-            print("fft.npy tem formato invalido para plot:", fft_cache.shape, flush=True)
+        if fft_cache is None:
             if interactive:
                 plt.pause(args.poll_seconds)
             else:

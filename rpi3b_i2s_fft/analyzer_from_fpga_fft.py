@@ -5,6 +5,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -40,6 +41,92 @@ def save_event_snapshot(evento: np.ndarray, fft: np.ndarray) -> None:
 def frames_for_seconds(sample_rate: int, frame_bins: int, seconds: float) -> int:
     frames_per_second = sample_rate / frame_bins
     return max(1, int(math.ceil(frames_per_second * seconds)))
+
+
+def create_analysis_buffers(
+    sample_rate: int,
+    frame_bins: int,
+    *,
+    prebuffer_seconds: float = PREBUFFER_SECONDS,
+    history_seconds: float = HISTORY_SECONDS,
+) -> dict[str, deque]:
+    buffer_size = frames_for_seconds(sample_rate, frame_bins, prebuffer_seconds)
+    history_size = frames_for_seconds(sample_rate, frame_bins, history_seconds)
+    return {
+        "pre_mfcc": deque(maxlen=buffer_size),
+        "history_mfcc": deque(maxlen=history_size),
+        "pre_fft": deque(maxlen=buffer_size),
+        "history_fft": deque(maxlen=history_size),
+    }
+
+
+def create_runtime_state() -> dict[str, object]:
+    return {
+        "recording": False,
+        "record_start": 0.0,
+        "future_buffer": [],
+        "future_buffer2": [],
+        "captured_prebuffer": [],
+        "captured_prebuffer2": [],
+        "last_event_time": 0.0,
+    }
+
+
+def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[str, deque]] = None) -> bool:
+    if bool(state["recording"]):
+        return False
+
+    state["future_buffer"] = []
+    state["future_buffer2"] = []
+    state["captured_prebuffer"] = list(buffers["pre_mfcc"]) if buffers is not None else []
+    state["captured_prebuffer2"] = list(buffers["pre_fft"]) if buffers is not None else []
+    state["recording"] = True
+    state["record_start"] = now
+    return True
+
+
+def ingest_frame(
+    buffers: dict[str, deque],
+    state: dict[str, object],
+    mfcc: np.ndarray,
+    fft_bins: np.ndarray,
+    now: float,
+    *,
+    record_seconds: float = RECORD_SECONDS,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    mfcc8 = np.asarray(mfcc[:8], dtype=np.float32)
+    fft_frame = np.asarray(fft_bins, dtype=np.float32)
+
+    buffers["pre_mfcc"].append(mfcc8.copy())
+    buffers["history_mfcc"].append(mfcc8.copy())
+    buffers["pre_fft"].append(fft_frame.copy())
+    buffers["history_fft"].append(fft_frame.copy())
+
+    if not bool(state["recording"]):
+        return None
+
+    future_mfcc = state["future_buffer"]
+    future_fft = state["future_buffer2"]
+    assert isinstance(future_mfcc, list)
+    assert isinstance(future_fft, list)
+
+    future_mfcc.append(mfcc8.copy())
+    future_fft.append(fft_frame.copy())
+
+    record_start = float(state["record_start"])
+    if now - record_start < record_seconds:
+        return None
+
+    captured_pre_mfcc = state["captured_prebuffer"]
+    captured_pre_fft = state["captured_prebuffer2"]
+    assert isinstance(captured_pre_mfcc, list)
+    assert isinstance(captured_pre_fft, list)
+
+    evento = np.array(captured_pre_mfcc + future_mfcc, dtype=np.float32)
+    fft = np.array(captured_pre_fft + future_fft, dtype=np.float32)
+    state["last_event_time"] = now
+    state["recording"] = False
+    return evento, fft
 
 
 def main() -> int:
@@ -124,24 +211,9 @@ def main() -> int:
 
     os.chdir(WORK_DIR)
 
-    buffer_size = frames_for_seconds(args.rate, args.frame_bins, PREBUFFER_SECONDS)
-    buffer_size2 = frames_for_seconds(args.rate, args.frame_bins, HISTORY_SECONDS)
-    buffer_size3 = frames_for_seconds(args.rate, args.frame_bins, PREBUFFER_SECONDS)
-    buffer_size4 = frames_for_seconds(args.rate, args.frame_bins, HISTORY_SECONDS)
-
+    buffers = create_analysis_buffers(args.rate, args.frame_bins)
     lock = threading.Lock()
-    buffer = deque(maxlen=buffer_size)
-    buffer2 = deque(maxlen=buffer_size2)
-    buffer3 = deque(maxlen=buffer_size3)
-    buffer4 = deque(maxlen=buffer_size4)
-
-    state = {
-        "recording": False,
-        "record_start": 0.0,
-        "future_buffer": [],
-        "future_buffer2": [],
-        "last_event_time": 0.0,
-    }
+    state = create_runtime_state()
 
     def toggle_recording() -> None:
         while True:
@@ -151,13 +223,9 @@ def main() -> int:
                 return
 
             with lock:
-                if state["recording"]:
+                armed = arm_recording(state, time.time(), buffers)
+                if not armed:
                     continue
-
-                state["future_buffer"] = []
-                state["future_buffer2"] = []
-                state["recording"] = True
-                state["record_start"] = time.time()
 
             print("Gravando evento com pre-buffer de 5 s...", flush=True)
 
@@ -196,18 +264,20 @@ def main() -> int:
     threading.Thread(target=toggle_recording, daemon=True).start()
     threading.Thread(
         target=compararEvento,
-        args=(buffer2, buffer4, lock, lambda: state["last_event_time"]),
+        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"]),
         daemon=True,
     ).start()
 
+    pre_size = buffers["pre_mfcc"].maxlen or 0
+    history_size = buffers["history_mfcc"].maxlen or 0
     print("Using ALSA capture device:", device, flush=True)
     print("Reading FPGA FFT stream from I2S...", flush=True)
     print(
         "Buffer sizes:",
-        f"pre_mfcc={buffer_size}",
-        f"history_mfcc={buffer_size2}",
-        f"pre_fft={buffer_size3}",
-        f"history_fft={buffer_size4}",
+        f"pre_mfcc={pre_size}",
+        f"history_mfcc={history_size}",
+        f"pre_fft={buffers['pre_fft'].maxlen or 0}",
+        f"history_fft={buffers['history_fft'].maxlen or 0}",
         flush=True,
     )
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
@@ -222,26 +292,10 @@ def main() -> int:
                 continue
 
             fft_bins, mfcc = frame
-            mfcc8 = np.asarray(mfcc[:8], dtype=np.float32)
-            fft_bins = np.asarray(fft_bins, dtype=np.float32)
-            complete_event = None
+            now = time.time()
 
             with lock:
-                buffer.append(mfcc8.copy())
-                buffer2.append(mfcc8.copy())
-                buffer3.append(fft_bins.copy())
-                buffer4.append(fft_bins.copy())
-
-                if state["recording"]:
-                    state["future_buffer"].append(mfcc8.copy())
-                    state["future_buffer2"].append(fft_bins.copy())
-
-                    if time.time() - state["record_start"] >= RECORD_SECONDS:
-                        evento = np.array(list(buffer) + state["future_buffer"], dtype=np.float32)
-                        fft = np.array(list(buffer3) + state["future_buffer2"], dtype=np.float32)
-                        state["last_event_time"] = time.time()
-                        state["recording"] = False
-                        complete_event = (evento, fft)
+                complete_event = ingest_frame(buffers, state, mfcc, fft_bins, now)
 
             if complete_event is not None:
                 evento, fft = complete_event

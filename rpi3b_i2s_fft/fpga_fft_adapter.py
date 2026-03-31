@@ -53,6 +53,11 @@ class FFTAdapterConfig:
             raise ValueError("tag_shift must be between 0 and 31")
         if self.tag_mask <= 0:
             raise ValueError("tag_mask must be positive")
+        tag_width = int(self.tag_mask).bit_length()
+        if (self.tag_shift + tag_width) > 32:
+            raise ValueError("tag field must fit inside a 32-bit I2S word")
+        if self.use_i2s_tags and self.payload_bits > self.tag_shift:
+            raise ValueError("payload_bits must not overlap the tag field when use_i2s_tags is enabled")
         if (
             self.bfpexp_flag_line is not None
             and self.done_line is not None
@@ -250,12 +255,17 @@ class FPGAFFTReceiver:
         return np.frombuffer(raw, dtype=np.int32).reshape(-1, 2)
 
     def _decode_tagged_word(self, word: int) -> Tuple[int, int]:
-        uword = int(np.uint32(word))
+        uword = int(word) & 0xFFFFFFFF
         tag = (uword >> self.cfg.tag_shift) & self.cfg.tag_mask
         payload = uword & self._payload_mask
         if payload & self._payload_sign_bit:
             payload -= 1 << self.cfg.payload_bits
         return tag, payload
+
+    def _push_pairs_back(self, pairs: np.ndarray) -> None:
+        if pairs.size == 0:
+            return
+        self._byte_buffer[:0] = np.asarray(pairs, dtype=np.int32).tobytes()
 
     def _pair_kind_and_payload(self, pair: np.ndarray) -> Tuple[str, Tuple[int, int]]:
         tag_l, payload_l = self._decode_tagged_word(int(pair[0]))
@@ -315,7 +325,7 @@ class FPGAFFTReceiver:
             pairs = self._pop_pairs(self._poll_pairs, exact=False)
             if pairs is None:
                 return None
-            for pair in pairs:
+            for idx, pair in enumerate(pairs):
                 kind, payload = self._pair_kind_and_payload(pair)
 
                 if waiting_for_start:
@@ -328,6 +338,7 @@ class FPGAFFTReceiver:
                         waiting_for_start = False
                         fft_pairs.append(payload)
                         if len(fft_pairs) >= self.cfg.frame_bins:
+                            self._push_pairs_back(pairs[idx + 1 :])
                             return np.asarray(fft_pairs, dtype=np.int32)
                         continue
                     continue
@@ -335,10 +346,12 @@ class FPGAFFTReceiver:
                 # After frame start, count only FFT-tagged pairs.
                 if kind != "fft":
                     # Frame broke early; force re-sync from a fresh BFPEXP->FFT transition.
+                    self._push_pairs_back(pairs[idx + 1 :])
                     return None
 
                 fft_pairs.append(payload)
                 if len(fft_pairs) >= self.cfg.frame_bins:
+                    self._push_pairs_back(pairs[idx + 1 :])
                     return np.asarray(fft_pairs, dtype=np.int32)
 
         return None

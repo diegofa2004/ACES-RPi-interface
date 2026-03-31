@@ -2,6 +2,9 @@
 
 This folder configures Raspberry Pi OS for I2S capture and uses a direct analyzer flow based on circular buffers, following the same event logic used in `pyserial`.
 
+For the repository-level rationale behind the current FPGA/host workflow, see
+[`../../../docs/current_state.md`](../../../docs/current_state.md).
+
 ## Files
 
 - `setup_rpi_i2s_fft.sh`: enables I2S in boot config and installs dependencies.
@@ -268,6 +271,49 @@ Plot-related change:
 
 - `plotFFT.py` now uses `auto` backend selection and falls back to `Agg` in headless Raspberry Pi setups, writing `fft_latest.png`
 - this plot change has no impact on detection accuracy; it only affects visualization reliability
+
+## Offline regression without Raspberry Pi + FPGA
+
+The Python side now has an offline regression path that validates the protocol contract
+used by the FPGA transmit RTL without requiring live hardware.
+
+Run from the submodule root:
+
+```bash
+cd ../
+python3 -m unittest discover -s tests -v
+```
+
+What the offline tests cover:
+
+- tagged I2S protocol decoding for the `BFPEXP -> FFT -> IDLE` framing described by the RTL
+- sign extension and tag extraction for the 32-bit packed words
+- re-synchronization after a broken tagged frame
+- raw mode frame extraction and GPIO-triggered start behavior
+- analyzer buffer sizing, record arming, and event snapshot generation
+- CSV logger frame decoding and sequence numbering
+- headless plot rendering with `Agg`
+- comparison helper math used by `compararEvento.py`
+
+Robustness improvements added together with the tests:
+
+- `FPGAFFTReceiver` now preserves unread tagged pairs from the same chunk when a frame ends or breaks early, instead of dropping them
+- tagged-mode configuration now rejects `payload_bits` that overlap the tag field
+- event recording now freezes the pre-buffer at the exact moment `Enter` is pressed, avoiding duplication of frames from the future window
+- logger and plot scripts expose smaller helper functions so behavior can be validated directly in unit tests
+
+What is still hardware-dependent:
+
+- ALSA driver timing and buffering on a real Raspberry Pi
+- electrical GPIO behavior and level timing against the FPGA pins
+- end-to-end clocking and pin mux setup on the board
+- any mismatch between simulated/tagged payload assumptions and the final Quartus image wired into the physical FPGA
+
+Recommended workflow:
+
+- use the offline regression first when changing Python parsing, framing, buffering, plotting, or detection helpers
+- use RTL simulation benches to validate serializer-side behavior and framing assumptions
+- use Raspberry Pi + FPGA bring-up only after both of the above pass
 
 GPIO handshake mode (optional):
 
