@@ -383,6 +383,26 @@ If your FPGA cannot guarantee BFPEXP tags before FFT tags, add:
 --allow-fft-without-bfpexp
 ```
 
+Debug matrix helper:
+
+- `run_channel_debug_matrix.sh` automates the most useful passive debug captures and stores:
+	- one `jsonl` per scenario,
+	- a `scenario_summary.tsv`,
+	- the exact replay commands,
+	- and a `session_info.txt` you can commit with the logs.
+
+Example:
+
+```bash
+./run_channel_debug_matrix.sh --seconds 8
+```
+
+Useful option when a BFPEXP GPIO exists:
+
+```bash
+./run_channel_debug_matrix.sh --bfpexp-flag-line 23
+```
+
 FPGA transmit reference (example RTL behavior):
 
 - Keep I2S running continuously.
@@ -397,6 +417,12 @@ Suggested 32-bit packing (matches default Python decoder):
 - bits `[31:30]` = `tag`
 - bits `[29:18]` = reserved (`0`)
 - bits `[17:0]` = signed payload (2's complement)
+
+Timing note for the FPGA serializer:
+
+- Use Philips I2S timing, not left-justified timing.
+- `LRCLK/WS` must change one bit before the next word `MSB`.
+- The 32-bit packed word above must still arrive intact at the Pi after that timing relationship.
 
 Verilog-style helper:
 
@@ -447,6 +473,7 @@ Important hardware notes:
 
 - Synchronize `done_from_rpi` into FPGA clock domain with 2 flip-flops.
 - If possible, hold each I2S word stable until shifted out (no combinational change mid-word).
+- Do not put the first `MSB` on `SD` in the same bit time as a `WS` transition; that shifts tags/payload on the Raspberry Pi side.
 - If your left/right are swapped (imag/real), adjust either FPGA mapping or Python decoding consistently.
 
 Integration note:
