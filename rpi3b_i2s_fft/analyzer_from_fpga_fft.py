@@ -26,6 +26,7 @@ EVENTO_FILENAME = WORK_DIR / "evento.npy"
 FFT_FILENAME = WORK_DIR / "fft.npy"
 EVENTO_TMP_FILENAME = WORK_DIR / "evento_tmp.npy"
 FFT_TMP_FILENAME = WORK_DIR / "fft_tmp.npy"
+RECORD_TRIGGER_FILENAME = WORK_DIR / "record_button.trigger"
 
 PREBUFFER_SECONDS = 5.0
 HISTORY_SECONDS = 15.0
@@ -642,6 +643,15 @@ def main() -> int:
     lock = threading.Lock()
     state = create_runtime_state()
 
+    def trigger_recording(source: str) -> bool:
+        with lock:
+            armed = arm_recording(state, time.time(), buffers)
+            if not armed:
+                return False
+
+        print(f"Gravando evento com pre-buffer de 5 s... fonte={source}", flush=True)
+        return True
+
     def toggle_recording() -> None:
         while True:
             try:
@@ -649,12 +659,24 @@ def main() -> int:
             except EOFError:
                 return
 
-            with lock:
-                armed = arm_recording(state, time.time(), buffers)
-                if not armed:
-                    continue
+            trigger_recording("stdin_enter")
 
-            print("Gravando evento com pre-buffer de 5 s...", flush=True)
+    def watch_record_trigger() -> None:
+        last_mtime_ns = RECORD_TRIGGER_FILENAME.stat().st_mtime_ns if RECORD_TRIGGER_FILENAME.exists() else 0
+
+        while True:
+            try:
+                stat_result = RECORD_TRIGGER_FILENAME.stat()
+            except FileNotFoundError:
+                time.sleep(0.10)
+                continue
+
+            current_mtime_ns = stat_result.st_mtime_ns
+            if current_mtime_ns != last_mtime_ns:
+                last_mtime_ns = current_mtime_ns
+                trigger_recording("gpio_button")
+
+            time.sleep(0.10)
 
     rx = FPGAFFTReceiver(cfg)
     try:
@@ -664,6 +686,7 @@ def main() -> int:
         return 1
 
     threading.Thread(target=toggle_recording, daemon=True).start()
+    threading.Thread(target=watch_record_trigger, daemon=True).start()
     threading.Thread(
         target=compararEvento,
         args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"]),
@@ -698,6 +721,7 @@ def main() -> int:
         flush=True,
     )
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
+    print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
 

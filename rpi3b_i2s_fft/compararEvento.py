@@ -9,6 +9,9 @@ from numpy.lib.stride_tricks import sliding_window_view
 EPSILON = 1e-9
 FFT_BAND_COUNT = 32
 BACKGROUND_PERCENTILE = 35.0
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+SIMILARITY_STATE_FILENAME = os.path.join(MODULE_DIR, "similaridade.flag")
+SIMILARITY_STATE_TMP_FILENAME = os.path.join(MODULE_DIR, "similaridade_tmp.flag")
 
 
 def _zscore_1d(x: np.ndarray) -> np.ndarray:
@@ -182,6 +185,12 @@ def _melhor_bloco_continuo(energia: np.ndarray, min_frac: float = 0.12, max_frac
     return melhor_i, melhor_j
 
 
+def _write_similarity_state(active: bool) -> None:
+    with open(SIMILARITY_STATE_TMP_FILENAME, "w", encoding="ascii") as handle:
+        handle.write("1\n" if active else "0\n")
+    os.replace(SIMILARITY_STATE_TMP_FILENAME, SIMILARITY_STATE_FILENAME)
+
+
 def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
     COOLDOWN = 15
     PASSO_JANELA = 1
@@ -203,6 +212,9 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
     energia_bloco_ref_cache = 0.0
     last_mtime_evento = 0
     last_mtime_fft = 0
+    similarity_state = None
+
+    _write_similarity_state(False)
 
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -250,6 +262,9 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
             hist_scores.clear()
             contador = 0
             detectando = False
+            if similarity_state is not False:
+                _write_similarity_state(False)
+                similarity_state = False
 
             print(f"bloco usado: {i0}:{i1} tamanho={bloco_tamanho_cache}")
 
@@ -350,5 +365,11 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
             if not detectando:
                 print("OPA! SOM SEMELHANTE!!!")
                 detectando = True
+            if similarity_state is not True:
+                _write_similarity_state(True)
+                similarity_state = True
         else:
             detectando = False
+            if similarity_state is not False:
+                _write_similarity_state(False)
+                similarity_state = False
