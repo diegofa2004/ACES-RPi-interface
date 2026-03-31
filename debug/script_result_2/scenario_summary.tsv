@@ -1,0 +1,4 @@
+scenario	status	log_file	duration_seconds	total_pairs	idle	bfpexp	fft	tag_mismatch	other	max_fft_run	reserved_nonzero_words	flag_high_chunks	flag_low_chunks	flag_unknown_chunks	interrupted
+strict_tags_shift30	ok	strict_tags_shift30.jsonl	12.032303075997334	167936	72528	4567	5456	60784	24601	3	272654	0	0	328	False
+relaxed_tags_shift30	ok	relaxed_tags_shift30.jsonl	12.012785283000994	168448	73757	4410	5242	59828	25211	4	271775	0	0	329	False
+relaxed_tags_shift29	ok	relaxed_tags_shift29.jsonl	12.025974484000471	169984	73463	4514	5322	61359	25326	4	265833	0	0	332	False

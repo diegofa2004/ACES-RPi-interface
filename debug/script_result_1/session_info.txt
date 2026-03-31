@@ -1,0 +1,46 @@
+Channel debug capture set
+generated_at=2026-03-31T15:11:17-03:00
+script=/home/polisat/Desktop/ACES-RPi-interface/rpi3b_i2s_fft/run_channel_debug_matrix.sh
+analyzer=/home/polisat/Desktop/ACES-RPi-interface/rpi3b_i2s_fft/analyzer_from_fpga_fft.py
+python=/home/polisat/Desktop/ACES-RPi-interface/rpi3b_i2s_fft/.venv/bin/python
+output_dir=/home/polisat/Desktop/ACES-RPi-interface/rpi3b_i2s_fft/debug_runs/20260331_151116
+device=auto
+rate=48000
+frame_bins=512
+useful_bins=256
+capture_seconds=12
+gpio_chip=/dev/gpiochip0
+bfpexp_flag_line=none
+flag_active_low=0
+wait_low_level=0
+tag_shift=30
+tag_mask=0x3
+payload_bits=18
+tag_idle=0
+tag_bfpexp=1
+tag_fft=2
+extra_tag_shifts=29
+chunk_pairs=1024
+preview_pairs=12
+dry_run=0
+
+[git]
+submodule_head=5e831c4adb31df879d57707e319759f1978df308
+ M run_channel_debug_matrix.sh
+ M setup_rpi_i2s_fft.sh
+?? .venv/
+?? debug/
+?? debug_runs/
+?? evento.npy
+?? fft.npy
+?? fft_capture.csv
+?? plotFFT-ERRADO.py
+
+[system]
+Linux raspberrypi 6.12.75+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.12.75-1+rpt1~bookworm (2026-03-11) aarch64 GNU/Linux
+
+[arecord -l]
+**** List of CAPTURE Hardware Devices ****
+card 2: sndrpigooglevoi [snd_rpi_googlevoicehat_soundcar], device 0: Google voiceHAT SoundCard HiFi voicehat-hifi-0 [Google voiceHAT SoundCard HiFi voicehat-hifi-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0

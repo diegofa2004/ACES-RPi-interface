@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,7 +12,7 @@ if str(TEST_ROOT) not in sys.path:
 
 from rpi3b_i2s_fft import analyzer_from_fpga_fft
 from rpi3b_i2s_fft.fpga_fft_adapter import FFTAdapterConfig
-from tests.test_support import pack_tagged_pairs, pack_tagged_word
+from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_word
 
 
 class AnalyzerFromFPGAFFTTests(unittest.TestCase):
@@ -90,6 +92,101 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(chunk["reserved_nonzero_words"], 2)
         self.assertEqual(summary["reserved_nonzero_words"], 2)
         self.assertEqual(summary["flag_unknown_chunks"], 1)
+
+    def test_iter_channel_debug_chunks_from_raw_file_uses_recorded_chunk_sizes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = Path(tmpdir) / "capture.raw"
+            raw_path.write_bytes(pack_raw_pairs([(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)]))
+
+            chunks = list(
+                analyzer_from_fpga_fft.iter_channel_debug_chunks_from_raw_file(
+                    raw_path,
+                    chunk_pairs=4,
+                    chunk_sizes=[2, 1, 2],
+                )
+            )
+
+        self.assertEqual([chunk.shape[0] for chunk in chunks], [2, 1, 2])
+        np.testing.assert_array_equal(chunks[1], np.asarray([[5, 6]], dtype=np.int32))
+
+    def test_run_channel_debug_replay_uses_saved_capture_index_metadata(self):
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            raw_path = tmpdir_path / "capture.raw"
+            index_path = tmpdir_path / "capture.index.jsonl"
+            log_path = tmpdir_path / "replay.jsonl"
+
+            raw_path.write_bytes(
+                pack_tagged_pairs(
+                    [
+                        (0, 0, 0),
+                        (1, 7, 7),
+                        (2, 3, 4),
+                        (2, 5, 12),
+                        (0, 0, 0),
+                    ]
+                )
+            )
+
+            with index_path.open("w", encoding="utf-8") as handle:
+                for payload in (
+                    {
+                        "type": "session_start",
+                        "device": "hw:2,0",
+                    },
+                    {
+                        "type": "chunk",
+                        "chunk_index": 0,
+                        "timestamp_ns": 100,
+                        "pair_count": 2,
+                        "pair_offset": 0,
+                        "byte_offset": 0,
+                        "flag_active": True,
+                    },
+                    {
+                        "type": "chunk",
+                        "chunk_index": 1,
+                        "timestamp_ns": 200,
+                        "pair_count": 3,
+                        "pair_offset": 2,
+                        "byte_offset": 16,
+                        "flag_active": False,
+                    },
+                    {
+                        "type": "summary",
+                        "duration_seconds": 0.75,
+                        "interrupted": False,
+                    },
+                ):
+                    handle.write(json.dumps(payload))
+                    handle.write("\n")
+
+            rc = analyzer_from_fpga_fft.run_channel_debug_replay(
+                cfg,
+                device="auto",
+                raw_path=raw_path,
+                index_path=index_path,
+                log_path=log_path,
+                chunk_pairs=4,
+                preview_pairs=2,
+            )
+
+            self.assertEqual(rc, 0)
+
+            with log_path.open("r", encoding="utf-8") as handle:
+                payloads = [json.loads(line) for line in handle if line.strip()]
+
+        self.assertEqual(payloads[0]["source"]["kind"], "raw_replay")
+        self.assertEqual(payloads[0]["device"], "hw:2,0")
+        self.assertEqual(payloads[1]["flag_active"], True)
+        self.assertEqual(payloads[1]["pair_offset"], 0)
+        self.assertEqual(payloads[2]["flag_active"], False)
+        self.assertEqual(payloads[2]["pair_offset"], 2)
+        self.assertEqual(payloads[2]["byte_offset"], 16)
+        self.assertEqual(payloads[3]["duration_seconds"], 0.75)
+        self.assertEqual(payloads[3]["top_fft_run_lengths"], [2])
 
     def test_frames_for_seconds_rounds_up(self):
         self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(48000, 512, 5.0), 469)

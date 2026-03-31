@@ -6,7 +6,7 @@ import threading
 import time
 from collections import Counter, deque
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -35,6 +35,7 @@ DEBUG_LOG_FORMAT_VERSION = 1
 DEFAULT_DEBUG_CAPTURE_SECONDS = 10.0
 DEFAULT_DEBUG_CHUNK_PAIRS = 1024
 DEFAULT_DEBUG_PREVIEW_PAIRS = 12
+DEBUG_BYTES_PER_PAIR = 8
 
 
 def save_event_snapshot(evento: np.ndarray, fft: np.ndarray) -> None:
@@ -219,6 +220,7 @@ def process_channel_debug_chunk(
     flag_active: Optional[bool],
     timestamp_ns: int,
 ) -> dict[str, object]:
+    pair_offset = int(state["total_pairs"])
     kind_counts = Counter()
     raw_tag_counts_left = Counter()
     raw_tag_counts_right = Counter()
@@ -312,6 +314,8 @@ def process_channel_debug_chunk(
         "type": "chunk",
         "chunk_index": chunk_index,
         "timestamp_ns": int(timestamp_ns),
+        "pair_offset": int(pair_offset),
+        "byte_offset": int(pair_offset * DEBUG_BYTES_PER_PAIR),
         "pair_count": int(len(pairs)),
         "flag_active": flag_active,
         "kind_counts": dict(sorted(kind_counts.items())),
@@ -362,6 +366,237 @@ def _write_jsonl_line(handle, payload: dict[str, object]) -> None:
     handle.flush()
 
 
+def default_debug_raw_index_path(raw_path: Path) -> Path:
+    suffix = "".join(raw_path.suffixes)
+    if suffix:
+        base_name = raw_path.name[: -len(suffix)]
+        return raw_path.with_name(f"{base_name}.index.jsonl")
+    return raw_path.with_name(f"{raw_path.name}.index.jsonl")
+
+
+def iter_channel_debug_chunks_from_raw_file(
+    raw_path: Path,
+    chunk_pairs: int,
+    *,
+    chunk_sizes: Optional[Sequence[int]] = None,
+) -> Iterator[np.ndarray]:
+    if chunk_pairs <= 0:
+        raise ValueError("chunk_pairs must be positive")
+
+    with raw_path.open("rb") as handle:
+        if chunk_sizes is not None:
+            for pair_count in chunk_sizes:
+                pair_count = int(pair_count)
+                if pair_count <= 0:
+                    continue
+                raw = handle.read(pair_count * DEBUG_BYTES_PER_PAIR)
+                if len(raw) != pair_count * DEBUG_BYTES_PER_PAIR:
+                    raise RuntimeError(
+                        f"Raw capture ended early while reading {pair_count} pairs from {raw_path}"
+                    )
+                yield np.frombuffer(raw, dtype=np.int32).reshape(-1, 2)
+
+            trailing = handle.read(1)
+            if trailing:
+                raise RuntimeError(
+                    f"Raw capture {raw_path} contains trailing bytes not described by the capture index"
+                )
+            return
+
+        chunk_bytes = chunk_pairs * DEBUG_BYTES_PER_PAIR
+        while True:
+            raw = handle.read(chunk_bytes)
+            if not raw:
+                return
+            valid_size = len(raw) - (len(raw) % DEBUG_BYTES_PER_PAIR)
+            if valid_size <= 0:
+                return
+            yield np.frombuffer(raw[:valid_size], dtype=np.int32).reshape(-1, 2)
+            if valid_size != len(raw):
+                return
+
+
+def load_channel_debug_capture_index(index_path: Optional[Path]) -> dict[str, object]:
+    result: dict[str, object] = {
+        "session_start": {},
+        "summary": {},
+        "chunks": [],
+    }
+    if index_path is None or not index_path.exists():
+        return result
+
+    chunks = result["chunks"]
+    assert isinstance(chunks, list)
+
+    with index_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            payload_type = payload.get("type")
+            if payload_type == "session_start":
+                result["session_start"] = payload
+            elif payload_type == "summary":
+                result["summary"] = payload
+            elif payload_type == "chunk":
+                chunks.append(payload)
+
+    return result
+
+
+def _build_debug_session_start(
+    cfg: FFTAdapterConfig,
+    *,
+    device: str,
+    capture_seconds: float,
+    chunk_pairs: int,
+    preview_pairs: int,
+    source: dict[str, object],
+    timestamp_ns: int,
+) -> dict[str, object]:
+    return {
+        "type": "session_start",
+        "timestamp_ns": int(timestamp_ns),
+        "format_version": DEBUG_LOG_FORMAT_VERSION,
+        "mode": "passive_channel_debug",
+        "protocol_enforced": False,
+        "done_pulses_emitted": False,
+        "device": device,
+        "arecord_cmd": build_arecord_cmd(device, cfg.sample_rate) if device else None,
+        "config": {
+            "sample_rate": cfg.sample_rate,
+            "frame_bins": cfg.frame_bins,
+            "useful_bins": cfg.useful_bins,
+            "use_i2s_tags": cfg.use_i2s_tags,
+            "tag_shift": cfg.tag_shift,
+            "tag_mask": cfg.tag_mask,
+            "payload_bits": cfg.payload_bits,
+            "tag_idle": cfg.tag_idle,
+            "tag_bfpexp": cfg.tag_bfpexp,
+            "tag_fft": cfg.tag_fft,
+            "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
+            "bfpexp_flag_line": cfg.bfpexp_flag_line,
+            "done_line": cfg.done_line,
+        },
+        "capture_plan": {
+            "capture_seconds": float(capture_seconds),
+            "chunk_pairs": int(chunk_pairs),
+            "preview_pairs": int(preview_pairs),
+        },
+        "source": source,
+    }
+
+
+def capture_channel_debug_raw(
+    cfg: FFTAdapterConfig,
+    *,
+    device: str,
+    raw_path: Path,
+    index_path: Path,
+    capture_seconds: float,
+    chunk_pairs: int,
+) -> int:
+    rx = FPGAFFTReceiver(cfg)
+    try:
+        rx.start()
+    except RuntimeError as exc:
+        print(str(exc), flush=True)
+        return 1
+
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    interrupted = False
+    start_monotonic = time.monotonic()
+    total_pairs = 0
+    chunk_index = 0
+
+    print("Channel debug raw capture active: writing the full I2S stream for offline replay.", flush=True)
+    print("Raw capture:", raw_path, flush=True)
+    print("Chunk index:", index_path, flush=True)
+
+    try:
+        with raw_path.open("wb") as raw_handle, index_path.open("w", encoding="utf-8") as index_handle:
+            _write_jsonl_line(
+                index_handle,
+                _build_debug_session_start(
+                    cfg,
+                    device=device,
+                    capture_seconds=capture_seconds,
+                    chunk_pairs=chunk_pairs,
+                    preview_pairs=0,
+                    source={
+                        "kind": "live_capture_index",
+                        "raw_path": str(raw_path),
+                    },
+                    timestamp_ns=time.time_ns(),
+                ),
+            )
+
+            while True:
+                elapsed = time.monotonic() - start_monotonic
+                if elapsed >= capture_seconds:
+                    break
+
+                pairs = rx.read_available_pairs(chunk_pairs)
+                if pairs is None:
+                    if rx._proc is not None and rx._proc.poll() is not None:
+                        break
+                    continue
+
+                pair_offset = total_pairs
+                raw_handle.write(np.asarray(pairs, dtype=np.int32).tobytes())
+                raw_handle.flush()
+
+                total_pairs += int(len(pairs))
+                _write_jsonl_line(
+                    index_handle,
+                    {
+                        "type": "chunk",
+                        "chunk_index": chunk_index,
+                        "timestamp_ns": time.time_ns(),
+                        "pair_count": int(len(pairs)),
+                        "pair_offset": int(pair_offset),
+                        "byte_offset": int(pair_offset * DEBUG_BYTES_PER_PAIR),
+                        "flag_active": rx.read_flag_state(),
+                    },
+                )
+                chunk_index += 1
+
+            _write_jsonl_line(
+                index_handle,
+                {
+                    "type": "summary",
+                    "timestamp_ns": time.time_ns(),
+                    "duration_seconds": float(time.monotonic() - start_monotonic),
+                    "interrupted": bool(interrupted),
+                    "chunk_count": int(chunk_index),
+                    "total_pairs": int(total_pairs),
+                    "raw_bytes": int(total_pairs * DEBUG_BYTES_PER_PAIR),
+                },
+            )
+    except KeyboardInterrupt:
+        interrupted = True
+        with index_path.open("a", encoding="utf-8") as index_handle:
+            _write_jsonl_line(
+                index_handle,
+                {
+                    "type": "summary",
+                    "timestamp_ns": time.time_ns(),
+                    "duration_seconds": float(time.monotonic() - start_monotonic),
+                    "interrupted": bool(interrupted),
+                    "chunk_count": int(chunk_index),
+                    "total_pairs": int(total_pairs),
+                    "raw_bytes": int(total_pairs * DEBUG_BYTES_PER_PAIR),
+                },
+            )
+        print("Stopping raw capture...", flush=True)
+    finally:
+        rx.stop()
+
+    print("Raw capture complete.", flush=True)
+    return 0
+
+
 def run_channel_debug_capture(
     cfg: FFTAdapterConfig,
     *,
@@ -392,36 +627,15 @@ def run_channel_debug_capture(
         with log_path.open("w", encoding="utf-8") as handle:
             _write_jsonl_line(
                 handle,
-                {
-                    "type": "session_start",
-                    "timestamp_ns": time.time_ns(),
-                    "format_version": DEBUG_LOG_FORMAT_VERSION,
-                    "mode": "passive_channel_debug",
-                    "protocol_enforced": False,
-                    "done_pulses_emitted": False,
-                    "device": device,
-                    "arecord_cmd": build_arecord_cmd(device, cfg.sample_rate),
-                    "config": {
-                        "sample_rate": cfg.sample_rate,
-                        "frame_bins": cfg.frame_bins,
-                        "useful_bins": cfg.useful_bins,
-                        "use_i2s_tags": cfg.use_i2s_tags,
-                        "tag_shift": cfg.tag_shift,
-                        "tag_mask": cfg.tag_mask,
-                        "payload_bits": cfg.payload_bits,
-                        "tag_idle": cfg.tag_idle,
-                        "tag_bfpexp": cfg.tag_bfpexp,
-                        "tag_fft": cfg.tag_fft,
-                        "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
-                        "bfpexp_flag_line": cfg.bfpexp_flag_line,
-                        "done_line": cfg.done_line,
-                    },
-                    "capture_plan": {
-                        "capture_seconds": capture_seconds,
-                        "chunk_pairs": chunk_pairs,
-                        "preview_pairs": preview_pairs,
-                    },
-                },
+                _build_debug_session_start(
+                    cfg,
+                    device=device,
+                    capture_seconds=capture_seconds,
+                    chunk_pairs=chunk_pairs,
+                    preview_pairs=preview_pairs,
+                    source={"kind": "live_arecord"},
+                    timestamp_ns=time.time_ns(),
+                ),
             )
 
             while True:
@@ -490,6 +704,90 @@ def run_channel_debug_capture(
         rx.stop()
 
     print("Debug capture complete.", flush=True)
+    return 0
+
+
+def run_channel_debug_replay(
+    cfg: FFTAdapterConfig,
+    *,
+    device: str,
+    raw_path: Path,
+    index_path: Optional[Path],
+    log_path: Path,
+    chunk_pairs: int,
+    preview_pairs: int,
+) -> int:
+    index_payload = load_channel_debug_capture_index(index_path)
+    session_start = index_payload["session_start"]
+    summary = index_payload["summary"]
+    chunk_entries = index_payload["chunks"]
+    assert isinstance(session_start, dict)
+    assert isinstance(summary, dict)
+    assert isinstance(chunk_entries, list)
+
+    chunk_sizes = [int(entry.get("pair_count", 0)) for entry in chunk_entries] if chunk_entries else None
+    state = create_channel_debug_state()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source_device = str(session_start.get("device") or device or "raw_replay")
+    source_duration = float(summary.get("duration_seconds", 0.0)) if summary else 0.0
+    print("Channel debug replay mode active: decoding a saved raw I2S capture.", flush=True)
+    print("Raw capture:", raw_path, flush=True)
+    if index_path is not None:
+        print("Replay index:", index_path, flush=True)
+    print("Structured JSONL log:", log_path, flush=True)
+
+    with log_path.open("w", encoding="utf-8") as handle:
+        _write_jsonl_line(
+            handle,
+            _build_debug_session_start(
+                cfg,
+                device=source_device,
+                capture_seconds=source_duration,
+                chunk_pairs=chunk_pairs,
+                preview_pairs=preview_pairs,
+                source={
+                    "kind": "raw_replay",
+                    "raw_path": str(raw_path),
+                    "raw_bytes": int(raw_path.stat().st_size),
+                    "index_path": str(index_path) if index_path is not None else None,
+                },
+                timestamp_ns=time.time_ns(),
+            ),
+        )
+
+        chunk_meta_iter = iter(chunk_entries)
+        for pairs in iter_channel_debug_chunks_from_raw_file(raw_path, chunk_pairs, chunk_sizes=chunk_sizes):
+            chunk_meta = next(chunk_meta_iter, {})
+            timestamp_ns = int(chunk_meta.get("timestamp_ns", time.time_ns()))
+            flag_active = chunk_meta.get("flag_active")
+            chunk_event = process_channel_debug_chunk(
+                pairs,
+                cfg,
+                state,
+                preview_pairs=preview_pairs,
+                flag_active=flag_active if isinstance(flag_active, bool) else None,
+                timestamp_ns=timestamp_ns,
+            )
+            if "pair_offset" in chunk_meta:
+                chunk_event["pair_offset"] = int(chunk_meta["pair_offset"])
+                chunk_event["byte_offset"] = int(chunk_meta.get("byte_offset", int(chunk_meta["pair_offset"]) * DEBUG_BYTES_PER_PAIR))
+            _write_jsonl_line(handle, chunk_event)
+
+        finalize_channel_debug_state(state)
+        if source_duration <= 0.0 and cfg.sample_rate > 0:
+            source_duration = float(state["total_pairs"]) / float(cfg.sample_rate)
+        _write_jsonl_line(
+            handle,
+            build_channel_debug_summary(
+                state,
+                duration_seconds=source_duration,
+                interrupted=bool(summary.get("interrupted", False)),
+                timestamp_ns=time.time_ns(),
+            ),
+        )
+
+    print("Replay analysis complete.", flush=True)
     return 0
 
 
@@ -563,6 +861,21 @@ def main() -> int:
         help="Write a passive JSONL channel debug log and exit after the capture window",
     )
     parser.add_argument(
+        "--debug-raw-capture",
+        default=None,
+        help="Write the full raw S32_LE stereo capture for later offline replay",
+    )
+    parser.add_argument(
+        "--debug-raw-index",
+        default=None,
+        help="Companion JSONL for raw capture/replay chunk timestamps and flag samples",
+    )
+    parser.add_argument(
+        "--debug-replay-raw",
+        default=None,
+        help="Replay a saved raw S32_LE stereo capture instead of reading the live device",
+    )
+    parser.add_argument(
         "--debug-capture-seconds",
         type=float,
         default=DEFAULT_DEBUG_CAPTURE_SECONDS,
@@ -596,11 +909,29 @@ def main() -> int:
         parser.error("--debug-chunk-pairs must be positive")
     if args.debug_preview_pairs < 0:
         parser.error("--debug-preview-pairs must be non-negative")
+    if args.debug_replay_raw and not args.debug_channel_log:
+        parser.error("--debug-replay-raw requires --debug-channel-log")
+    if args.debug_raw_capture and args.debug_replay_raw:
+        parser.error("--debug-raw-capture and --debug-replay-raw are mutually exclusive")
+    if args.debug_raw_index and not (args.debug_raw_capture or args.debug_replay_raw):
+        parser.error("--debug-raw-index requires --debug-raw-capture or --debug-replay-raw")
 
-    try:
-        device = resolve_audio_device(args.device)
-    except RuntimeError as exc:
-        parser.error(str(exc))
+    replay_raw_path = Path(args.debug_replay_raw) if args.debug_replay_raw else None
+    raw_capture_path = Path(args.debug_raw_capture) if args.debug_raw_capture else None
+    if args.debug_raw_index:
+        raw_index_path = Path(args.debug_raw_index)
+    elif raw_capture_path is not None:
+        raw_index_path = default_debug_raw_index_path(raw_capture_path)
+    else:
+        raw_index_path = None
+
+    if replay_raw_path is not None:
+        device = args.device
+    else:
+        try:
+            device = resolve_audio_device(args.device)
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     os.chdir(WORK_DIR)
 
@@ -628,6 +959,28 @@ def main() -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
+
+    if raw_capture_path is not None:
+        assert raw_index_path is not None
+        return capture_channel_debug_raw(
+            cfg,
+            device=device,
+            raw_path=raw_capture_path,
+            index_path=raw_index_path,
+            capture_seconds=args.debug_capture_seconds,
+            chunk_pairs=args.debug_chunk_pairs,
+        )
+
+    if replay_raw_path is not None:
+        return run_channel_debug_replay(
+            cfg,
+            device=device,
+            raw_path=replay_raw_path,
+            index_path=raw_index_path,
+            log_path=Path(args.debug_channel_log),
+            chunk_pairs=args.debug_chunk_pairs,
+            preview_pairs=args.debug_preview_pairs,
+        )
 
     if args.debug_channel_log:
         return run_channel_debug_capture(
