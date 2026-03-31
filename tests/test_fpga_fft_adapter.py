@@ -28,6 +28,17 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         self.assertEqual(rx._poll_pairs, 512)
         self.assertEqual(rx._poll_bytes, 4096)
 
+    def test_read_available_pairs_can_return_partial_chunk(self):
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4)
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(pack_raw_pairs([(1, 2), (3, 4), (5, 6)]), max_chunk_bytes=16)
+
+        pairs = rx.read_available_pairs(3)
+        self.assertIsNotNone(pairs)
+        assert pairs is not None
+        self.assertEqual(pairs.shape, (2, 2))
+        np.testing.assert_array_equal(pairs, np.asarray([[1, 2], [3, 4]], dtype=np.int32))
+
     def test_start_and_stop_use_capture_process_helpers(self):
         fake_proc = FakeProcess(b"")
         cfg = FFTAdapterConfig(device="auto")

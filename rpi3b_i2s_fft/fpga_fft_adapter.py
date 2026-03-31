@@ -256,6 +256,14 @@ class FPGAFFTReceiver:
             return None
         return np.frombuffer(raw, dtype=np.int32).reshape(-1, 2)
 
+    def read_available_pairs(self, pair_count: int) -> Optional[np.ndarray]:
+        return self._pop_pairs(pair_count, exact=False)
+
+    def read_flag_state(self) -> Optional[bool]:
+        if self._bfpexp_line is None:
+            return None
+        return self._read_flag_active()
+
     def _decode_tagged_word(self, word: int) -> Tuple[int, int]:
         uword = int(word) & 0xFFFFFFFF
         tag = (uword >> self.cfg.tag_shift) & self.cfg.tag_mask

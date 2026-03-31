@@ -1,9 +1,10 @@
 import argparse
+import json
 import math
 import os
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,11 +13,11 @@ import numpy as np
 try:
     from .compararEvento import compararEvento
     from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from .i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
+    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
 except ImportError:
     from compararEvento import compararEvento
     from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
+    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -29,6 +30,10 @@ FFT_TMP_FILENAME = WORK_DIR / "fft_tmp.npy"
 PREBUFFER_SECONDS = 5.0
 HISTORY_SECONDS = 15.0
 RECORD_SECONDS = 5.0
+DEBUG_LOG_FORMAT_VERSION = 1
+DEFAULT_DEBUG_CAPTURE_SECONDS = 10.0
+DEFAULT_DEBUG_CHUNK_PAIRS = 1024
+DEFAULT_DEBUG_PREVIEW_PAIRS = 12
 
 
 def save_event_snapshot(evento: np.ndarray, fft: np.ndarray) -> None:
@@ -129,6 +134,364 @@ def ingest_frame(
     return evento, fft
 
 
+def _u32_hex(word: int) -> str:
+    return f"0x{int(word) & 0xFFFFFFFF:08X}"
+
+
+def _decode_debug_word(word: int, cfg: FFTAdapterConfig) -> dict[str, object]:
+    uword = int(word) & 0xFFFFFFFF
+    tag = int((uword >> cfg.tag_shift) & cfg.tag_mask)
+
+    payload_mask = (1 << cfg.payload_bits) - 1
+    payload = int(uword & payload_mask)
+    sign_bit = 1 << (cfg.payload_bits - 1)
+    if payload & sign_bit:
+        payload -= 1 << cfg.payload_bits
+
+    reserved_width = max(0, cfg.tag_shift - cfg.payload_bits)
+    reserved = 0
+    if reserved_width > 0:
+        reserved = int((uword >> cfg.payload_bits) & ((1 << reserved_width) - 1))
+
+    return {
+        "hex": _u32_hex(word),
+        "i32": int(word),
+        "tag": tag,
+        "payload": payload,
+        "reserved": reserved,
+        "reserved_nonzero": bool(reserved),
+    }
+
+
+def _classify_debug_pair(left_tag: int, right_tag: int, cfg: FFTAdapterConfig) -> str:
+    if left_tag != right_tag:
+        return "tag_mismatch"
+    if left_tag == cfg.tag_idle:
+        return "idle"
+    if left_tag == cfg.tag_bfpexp:
+        return "bfpexp"
+    if left_tag == cfg.tag_fft:
+        return "fft"
+    return "other"
+
+
+def create_channel_debug_state() -> dict[str, object]:
+    return {
+        "chunk_index": 0,
+        "total_pairs": 0,
+        "kind_counts": Counter(),
+        "raw_tag_counts_left": Counter(),
+        "raw_tag_counts_right": Counter(),
+        "transition_counts": Counter(),
+        "max_run_by_kind": Counter(),
+        "fft_run_lengths": [],
+        "reserved_nonzero_words": 0,
+        "flag_high_chunks": 0,
+        "flag_low_chunks": 0,
+        "flag_unknown_chunks": 0,
+        "current_run_kind": None,
+        "current_run_length": 0,
+    }
+
+
+def _finish_global_debug_run(state: dict[str, object]) -> None:
+    current_kind = state["current_run_kind"]
+    current_length = int(state["current_run_length"])
+    if current_kind == "fft" and current_length > 0:
+        fft_run_lengths = state["fft_run_lengths"]
+        assert isinstance(fft_run_lengths, list)
+        fft_run_lengths.append(current_length)
+
+
+def finalize_channel_debug_state(state: dict[str, object]) -> None:
+    _finish_global_debug_run(state)
+    state["current_run_kind"] = None
+    state["current_run_length"] = 0
+
+
+def process_channel_debug_chunk(
+    pairs: np.ndarray,
+    cfg: FFTAdapterConfig,
+    state: dict[str, object],
+    *,
+    preview_pairs: int,
+    flag_active: Optional[bool],
+    timestamp_ns: int,
+) -> dict[str, object]:
+    kind_counts = Counter()
+    raw_tag_counts_left = Counter()
+    raw_tag_counts_right = Counter()
+    transition_counts = Counter()
+    max_run_by_kind = Counter()
+    fft_run_lengths = []
+    preview = []
+    reserved_nonzero_words = 0
+
+    local_run_kind = None
+    local_run_length = 0
+
+    for pair_index, pair in enumerate(np.asarray(pairs, dtype=np.int32)):
+        left = _decode_debug_word(int(pair[0]), cfg)
+        right = _decode_debug_word(int(pair[1]), cfg)
+        kind = _classify_debug_pair(int(left["tag"]), int(right["tag"]), cfg)
+
+        kind_counts[kind] += 1
+        raw_tag_counts_left[int(left["tag"])] += 1
+        raw_tag_counts_right[int(right["tag"])] += 1
+        reserved_nonzero_words += int(bool(left["reserved_nonzero"])) + int(bool(right["reserved_nonzero"]))
+
+        if pair_index < preview_pairs:
+            preview.append(
+                {
+                    "pair_index": pair_index,
+                    "kind": kind,
+                    "left": left,
+                    "right": right,
+                }
+            )
+
+        if local_run_kind != kind:
+            if local_run_kind is not None:
+                transition_counts[f"{local_run_kind}->{kind}"] += 1
+                if local_run_kind == "fft":
+                    fft_run_lengths.append(local_run_length)
+            local_run_kind = kind
+            local_run_length = 1
+        else:
+            local_run_length += 1
+        max_run_by_kind[kind] = max(max_run_by_kind[kind], local_run_length)
+
+        state_kind_counts = state["kind_counts"]
+        state_raw_tag_counts_left = state["raw_tag_counts_left"]
+        state_raw_tag_counts_right = state["raw_tag_counts_right"]
+        state_transition_counts = state["transition_counts"]
+        state_max_run_by_kind = state["max_run_by_kind"]
+        assert isinstance(state_kind_counts, Counter)
+        assert isinstance(state_raw_tag_counts_left, Counter)
+        assert isinstance(state_raw_tag_counts_right, Counter)
+        assert isinstance(state_transition_counts, Counter)
+        assert isinstance(state_max_run_by_kind, Counter)
+
+        state["total_pairs"] = int(state["total_pairs"]) + 1
+        state_kind_counts[kind] += 1
+        state_raw_tag_counts_left[int(left["tag"])] += 1
+        state_raw_tag_counts_right[int(right["tag"])] += 1
+        state["reserved_nonzero_words"] = int(state["reserved_nonzero_words"]) + int(bool(left["reserved_nonzero"]))
+        state["reserved_nonzero_words"] = int(state["reserved_nonzero_words"]) + int(bool(right["reserved_nonzero"]))
+
+        current_run_kind = state["current_run_kind"]
+        current_run_length = int(state["current_run_length"])
+        if current_run_kind != kind:
+            if current_run_kind is not None:
+                state_transition_counts[f"{current_run_kind}->{kind}"] += 1
+                if current_run_kind == "fft" and current_run_length > 0:
+                    fft_run_lengths_state = state["fft_run_lengths"]
+                    assert isinstance(fft_run_lengths_state, list)
+                    fft_run_lengths_state.append(current_run_length)
+            state["current_run_kind"] = kind
+            state["current_run_length"] = 1
+        else:
+            state["current_run_length"] = current_run_length + 1
+        state_max_run_by_kind[kind] = max(state_max_run_by_kind[kind], int(state["current_run_length"]))
+
+    if local_run_kind == "fft" and local_run_length > 0:
+        fft_run_lengths.append(local_run_length)
+
+    if flag_active is True:
+        state["flag_high_chunks"] = int(state["flag_high_chunks"]) + 1
+    elif flag_active is False:
+        state["flag_low_chunks"] = int(state["flag_low_chunks"]) + 1
+    else:
+        state["flag_unknown_chunks"] = int(state["flag_unknown_chunks"]) + 1
+
+    chunk_index = int(state["chunk_index"])
+    state["chunk_index"] = chunk_index + 1
+
+    return {
+        "type": "chunk",
+        "chunk_index": chunk_index,
+        "timestamp_ns": int(timestamp_ns),
+        "pair_count": int(len(pairs)),
+        "flag_active": flag_active,
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "raw_tag_counts_left": dict(sorted(raw_tag_counts_left.items())),
+        "raw_tag_counts_right": dict(sorted(raw_tag_counts_right.items())),
+        "transition_counts": dict(sorted(transition_counts.items())),
+        "max_run_by_kind": dict(sorted(max_run_by_kind.items())),
+        "fft_run_lengths": fft_run_lengths,
+        "reserved_nonzero_words": reserved_nonzero_words,
+        "preview": preview,
+    }
+
+
+def build_channel_debug_summary(
+    state: dict[str, object],
+    *,
+    duration_seconds: float,
+    interrupted: bool,
+    timestamp_ns: int,
+) -> dict[str, object]:
+    fft_run_lengths = list(state["fft_run_lengths"])
+    fft_run_lengths.sort(reverse=True)
+
+    return {
+        "type": "summary",
+        "timestamp_ns": int(timestamp_ns),
+        "duration_seconds": float(duration_seconds),
+        "interrupted": bool(interrupted),
+        "chunk_count": int(state["chunk_index"]),
+        "total_pairs": int(state["total_pairs"]),
+        "kind_counts": dict(sorted(dict(state["kind_counts"]).items())),
+        "raw_tag_counts_left": dict(sorted(dict(state["raw_tag_counts_left"]).items())),
+        "raw_tag_counts_right": dict(sorted(dict(state["raw_tag_counts_right"]).items())),
+        "transition_counts": dict(sorted(dict(state["transition_counts"]).items())),
+        "max_run_by_kind": dict(sorted(dict(state["max_run_by_kind"]).items())),
+        "top_fft_run_lengths": fft_run_lengths[:16],
+        "fft_run_count": len(fft_run_lengths),
+        "reserved_nonzero_words": int(state["reserved_nonzero_words"]),
+        "flag_high_chunks": int(state["flag_high_chunks"]),
+        "flag_low_chunks": int(state["flag_low_chunks"]),
+        "flag_unknown_chunks": int(state["flag_unknown_chunks"]),
+    }
+
+
+def _write_jsonl_line(handle, payload: dict[str, object]) -> None:
+    handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+    handle.write("\n")
+    handle.flush()
+
+
+def run_channel_debug_capture(
+    cfg: FFTAdapterConfig,
+    *,
+    device: str,
+    log_path: Path,
+    capture_seconds: float,
+    chunk_pairs: int,
+    preview_pairs: int,
+) -> int:
+    rx = FPGAFFTReceiver(cfg)
+    try:
+        rx.start()
+    except RuntimeError as exc:
+        print(str(exc), flush=True)
+        return 1
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    interrupted = False
+    start_monotonic = time.monotonic()
+    last_status = start_monotonic
+    state = create_channel_debug_state()
+
+    print("Channel debug mode active: passive capture, no frame protocol enforcement.", flush=True)
+    print("Structured JSONL log:", log_path, flush=True)
+    print("Commit this log file so we can inspect raw words, decoded tags, transitions, and FFT run lengths.", flush=True)
+
+    try:
+        with log_path.open("w", encoding="utf-8") as handle:
+            _write_jsonl_line(
+                handle,
+                {
+                    "type": "session_start",
+                    "timestamp_ns": time.time_ns(),
+                    "format_version": DEBUG_LOG_FORMAT_VERSION,
+                    "mode": "passive_channel_debug",
+                    "protocol_enforced": False,
+                    "done_pulses_emitted": False,
+                    "device": device,
+                    "arecord_cmd": build_arecord_cmd(device, cfg.sample_rate),
+                    "config": {
+                        "sample_rate": cfg.sample_rate,
+                        "frame_bins": cfg.frame_bins,
+                        "useful_bins": cfg.useful_bins,
+                        "use_i2s_tags": cfg.use_i2s_tags,
+                        "tag_shift": cfg.tag_shift,
+                        "tag_mask": cfg.tag_mask,
+                        "payload_bits": cfg.payload_bits,
+                        "tag_idle": cfg.tag_idle,
+                        "tag_bfpexp": cfg.tag_bfpexp,
+                        "tag_fft": cfg.tag_fft,
+                        "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
+                        "bfpexp_flag_line": cfg.bfpexp_flag_line,
+                        "done_line": cfg.done_line,
+                    },
+                    "capture_plan": {
+                        "capture_seconds": capture_seconds,
+                        "chunk_pairs": chunk_pairs,
+                        "preview_pairs": preview_pairs,
+                    },
+                },
+            )
+
+            while True:
+                elapsed = time.monotonic() - start_monotonic
+                if elapsed >= capture_seconds:
+                    break
+
+                pairs = rx.read_available_pairs(chunk_pairs)
+                if pairs is None:
+                    if rx._proc is not None and rx._proc.poll() is not None:
+                        break
+                    continue
+
+                flag_active = rx.read_flag_state()
+                chunk_event = process_channel_debug_chunk(
+                    pairs,
+                    cfg,
+                    state,
+                    preview_pairs=preview_pairs,
+                    flag_active=flag_active,
+                    timestamp_ns=time.time_ns(),
+                )
+                _write_jsonl_line(handle, chunk_event)
+
+                now = time.monotonic()
+                if now - last_status >= 1.0:
+                    kind_counts = chunk_event["kind_counts"]
+                    assert isinstance(kind_counts, dict)
+                    print(
+                        "debug:",
+                        f"chunks={state['chunk_index']}",
+                        f"pairs={state['total_pairs']}",
+                        f"idle={kind_counts.get('idle', 0)}",
+                        f"bfpexp={kind_counts.get('bfpexp', 0)}",
+                        f"fft={kind_counts.get('fft', 0)}",
+                        f"mismatch={kind_counts.get('tag_mismatch', 0)}",
+                        flush=True,
+                    )
+                    last_status = now
+
+            finalize_channel_debug_state(state)
+            _write_jsonl_line(
+                handle,
+                build_channel_debug_summary(
+                    state,
+                    duration_seconds=time.monotonic() - start_monotonic,
+                    interrupted=interrupted,
+                    timestamp_ns=time.time_ns(),
+                ),
+            )
+    except KeyboardInterrupt:
+        interrupted = True
+        finalize_channel_debug_state(state)
+        with log_path.open("a", encoding="utf-8") as handle:
+            _write_jsonl_line(
+                handle,
+                build_channel_debug_summary(
+                    state,
+                    duration_seconds=time.monotonic() - start_monotonic,
+                    interrupted=interrupted,
+                    timestamp_ns=time.time_ns(),
+                ),
+            )
+        print("Stopping debug capture...", flush=True)
+    finally:
+        rx.stop()
+
+    print("Debug capture complete.", flush=True)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Feed circular buffers from FPGA I2S FFT stream using the same event logic as pyserial."
@@ -193,6 +556,29 @@ def main() -> int:
         action="store_true",
         help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
     )
+    parser.add_argument(
+        "--debug-channel-log",
+        default=None,
+        help="Write a passive JSONL channel debug log and exit after the capture window",
+    )
+    parser.add_argument(
+        "--debug-capture-seconds",
+        type=float,
+        default=DEFAULT_DEBUG_CAPTURE_SECONDS,
+        help="Duration of passive channel debug capture in seconds",
+    )
+    parser.add_argument(
+        "--debug-chunk-pairs",
+        type=int,
+        default=DEFAULT_DEBUG_CHUNK_PAIRS,
+        help="Number of raw stereo pairs summarized per JSONL chunk in debug mode",
+    )
+    parser.add_argument(
+        "--debug-preview-pairs",
+        type=int,
+        default=DEFAULT_DEBUG_PREVIEW_PAIRS,
+        help="Number of raw pairs previewed inside each JSONL debug chunk",
+    )
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -203,6 +589,12 @@ def main() -> int:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    if args.debug_capture_seconds <= 0:
+        parser.error("--debug-capture-seconds must be positive")
+    if args.debug_chunk_pairs <= 0:
+        parser.error("--debug-chunk-pairs must be positive")
+    if args.debug_preview_pairs < 0:
+        parser.error("--debug-preview-pairs must be non-negative")
 
     try:
         device = resolve_audio_device(args.device)
@@ -210,24 +602,6 @@ def main() -> int:
         parser.error(str(exc))
 
     os.chdir(WORK_DIR)
-
-    buffers = create_analysis_buffers(args.rate, args.frame_bins)
-    lock = threading.Lock()
-    state = create_runtime_state()
-
-    def toggle_recording() -> None:
-        while True:
-            try:
-                input()
-            except EOFError:
-                return
-
-            with lock:
-                armed = arm_recording(state, time.time(), buffers)
-                if not armed:
-                    continue
-
-            print("Gravando evento com pre-buffer de 5 s...", flush=True)
 
     try:
         cfg = FFTAdapterConfig(
@@ -253,6 +627,34 @@ def main() -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.debug_channel_log:
+        return run_channel_debug_capture(
+            cfg,
+            device=device,
+            log_path=Path(args.debug_channel_log),
+            capture_seconds=args.debug_capture_seconds,
+            chunk_pairs=args.debug_chunk_pairs,
+            preview_pairs=args.debug_preview_pairs,
+        )
+
+    buffers = create_analysis_buffers(args.rate, args.frame_bins)
+    lock = threading.Lock()
+    state = create_runtime_state()
+
+    def toggle_recording() -> None:
+        while True:
+            try:
+                input()
+            except EOFError:
+                return
+
+            with lock:
+                armed = arm_recording(state, time.time(), buffers)
+                if not armed:
+                    continue
+
+            print("Gravando evento com pre-buffer de 5 s...", flush=True)
 
     rx = FPGAFFTReceiver(cfg)
     try:
