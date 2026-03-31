@@ -76,7 +76,9 @@ class FPGAFFTReceiver:
         self._proc: Optional[subprocess.Popen] = None
         self._bytes_per_pair = 8  # real(int32) + imag(int32)
         self._frame_bytes = self.cfg.frame_bins * self._bytes_per_pair
-        self._poll_pairs = 64
+        # Poll at least one full FFT frame per read so Python/GPIO overhead
+        # does not force the ALSA capture side to run near the overrun limit.
+        self._poll_pairs = max(64, self.cfg.frame_bins)
         self._poll_bytes = self._poll_pairs * self._bytes_per_pair
         self._byte_buffer = bytearray()
         self._line_request = None
@@ -281,6 +283,14 @@ class FPGAFFTReceiver:
             return "idle", (payload_l, payload_r)
         return "other", (payload_l, payload_r)
 
+    def _allow_tagged_fft_start_without_bfpexp(self) -> bool:
+        if not self.cfg.require_bfpexp_before_fft:
+            return True
+        # In tagged streams that wait for RPi DONE before emitting the next BFPEXP,
+        # insisting on BFPEXP for the very first decoded frame can deadlock startup
+        # if software attaches while a FFT burst is already in flight.
+        return self.cfg.done_line is not None
+
     def _wait_for_fft_window(self) -> bool:
         if self.cfg.use_i2s_tags:
             return True
@@ -329,11 +339,13 @@ class FPGAFFTReceiver:
                 kind, payload = self._pair_kind_and_payload(pair)
 
                 if waiting_for_start:
+                    if kind == "idle":
+                        continue
                     if kind == "bfpexp":
                         bfpexp_seen = True
                         continue
                     if kind == "fft":
-                        if self.cfg.require_bfpexp_before_fft and not bfpexp_seen:
+                        if (not bfpexp_seen) and (not self._allow_tagged_fft_start_without_bfpexp()):
                             continue
                         waiting_for_start = False
                         fft_pairs.append(payload)
@@ -343,16 +355,19 @@ class FPGAFFTReceiver:
                         continue
                     continue
 
-                # After frame start, count only FFT-tagged pairs.
-                if kind != "fft":
-                    # Frame broke early; force re-sync from a fresh BFPEXP->FFT transition.
-                    self._push_pairs_back(pairs[idx + 1 :])
-                    return None
+                if kind == "fft":
+                    fft_pairs.append(payload)
+                    if len(fft_pairs) >= self.cfg.frame_bins:
+                        self._push_pairs_back(pairs[idx + 1 :])
+                        return np.asarray(fft_pairs, dtype=np.int32)
+                    continue
 
-                fft_pairs.append(payload)
-                if len(fft_pairs) >= self.cfg.frame_bins:
-                    self._push_pairs_back(pairs[idx + 1 :])
-                    return np.asarray(fft_pairs, dtype=np.int32)
+                # Any non-FFT tag after frame start breaks the partial frame.
+                # Discard the partial data and keep scanning the current chunk so
+                # idle/null padding is ignored and a fresh BFPEXP can resync us.
+                fft_pairs.clear()
+                waiting_for_start = True
+                bfpexp_seen = (kind == "bfpexp")
 
         return None
 

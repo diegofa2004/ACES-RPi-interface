@@ -272,6 +272,21 @@ def main() -> int:
     history_size = buffers["history_mfcc"].maxlen or 0
     print("Using ALSA capture device:", device, flush=True)
     print("Reading FPGA FFT stream from I2S...", flush=True)
+    if args.use_i2s_tags:
+        print("Tagged mode: idle-tagged words are ignored while searching for frames.", flush=True)
+        if args.allow_fft_without_bfpexp:
+            print("Tagged mode sync: FFT tags may start a frame even without a BFPEXP tag.", flush=True)
+        elif args.done_line is not None:
+            print(
+                "Tagged mode sync: startup can bootstrap from an in-flight FFT burst because DONE is configured.",
+                flush=True,
+            )
+        else:
+            print(
+                "Tagged mode sync: waiting for BFPEXP before FFT frame start; "
+                "if startup attaches mid-stream, use --done-line or --allow-fft-without-bfpexp.",
+                flush=True,
+            )
     print(
         "Buffer sizes:",
         f"pre_mfcc={pre_size}",
@@ -288,7 +303,6 @@ def main() -> int:
         while True:
             frame = rx.read_frame()
             if frame is None:
-                time.sleep(0.005)
                 continue
 
             fft_bins, mfcc = frame

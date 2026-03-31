@@ -15,7 +15,27 @@ from rpi3b_i2s_fft import i2s_stream
 class I2SStreamTests(unittest.TestCase):
     def test_build_arecord_cmd_uses_expected_format(self):
         cmd = i2s_stream.build_arecord_cmd("hw:1,0", 48000)
-        self.assertEqual(cmd, ["arecord", "-q", "-D", "hw:1,0", "-f", "S32_LE", "-c", "2", "-r", "48000", "-t", "raw"])
+        self.assertEqual(
+            cmd,
+            [
+                "arecord",
+                "-q",
+                "-D",
+                "hw:1,0",
+                "-B",
+                str(i2s_stream.DEFAULT_ARECORD_BUFFER_TIME_US),
+                "-F",
+                str(i2s_stream.DEFAULT_ARECORD_PERIOD_TIME_US),
+                "-f",
+                "S32_LE",
+                "-c",
+                "2",
+                "-r",
+                "48000",
+                "-t",
+                "raw",
+            ],
+        )
 
     def test_trim_incomplete_frames_discards_partial_tail(self):
         raw = b"\x00" * 19

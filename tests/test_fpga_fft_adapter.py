@@ -21,6 +21,13 @@ class FFTAdapterConfigTests(unittest.TestCase):
 
 
 class FPGAFFTReceiverTests(unittest.TestCase):
+    def test_receiver_polls_at_least_one_frame_per_read(self):
+        cfg = FFTAdapterConfig(frame_bins=512, useful_bins=256)
+        rx = FPGAFFTReceiver(cfg)
+
+        self.assertEqual(rx._poll_pairs, 512)
+        self.assertEqual(rx._poll_bytes, 4096)
+
     def test_start_and_stop_use_capture_process_helpers(self):
         fake_proc = FakeProcess(b"")
         cfg = FFTAdapterConfig(device="auto")
@@ -87,6 +94,54 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         fft_bins, _ = frame
         np.testing.assert_allclose(fft_bins, np.asarray([np.sqrt(5.0), 5.0, 13.0, 17.0], dtype=np.float32))
 
+    def test_tagged_mode_with_done_line_can_bootstrap_from_fft_without_bfpexp(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            done_line=24,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (2, 1, 2),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, 8, 15),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([np.sqrt(5.0), 5.0, 13.0, 17.0], dtype=np.float32))
+
+    def test_tagged_mode_discards_idle_pairs_while_searching_for_frame(self):
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True, handshake_timeout_seconds=0.01)
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (0, 0, 0),
+                    (0, 0, 0),
+                    (1, 7, 7),
+                    (0, 0, 0),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
     def test_tagged_mode_resynchronizes_after_broken_frame(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True, handshake_timeout_seconds=0.01)
         rx = FPGAFFTReceiver(cfg)
@@ -105,7 +160,6 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         )
         rx._proc = FakeProcess(stream)
 
-        self.assertIsNone(rx.read_frame())
         frame = rx.read_frame()
         self.assertIsNotNone(frame)
         fft_bins, _ = frame

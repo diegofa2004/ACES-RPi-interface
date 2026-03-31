@@ -6,6 +6,8 @@ from typing import BinaryIO
 
 AUTO_AUDIO_DEVICE = "auto"
 BYTES_PER_STEREO_FRAME = 8
+DEFAULT_ARECORD_BUFFER_TIME_US = 250000
+DEFAULT_ARECORD_PERIOD_TIME_US = 50000
 _CAPTURE_DEVICE_RE = re.compile(r"^card\s+(?P<card>\d+):.*device\s+(?P<device>\d+):", re.IGNORECASE)
 _PREFERRED_CAPTURE_KEYWORDS = (
     "googlevoicehat",
@@ -24,6 +26,10 @@ def build_arecord_cmd(device: str, rate: int) -> list[str]:
         "-q",
         "-D",
         device,
+        "-B",
+        str(DEFAULT_ARECORD_BUFFER_TIME_US),
+        "-F",
+        str(DEFAULT_ARECORD_PERIOD_TIME_US),
         "-f",
         "S32_LE",
         "-c",
