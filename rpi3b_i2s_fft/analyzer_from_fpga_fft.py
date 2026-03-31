@@ -1,22 +1,51 @@
 import argparse
+import math
 import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
+
+import numpy as np
 
 try:
+    from .compararEvento import compararEvento
     from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
     from .i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
 except ImportError:
+    from compararEvento import compararEvento
     from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
     from i2s_stream import AUTO_AUDIO_DEVICE, resolve_audio_device
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
+WORK_DIR = Path(__file__).resolve().parent
+EVENTO_FILENAME = WORK_DIR / "evento.npy"
+FFT_FILENAME = WORK_DIR / "fft.npy"
+EVENTO_TMP_FILENAME = WORK_DIR / "evento_tmp.npy"
+FFT_TMP_FILENAME = WORK_DIR / "fft_tmp.npy"
+
+PREBUFFER_SECONDS = 5.0
+HISTORY_SECONDS = 15.0
+RECORD_SECONDS = 5.0
+
+
+def save_event_snapshot(evento: np.ndarray, fft: np.ndarray) -> None:
+    np.save(EVENTO_TMP_FILENAME, evento)
+    os.replace(EVENTO_TMP_FILENAME, EVENTO_FILENAME)
+    np.save(FFT_TMP_FILENAME, fft)
+    os.replace(FFT_TMP_FILENAME, FFT_FILENAME)
+
+
+def frames_for_seconds(sample_rate: int, frame_bins: int, seconds: float) -> int:
+    frames_per_second = sample_rate / frame_bins
+    return max(1, int(math.ceil(frames_per_second * seconds)))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Feed analyzer buffers from FPGA I2S FFT stream.")
+    parser = argparse.ArgumentParser(
+        description="Feed circular buffers from FPGA I2S FFT stream using the same event logic as pyserial."
+    )
     parser.add_argument(
         "-D",
         "--device",
@@ -93,9 +122,44 @@ def main() -> int:
     except RuntimeError as exc:
         parser.error(str(exc))
 
+    os.chdir(WORK_DIR)
+
+    buffer_size = frames_for_seconds(args.rate, args.frame_bins, PREBUFFER_SECONDS)
+    buffer_size2 = frames_for_seconds(args.rate, args.frame_bins, HISTORY_SECONDS)
+    buffer_size3 = frames_for_seconds(args.rate, args.frame_bins, PREBUFFER_SECONDS)
+    buffer_size4 = frames_for_seconds(args.rate, args.frame_bins, HISTORY_SECONDS)
+
     lock = threading.Lock()
-    buffer2 = deque(maxlen=330)  # MFCC history (15 s equivalent windowing in original code)
-    buffer4 = deque(maxlen=330)  # FFT magnitude history
+    buffer = deque(maxlen=buffer_size)
+    buffer2 = deque(maxlen=buffer_size2)
+    buffer3 = deque(maxlen=buffer_size3)
+    buffer4 = deque(maxlen=buffer_size4)
+
+    state = {
+        "recording": False,
+        "record_start": 0.0,
+        "future_buffer": [],
+        "future_buffer2": [],
+        "last_event_time": 0.0,
+    }
+
+    def toggle_recording() -> None:
+        while True:
+            try:
+                input()
+            except EOFError:
+                return
+
+            with lock:
+                if state["recording"]:
+                    continue
+
+                state["future_buffer"] = []
+                state["future_buffer2"] = []
+                state["recording"] = True
+                state["record_start"] = time.time()
+
+            print("Gravando evento com pre-buffer de 5 s...", flush=True)
 
     try:
         cfg = FFTAdapterConfig(
@@ -129,9 +193,26 @@ def main() -> int:
         print(str(exc), flush=True)
         return 1
 
-    print("Using ALSA capture device:", device)
-    print("Reading FPGA FFT stream from I2S...")
-    print("Press Ctrl+C to stop")
+    threading.Thread(target=toggle_recording, daemon=True).start()
+    threading.Thread(
+        target=compararEvento,
+        args=(buffer2, buffer4, lock, lambda: state["last_event_time"]),
+        daemon=True,
+    ).start()
+
+    print("Using ALSA capture device:", device, flush=True)
+    print("Reading FPGA FFT stream from I2S...", flush=True)
+    print(
+        "Buffer sizes:",
+        f"pre_mfcc={buffer_size}",
+        f"history_mfcc={buffer_size2}",
+        f"pre_fft={buffer_size3}",
+        f"history_fft={buffer_size4}",
+        flush=True,
+    )
+    print("Press ENTER to save an event like the pyserial flow.", flush=True)
+    print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)
+    print("Press Ctrl+C to stop.", flush=True)
 
     try:
         while True:
@@ -141,19 +222,34 @@ def main() -> int:
                 continue
 
             fft_bins, mfcc = frame
-            with lock:
-                buffer2.append(mfcc[:8])
-                buffer4.append(fft_bins)
+            mfcc8 = np.asarray(mfcc[:8], dtype=np.float32)
+            fft_bins = np.asarray(fft_bins, dtype=np.float32)
+            complete_event = None
 
-            # Replace this print with your analyzer callback if desired.
-            print(
-                f"frame ok | mfcc0={float(mfcc[0]):.3f} mfcc1={float(mfcc[1]):.3f} "
-                f"fft_peak={float(fft_bins.max()):.3f}",
-                flush=True,
-            )
+            with lock:
+                buffer.append(mfcc8.copy())
+                buffer2.append(mfcc8.copy())
+                buffer3.append(fft_bins.copy())
+                buffer4.append(fft_bins.copy())
+
+                if state["recording"]:
+                    state["future_buffer"].append(mfcc8.copy())
+                    state["future_buffer2"].append(fft_bins.copy())
+
+                    if time.time() - state["record_start"] >= RECORD_SECONDS:
+                        evento = np.array(list(buffer) + state["future_buffer"], dtype=np.float32)
+                        fft = np.array(list(buffer3) + state["future_buffer2"], dtype=np.float32)
+                        state["last_event_time"] = time.time()
+                        state["recording"] = False
+                        complete_event = (evento, fft)
+
+            if complete_event is not None:
+                evento, fft = complete_event
+                save_event_snapshot(evento, fft)
+                print("evento de 10s salvo", flush=True)
 
     except KeyboardInterrupt:
-        print("Stopping...")
+        print("Stopping...", flush=True)
     finally:
         rx.stop()
 

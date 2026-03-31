@@ -84,10 +84,15 @@ Next steps:
    sudo reboot
 2. After reboot, list ALSA devices:
    arecord -l
-3. Start the I2S FFT daemon:
-  ${PROJECT_DIR}/.venv/bin/python ${PROJECT_DIR}/fft_i2s_daemon.py -r 48000
-4. In another shell, read latest real/imag values:
-   ${PROJECT_DIR}/.venv/bin/python ${PROJECT_DIR}/fft_i2s_client.py --watch
+3. Recommended event-comparison flow:
+   cd ${PROJECT_DIR}
+   .venv/bin/python analyzer_from_fpga_fft.py -r 48000 --frame-bins 512 --useful-bins 256
+4. Optional second terminal for FFT visualization:
+   cd ${PROJECT_DIR}
+   .venv/bin/python plotFFT.py --rate 48000 --frame-bins 512
+5. Optional third terminal for raw CSV logging:
+   cd ${PROJECT_DIR}
+   .venv/bin/python fft_i2s_logger.py -r 48000 --csv fft_capture.csv
 
 If auto-detection chooses the wrong input, set AUDIO_DEVICE or pass -D hw:X,Y explicitly.
 If you are using FPGA as I2S master, ensure the selected overlay supports external BCLK/LRCLK input.
