@@ -245,9 +245,11 @@ window frame by frame, which caused a large CPU cost on the Pi.
 Current comparison behavior:
 
 - selects the most energetic continuous block of the saved event, using a window between 12% and 30% of the recorded event length
-- builds 3 signatures for that block: average MFCC, average FFT, and FFT energy envelope
-- applies an energy gate before scoring low-energy candidate windows
-- scores each candidate window as `0.10 * MFCC + 0.65 * FFT + 0.25 * envelope`
+- groups the FFT into 32 wider bands and subtracts a per-band stationary background profile before scoring
+- gives more weight to the dominant spectral bands of the saved event instead of treating all FFT bins equally
+- adds a band spectral-flux signature so transient spectral changes still influence detection even in noisy rooms
+- applies an energy gate that now combines the saved-event energy floor with the current live-background energy level
+- scores each candidate window as `0.10 * MFCC + 0.40 * band FFT + 0.30 * spectral flux + 0.20 * envelope`
 - uses a relative trigger (`rel`) based on recent score history instead of relying only on a fixed absolute threshold
 - prints `proc_ms` in the terminal so processing time per comparison pass is visible during runtime
 
@@ -262,9 +264,11 @@ Expected accuracy impact versus the previous full-window comparator:
 
 - exact precision/recall was not measured yet; a labeled validation set is required for quantitative numbers
 - tends to be more tolerant to timing jitter, trigger offset, and small frame misalignment because it compares compact signatures of the energetic part of the event
-- can lose sensitivity to fine temporal evolution inside the full event, because different sounds with similar average spectrum and envelope can look more alike than before
+- should reject more stationary fan/air-conditioner/background noise because persistent band energy is suppressed before comparison
+- recovers part of the temporal information lost in the first real-time simplification, because band spectral flux reacts to spectral onsets instead of only average shape
+- can still confuse events that share both the same dominant bands and a similar onset pattern; quantitative validation still depends on a labeled noisy dataset
 - the energy gate should reduce false positives during silence or very weak background activity
-- the same energy gate can miss very quiet target events if they stay below the selected energy fraction
+- the adaptive energy gate is safer in loud rooms, but it can still miss very quiet target events if the event never rises above the live background
 - the relative threshold adapts better to changing background conditions, but detection now depends more on the recent score history than the old fixed-score comparator
 
 Plot-related change:

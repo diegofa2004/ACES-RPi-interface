@@ -7,6 +7,8 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 
 EPSILON = 1e-9
+FFT_BAND_COUNT = 32
+BACKGROUND_PERCENTILE = 35.0
 
 
 def _zscore_1d(x: np.ndarray) -> np.ndarray:
@@ -29,6 +31,16 @@ def _cosine_batch(batch: np.ndarray, ref: np.ndarray) -> np.ndarray:
     return numerador / denominador
 
 
+def _cosine_batch_weighted(batch: np.ndarray, ref: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    batch = np.asarray(batch, dtype=np.float32)
+    ref = np.asarray(ref, dtype=np.float32)
+    weights = np.asarray(weights, dtype=np.float32)
+    numerador = batch @ (ref * weights)
+    norma_batch = np.sqrt(np.sum((batch * batch) * weights, axis=1, dtype=np.float32))
+    norma_ref = np.sqrt(np.sum((ref * ref) * weights, dtype=np.float32))
+    return numerador / ((norma_batch * norma_ref) + EPSILON)
+
+
 def _prepara_mfcc(m: np.ndarray) -> np.ndarray:
     return np.asarray(m, dtype=np.float32)[:, :8]
 
@@ -41,13 +53,63 @@ def _prepara_fft(f: np.ndarray) -> np.ndarray:
     return np.maximum(f, 0.0)
 
 
+def _agrupar_bandas_fft(f: np.ndarray, band_count: int = FFT_BAND_COUNT) -> np.ndarray:
+    f = np.asarray(f, dtype=np.float32)
+    if f.ndim != 2:
+        raise ValueError("FFT data must be 2D")
+
+    useful = f[:, :256]
+    if useful.shape[1] == 0:
+        return np.zeros((useful.shape[0], 0), dtype=np.float32)
+    band_count = max(1, min(int(band_count), useful.shape[1]))
+
+    if useful.shape[1] % band_count == 0:
+        bins_per_band = useful.shape[1] // band_count
+        grouped = useful.reshape(useful.shape[0], band_count, bins_per_band)
+        return np.mean(grouped, axis=2, dtype=np.float32)
+
+    edges = np.linspace(0, useful.shape[1], num=band_count + 1, dtype=np.int32)
+    bands = np.zeros((useful.shape[0], band_count), dtype=np.float32)
+    for idx in range(band_count):
+        start = int(edges[idx])
+        stop = max(start + 1, int(edges[idx + 1]))
+        bands[:, idx] = np.mean(useful[:, start:stop], axis=1, dtype=np.float32)
+    return bands
+
+
+def _suprime_ruido_estacionario(f_bands: np.ndarray, percentile: float = BACKGROUND_PERCENTILE) -> np.ndarray:
+    f_bands = np.asarray(f_bands, dtype=np.float32)
+    if f_bands.ndim != 2 or f_bands.shape[0] == 0:
+        return f_bands
+
+    noise_profile = np.percentile(f_bands, percentile, axis=0, keepdims=True).astype(np.float32)
+    return np.maximum(f_bands - noise_profile, 0.0)
+
+
+def _prepara_fft_bandas(f_prepared: np.ndarray) -> np.ndarray:
+    return _suprime_ruido_estacionario(_agrupar_bandas_fft(f_prepared))
+
+
 def _energia_frames_fft_raw(f: np.ndarray) -> np.ndarray:
     f = np.asarray(f, dtype=np.float32)
     return np.sum(np.log1p(f[:, :256]), axis=1, dtype=np.float32)
 
 
-def _assinatura_fft(f_sel: np.ndarray) -> np.ndarray:
-    return _zscore_1d(np.mean(f_sel, axis=0, dtype=np.float32))
+def _pesos_bandas_referencia(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32)
+    destaque = np.maximum(v - np.median(v, dtype=np.float32), 0.0)
+    soma = float(np.sum(destaque, dtype=np.float32))
+    if soma <= EPSILON:
+        return np.ones_like(v, dtype=np.float32)
+
+    normalized = destaque / soma
+    return 0.25 + (normalized * np.float32(v.size))
+
+
+def _assinatura_fft(f_sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    f_bands = _prepara_fft_bandas(f_sel)
+    mean_bands = np.mean(f_bands, axis=0, dtype=np.float32)
+    return _zscore_1d(mean_bands), _pesos_bandas_referencia(mean_bands)
 
 
 def _assinatura_mfcc(m_sel: np.ndarray) -> np.ndarray:
@@ -56,6 +118,22 @@ def _assinatura_mfcc(m_sel: np.ndarray) -> np.ndarray:
 
 def _assinatura_env(f_sel_raw: np.ndarray) -> np.ndarray:
     return _zscore_1d(_energia_frames_fft_raw(f_sel_raw))
+
+
+def _fluxo_espectral_bandas(f_bands: np.ndarray) -> np.ndarray:
+    f_bands = np.asarray(f_bands, dtype=np.float32)
+    if f_bands.ndim != 2:
+        raise ValueError("Band FFT data must be 2D")
+    if f_bands.shape[0] < 2:
+        return np.zeros((0, f_bands.shape[1]), dtype=np.float32)
+    return np.maximum(np.diff(f_bands, axis=0), 0.0)
+
+
+def _assinatura_fluxo(f_sel: np.ndarray) -> np.ndarray:
+    fluxo = _fluxo_espectral_bandas(_prepara_fft_bandas(f_sel))
+    if fluxo.shape[0] == 0:
+        return np.zeros((FFT_BAND_COUNT,), dtype=np.float32)
+    return _zscore_1d(np.mean(fluxo, axis=0, dtype=np.float32))
 
 
 def _window_mean_2d(x: np.ndarray, window_size: int, step: int) -> np.ndarray:
@@ -117,6 +195,8 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
 
     bloco_mfcc_ref = None
     bloco_fft_ref = None
+    bloco_fft_pesos = None
+    bloco_fluxo_ref = None
     bloco_env_ref = None
     bloco_tamanho_cache = 0
     energia_bloco_ref_cache = 0.0
@@ -138,6 +218,8 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
         if (
             bloco_mfcc_ref is None
             or bloco_fft_ref is None
+            or bloco_fft_pesos is None
+            or bloco_fluxo_ref is None
             or bloco_env_ref is None
             or mtime_evento != last_mtime_evento
             or mtime_fft != last_mtime_fft
@@ -155,7 +237,8 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
             bloco_fft_raw = evento_fft_raw[i0:i1]
 
             bloco_mfcc_ref = _assinatura_mfcc(bloco_mfcc)
-            bloco_fft_ref = _assinatura_fft(bloco_fft)
+            bloco_fft_ref, bloco_fft_pesos = _assinatura_fft(bloco_fft)
+            bloco_fluxo_ref = _assinatura_fluxo(bloco_fft)
             bloco_env_ref = _assinatura_env(bloco_fft_raw)
 
             bloco_tamanho_cache = i1 - i0
@@ -186,10 +269,25 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
 
         energia_frames = _energia_frames_fft_raw(atual_fft_full)
         energia_janelas = _window_mean_1d(energia_frames, bloco_tamanho, PASSO_JANELA)
-        validas = energia_janelas >= (MIN_ENERGIA_JANELA * energia_bloco_ref)
+        energia_baseline = float(np.percentile(energia_frames, 35))
+        energia_quieta = energia_frames[energia_frames <= np.percentile(energia_frames, 50)]
+        if energia_quieta.size == 0:
+            energia_quieta = energia_frames
+        energia_spread = float(np.std(energia_quieta, dtype=np.float32) + EPSILON)
+        min_energia_janela = max(MIN_ENERGIA_JANELA * energia_bloco_ref, energia_baseline + (0.5 * energia_spread))
+        validas = energia_janelas >= min_energia_janela
 
         mfcc_medias = _window_mean_2d(_prepara_mfcc(atual_mfcc_full), bloco_tamanho, PASSO_JANELA)
-        fft_medias = _window_mean_2d(_prepara_fft(atual_fft_full), bloco_tamanho, PASSO_JANELA)
+        fft_bands = _prepara_fft_bandas(_prepara_fft(atual_fft_full))
+        fft_medias = _window_mean_2d(fft_bands, bloco_tamanho, PASSO_JANELA)
+        fluxo_frames = _fluxo_espectral_bandas(fft_bands)
+        fluxo_tamanho = max(1, bloco_tamanho - 1)
+        if fluxo_frames.shape[0] >= fluxo_tamanho:
+            fluxo_medias = _window_mean_2d(fluxo_frames, fluxo_tamanho, PASSO_JANELA)
+            ref_fluxo = _zscore_rows(fluxo_medias)
+            s_fluxo = _cosine_batch(ref_fluxo, bloco_fluxo_ref)
+        else:
+            s_fluxo = np.zeros((fft_medias.shape[0],), dtype=np.float32)
         env_janelas = sliding_window_view(energia_frames, bloco_tamanho)[::PASSO_JANELA]
 
         ref_mfcc = _zscore_rows(mfcc_medias)
@@ -197,22 +295,24 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
         ref_env = _zscore_rows(np.asarray(env_janelas, dtype=np.float32))
 
         s_mfcc = _cosine_batch(ref_mfcc, bloco_mfcc_ref)
-        s_fft = _cosine_batch(ref_fft, bloco_fft_ref)
+        s_fft = _cosine_batch_weighted(ref_fft, bloco_fft_ref, bloco_fft_pesos)
         s_env = _cosine_batch(ref_env, bloco_env_ref)
 
-        score = (0.10 * s_mfcc) + (0.65 * s_fft) + (0.25 * s_env)
+        score = (0.10 * s_mfcc) + (0.40 * s_fft) + (0.30 * s_fluxo) + (0.20 * s_env)
         score = np.where(validas, score, -np.inf)
 
         if np.all(~validas):
             melhor_score = 0.0
             melhor_mfcc = 0.0
             melhor_fft = 0.0
+            melhor_fluxo = 0.0
             melhor_env = 0.0
         else:
             melhor_idx = int(np.argmax(score))
             melhor_score = float(score[melhor_idx])
             melhor_mfcc = float(s_mfcc[melhor_idx])
             melhor_fft = float(s_fft[melhor_idx])
+            melhor_fluxo = float(s_fluxo[melhor_idx])
             melhor_env = float(s_env[melhor_idx])
 
         hist_scores.append(melhor_score)
@@ -234,6 +334,7 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
             f"base={baseline:.3f} "
             f"mfcc={melhor_mfcc:.3f} "
             f"fft={melhor_fft:.3f} "
+            f"fluxo={melhor_fluxo:.3f} "
             f"env={melhor_env:.3f} "
             f"janelas={len(score)} "
             f"proc_ms={elapsed_ms:.1f}"
