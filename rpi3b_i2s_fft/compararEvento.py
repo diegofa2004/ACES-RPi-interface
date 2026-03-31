@@ -97,7 +97,8 @@ def _energia_frames_fft_raw(f: np.ndarray) -> np.ndarray:
 
 def _pesos_bandas_referencia(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=np.float32)
-    destaque = np.maximum(v - np.median(v, dtype=np.float32), 0.0)
+    baseline = np.float32(np.median(v))
+    destaque = np.maximum(v - baseline, 0.0)
     soma = float(np.sum(destaque, dtype=np.float32))
     if soma <= EPSILON:
         return np.ones_like(v, dtype=np.float32)
