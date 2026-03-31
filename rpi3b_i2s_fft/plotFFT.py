@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -6,6 +8,71 @@ import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _display_available() -> bool:
+    return any(os.environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET"))
+
+
+def _load_pyplot(requested_backend: str):
+    try:
+        import matplotlib
+    except ImportError as exc:
+        raise SystemExit(
+            "matplotlib is required for plotFFT.py. Install the project requirements first."
+        ) from exc
+
+    backend_name = (requested_backend or "auto").strip()
+    if backend_name.lower() == "auto":
+        candidates = ["TkAgg", "Agg"] if _display_available() else ["Agg"]
+    elif backend_name.lower() == "agg":
+        candidates = ["Agg"]
+    else:
+        candidates = [backend_name, "Agg"]
+
+    last_error = None
+    for backend in candidates:
+        try:
+            matplotlib.use(backend, force=True)
+            sys.modules.pop("matplotlib.pyplot", None)
+            import matplotlib.pyplot as plt
+
+            return plt, backend, backend.lower() != "agg"
+        except Exception as exc:  # pragma: no cover - backend availability depends on target system
+            last_error = exc
+
+    raise SystemExit(f"Unable to initialize matplotlib backend {backend_name!r}: {last_error}")
+
+
+def _render_plot(ax, fft_cache: np.ndarray, rate: int, frame_bins: int, max_freq: float, step_hz: float) -> None:
+    freq_per_bin = rate / frame_bins
+    max_bin = min(fft_cache.shape[1], int(max_freq / freq_per_bin) + 1)
+    fft_mag = np.abs(fft_cache[:, :max_bin])
+    fft_mag = 20.0 * np.log10(fft_mag + 1e-9)
+
+    vmax = float(np.max(fft_mag))
+    vmin = vmax - 50.0
+
+    ax.clear()
+    ax.imshow(
+        fft_mag.T,
+        aspect="auto",
+        origin="lower",
+        cmap="inferno",
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    ax.set_title("FFT ao longo do tempo")
+    ax.set_xlabel("Tempo (frames)")
+    ax.set_ylabel("Frequencia (Hz)")
+
+    freq_limit = min(max_freq, (max_bin - 1) * freq_per_bin)
+    freqs_hz = np.arange(0.0, freq_limit + step_hz, step_hz)
+    yticks = freqs_hz / freq_per_bin
+    valid = yticks < max_bin
+    ax.set_yticks(yticks[valid])
+    ax.set_yticklabels([f"{int(freq)}" for freq in freqs_hz[valid]])
 
 
 def main() -> int:
@@ -22,7 +89,18 @@ def main() -> int:
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--max-freq", type=float, default=20000.0, help="Maximum frequency shown on the plot")
     parser.add_argument("--step-hz", type=float, default=1000.0, help="Y-axis label spacing in Hz")
-    parser.add_argument("--backend", default="TkAgg", help="Matplotlib backend for the interactive window")
+    parser.add_argument(
+        "--backend",
+        default="auto",
+        help="Matplotlib backend. Use 'auto' for GUI when available and 'Agg' when headless.",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=SCRIPT_DIR / "fft_latest.png",
+        help="PNG file updated when running with a headless backend such as Agg",
+    )
+    parser.add_argument("--poll-seconds", type=float, default=0.10, help="Polling interval for fft.npy updates")
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -33,35 +111,43 @@ def main() -> int:
         parser.error("--max-freq must be positive")
     if args.step_hz <= 0:
         parser.error("--step-hz must be positive")
+    if args.poll_seconds <= 0:
+        parser.error("--poll-seconds must be positive")
 
-    try:
-        import matplotlib
-    except ImportError as exc:
-        raise SystemExit(
-            "matplotlib is required for plotFFT.py. Install the project requirements first."
-        ) from exc
-
-    matplotlib.use(args.backend)
-    import matplotlib.pyplot as plt
+    plt, backend_name, interactive = _load_pyplot(args.backend)
 
     fft_path = args.fft_file.resolve()
-    freq_per_bin = args.rate / args.frame_bins
+    output_path = args.output_file.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots()
-    plt.ion()
-    plt.show(block=False)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if interactive:
+        plt.ion()
+        plt.show(block=False)
+        print(f"Using matplotlib backend: {backend_name}", flush=True)
+    else:
+        print(
+            f"Using matplotlib backend: {backend_name} (headless mode, updating {output_path})",
+            flush=True,
+        )
 
     fft_cache = None
     last_mtime = 0.0
 
     while True:
         if not fft_path.exists():
-            plt.pause(0.1)
+            if interactive:
+                plt.pause(args.poll_seconds)
+            else:
+                time.sleep(args.poll_seconds)
             continue
 
         mtime = fft_path.stat().st_mtime
         if fft_cache is not None and mtime == last_mtime:
-            plt.pause(0.1)
+            if interactive:
+                plt.pause(args.poll_seconds)
+            else:
+                time.sleep(args.poll_seconds)
             continue
 
         print("FFT atualizada:", fft_path, flush=True)
@@ -70,41 +156,24 @@ def main() -> int:
 
         if fft_cache.ndim != 2 or fft_cache.shape[0] == 0 or fft_cache.shape[1] == 0:
             print("fft.npy tem formato invalido para plot:", fft_cache.shape, flush=True)
-            plt.pause(0.1)
+            if interactive:
+                plt.pause(args.poll_seconds)
+            else:
+                time.sleep(args.poll_seconds)
             continue
 
-        max_bin = min(fft_cache.shape[1], int(args.max_freq / freq_per_bin) + 1)
-        fft_mag = np.abs(fft_cache[:, :max_bin])
-        fft_mag = 20.0 * np.log10(fft_mag + 1e-9)
+        _render_plot(ax, fft_cache, args.rate, args.frame_bins, args.max_freq, args.step_hz)
+        fig.tight_layout()
 
-        vmax = float(np.max(fft_mag))
-        vmin = vmax - 50.0
+        if interactive:
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            plt.pause(0.01)
+        else:
+            fig.savefig(output_path, dpi=120)
+            print("PNG atualizada:", output_path, flush=True)
 
-        ax.clear()
-        ax.imshow(
-            fft_mag.T,
-            aspect="auto",
-            origin="lower",
-            cmap="inferno",
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        ax.set_title("FFT ao longo do tempo")
-        ax.set_xlabel("Tempo (frames)")
-        ax.set_ylabel("Frequencia (Hz)")
-
-        freq_limit = min(args.max_freq, (max_bin - 1) * freq_per_bin)
-        freqs_hz = np.arange(0.0, freq_limit + args.step_hz, args.step_hz)
-        yticks = freqs_hz / freq_per_bin
-        valid = yticks < max_bin
-        ax.set_yticks(yticks[valid])
-        ax.set_yticklabels([f"{int(freq)}" for freq in freqs_hz[valid]])
-
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-        plt.pause(0.01)
-        time.sleep(0.05)
+        time.sleep(args.poll_seconds)
 
 
 if __name__ == "__main__":

@@ -149,6 +149,8 @@ cd rpi3b_i2s_fft
 
 This terminal only visualizes the saved `fft.npy`. It is not required for detection.
 If `matplotlib` is missing, install the project requirements again inside `.venv`.
+When the Raspberry Pi is running without a graphical desktop, `plotFFT.py` now falls back
+to the `Agg` backend automatically and keeps writing `fft_latest.png` instead of opening a window.
 
 Terminal 3 (optional, only if you want a raw CSV dump of the incoming I2S stream):
 
@@ -230,6 +232,42 @@ Important runtime note:
 - the first requirement is having a valid `evento.npy` and `fft.npy`
 - the second requirement is waiting for the `compararEvento` cooldown of 15 seconds
 - after that, score messages and detections are printed automatically in Terminal 1
+
+## Comparison changes and accuracy impact
+
+The current `compararEvento.py` was changed to make the Raspberry Pi path usable in real time.
+The previous version re-normalized and compared the full saved event against each candidate
+window frame by frame, which caused a large CPU cost on the Pi.
+
+Current comparison behavior:
+
+- selects the most energetic continuous block of the saved event, using a window between 12% and 30% of the recorded event length
+- builds 3 signatures for that block: average MFCC, average FFT, and FFT energy envelope
+- applies an energy gate before scoring low-energy candidate windows
+- scores each candidate window as `0.10 * MFCC + 0.65 * FFT + 0.25 * envelope`
+- uses a relative trigger (`rel`) based on recent score history instead of relying only on a fixed absolute threshold
+- prints `proc_ms` in the terminal so processing time per comparison pass is visible during runtime
+
+Practical performance impact:
+
+- removes the hottest Python loop in the old implementation
+- avoids recalculating frame-by-frame cosine similarity across the entire 10 s reference event
+- in a local synthetic benchmark shaped like the FPGA flow, the comparison path dropped from seconds per pass to tens of milliseconds per pass
+- exact Raspberry Pi timing still depends on the Pi model, clocking, and system load
+
+Expected accuracy impact versus the previous full-window comparator:
+
+- exact precision/recall was not measured yet; a labeled validation set is required for quantitative numbers
+- tends to be more tolerant to timing jitter, trigger offset, and small frame misalignment because it compares compact signatures of the energetic part of the event
+- can lose sensitivity to fine temporal evolution inside the full event, because different sounds with similar average spectrum and envelope can look more alike than before
+- the energy gate should reduce false positives during silence or very weak background activity
+- the same energy gate can miss very quiet target events if they stay below the selected energy fraction
+- the relative threshold adapts better to changing background conditions, but detection now depends more on the recent score history than the old fixed-score comparator
+
+Plot-related change:
+
+- `plotFFT.py` now uses `auto` backend selection and falls back to `Agg` in headless Raspberry Pi setups, writing `fft_latest.png`
+- this plot change has no impact on detection accuracy; it only affects visualization reliability
 
 GPIO handshake mode (optional):
 
