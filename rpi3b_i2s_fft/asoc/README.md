@@ -3,6 +3,10 @@
 Esta pasta contém a infraestrutura mínima de kernel/Device Tree para o caminho
 FPGA -> Raspberry Pi 3B definido em `docs/overlay_implemenation_plan.md`.
 
+Para o historico consolidado da investigacao I2S no Raspberry Pi, incluindo
+erros encontrados, matriz experimental e estado parcial atual, veja
+[`../../docs/i2s_rpi_debug_status.md`](../../docs/i2s_rpi_debug_status.md).
+
 ## Artefatos
 
 - `snd-soc-fpgafft-codec.c`: codec ASoC mínimo, capture-only, sem plano de controle.

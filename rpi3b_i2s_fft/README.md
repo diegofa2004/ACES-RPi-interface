@@ -5,6 +5,9 @@ This folder configures Raspberry Pi OS for I2S capture and uses a direct analyze
 For the repository-level rationale behind the current FPGA/host workflow, see
 [`../../../docs/current_state.md`](../../../docs/current_state.md).
 
+For the consolidated status of the Raspberry Pi I2S debug investigation, see
+[`../docs/i2s_rpi_debug_status.md`](../docs/i2s_rpi_debug_status.md).
+
 ## Files
 
 - `setup_rpi_i2s_fft.sh`: installs the official fpgafft overlay/codec plus Python dependencies.
