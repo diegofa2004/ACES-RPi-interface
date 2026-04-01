@@ -19,17 +19,22 @@ class FFTI2SLoggerTests(unittest.TestCase):
         stereo = fft_i2s_logger.decode_stereo_frames(raw)
         np.testing.assert_array_equal(stereo, np.asarray([[1, 2], [3, 4]], dtype=np.int32))
 
+    def test_format_i32_hex_preserves_32bit_pattern(self):
+        self.assertEqual(fft_i2s_logger.format_i32_hex(10), "0x0000000A")
+        self.assertEqual(fft_i2s_logger.format_i32_hex(-1), "0xFFFFFFFF")
+        self.assertEqual(fft_i2s_logger.format_i32_hex(np.int32(-2147483648)), "0x80000000")
+
     def test_write_csv_rows_increments_sequence(self):
         output = io.StringIO()
         writer = csv.writer(output)
-        stereo = np.asarray([[10, 20], [30, 40]], dtype=np.int32)
+        stereo = np.asarray([[10, 20], [-1, 0x12345678]], dtype=np.int32)
         timestamps = iter([1000, 1001])
         next_seq = fft_i2s_logger.write_csv_rows(writer, stereo, 7, timestamp_ns_fn=lambda: next(timestamps))
 
         self.assertEqual(next_seq, 9)
         self.assertEqual(
             output.getvalue().splitlines(),
-            ["1000,7,10,20", "1001,8,30,40"],
+            ["1000,7,0x0000000A,0x00000014", "1001,8,0xFFFFFFFF,0x12345678"],
         )
 
 

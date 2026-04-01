@@ -37,6 +37,10 @@ DEFAULT_LOGGER_CHUNK_FRAMES = 1024
 DEFAULT_CSV_FLUSH_EVERY_CHUNKS = 32
 
 
+def format_i32_hex(value: int) -> str:
+    return f"0x{int(value) & 0xFFFFFFFF:08X}"
+
+
 def decode_stereo_frames(raw: bytes) -> np.ndarray:
     data = np.frombuffer(raw, dtype=np.int32)
     if data.size < 2 or (data.size % 2) != 0:
@@ -54,7 +58,7 @@ def write_csv_rows(
     seq = seq_start
     rows = []
     for row in stereo:
-        rows.append([timestamp_ns_fn(), seq, int(row[0]), int(row[1])])
+        rows.append([timestamp_ns_fn(), seq, format_i32_hex(row[0]), format_i32_hex(row[1])])
         seq = (seq + 1) & 0xFFFFFFFF
     writer.writerows(rows)
     return seq
