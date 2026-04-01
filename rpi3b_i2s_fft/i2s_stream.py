@@ -10,8 +10,8 @@ import numpy as np
 AUTO_AUDIO_DEVICE = "auto"
 BYTES_PER_STEREO_FRAME = 8
 DEFAULT_CAPTURE_RATE_HZ = 48828
-DEFAULT_ARECORD_BUFFER_TIME_US = 250000
-DEFAULT_ARECORD_PERIOD_TIME_US = 50000
+DEFAULT_ARECORD_BUFFER_TIME_US = 1000000
+DEFAULT_ARECORD_PERIOD_TIME_US = 250000
 _CAPTURE_DEVICE_RE = re.compile(r"^card\s+(?P<card>\d+):.*device\s+(?P<device>\d+):", re.IGNORECASE)
 _PREFERRED_CAPTURE_KEYWORDS = (
     "aces-fpgafft",
@@ -31,6 +31,14 @@ _DEFAULT_PAYLOAD_BITS = 18
 _DEFAULT_TAG_IDLE = 0
 _DEFAULT_TAG_BFPEXP = 1
 _DEFAULT_TAG_FFT = 2
+_DEFAULT_ALIGNMENT_SEARCH_PAIR_LIMIT = 512
+_DEFAULT_ALIGNMENT_CONFIRM_PAIRS = 64
+_DEFAULT_ALIGNMENT_VALIDATE_PAIRS = 64
+_DEFAULT_ALIGNMENT_LOCK_MIN_SCORE = 240
+_DEFAULT_ALIGNMENT_LOCK_MIN_MARGIN = 140
+_DEFAULT_ALIGNMENT_MIN_GOOD_RATIO = 0.80
+_DEFAULT_ALIGNMENT_MIN_RESERVED_RATIO = 0.95
+_DEFAULT_ALIGNMENT_MAX_RAW_WORDS = 4096
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,20 @@ class TaggedI2SAlignment:
     initial_word_skip: int
     swap_channels: bool
     score: int
+
+
+@dataclass(frozen=True)
+class TaggedI2SAlignmentMetrics:
+    pair_count: int
+    good_pairs: int
+    reserved_zero_good_pairs: int
+    active_pairs: int
+    fft_pairs: int
+    bfpexp_pairs: int
+    bfpexp_equal_pairs: int
+    invalid_pairs: int
+    longest_fft_run: int
+    bfpexp_to_fft_transitions: int
 
 
 def _reframe_tagged_words(words_u32: np.ndarray, bit_offset: int) -> np.ndarray:
@@ -54,7 +76,7 @@ def _reframe_tagged_words(words_u32: np.ndarray, bit_offset: int) -> np.ndarray:
     return (left | right).astype(np.uint32)
 
 
-def _score_tagged_alignment_candidate(
+def _collect_tagged_alignment_metrics(
     words_u32: np.ndarray,
     *,
     tag_shift: int,
@@ -64,13 +86,22 @@ def _score_tagged_alignment_candidate(
     tag_bfpexp: int,
     tag_fft: int,
     search_pair_limit: int,
-) -> int:
-    if words_u32.size < 8:
-        return -1_000_000
+) -> TaggedI2SAlignmentMetrics:
+    if words_u32.size < 2:
+        return TaggedI2SAlignmentMetrics(
+            pair_count=0,
+            good_pairs=0,
+            reserved_zero_good_pairs=0,
+            active_pairs=0,
+            fft_pairs=0,
+            bfpexp_pairs=0,
+            bfpexp_equal_pairs=0,
+            invalid_pairs=0,
+            longest_fft_run=0,
+            bfpexp_to_fft_transitions=0,
+        )
 
     pair_count = min(words_u32.size // 2, search_pair_limit)
-    if pair_count < 4:
-        return -1_000_000
 
     pairs = words_u32[: pair_count * 2].reshape(-1, 2)
     left = pairs[:, 0]
@@ -97,40 +128,104 @@ def _score_tagged_alignment_candidate(
     active_pairs = bfpexp_pairs | fft_pairs
     bfpexp_equal = bfpexp_pairs & (left == right)
 
-    score = 0
-    score += int(good_pairs.sum()) * 100
-    score += int(reserved_zero[good_pairs].sum()) * 60
-    score += int(active_pairs.sum()) * 30
-    score += int(fft_pairs.sum()) * 15
-    score += int(bfpexp_equal.sum()) * 90
-    score -= int((~good_pairs).sum()) * 220
-    score -= int((good_pairs & (~reserved_zero)).sum()) * 140
+    longest_fft_run = 0
+    current_fft_run = 0
+    bfpexp_to_fft_transitions = 0
+    prev_kind = "invalid"
+    for pair_index in range(pair_count):
+        if not bool(good_pairs[pair_index]):
+            kind = "invalid"
+            current_fft_run = 0
+        elif bool(bfpexp_pairs[pair_index]):
+            kind = "bfpexp"
+            current_fft_run = 0
+        elif bool(fft_pairs[pair_index]):
+            kind = "fft"
+            current_fft_run += 1
+            if current_fft_run > longest_fft_run:
+                longest_fft_run = current_fft_run
+        else:
+            kind = "idle"
+            current_fft_run = 0
 
-    if active_pairs.sum() == 0:
+        if prev_kind == "bfpexp" and kind == "fft":
+            bfpexp_to_fft_transitions += 1
+        prev_kind = kind
+
+    return TaggedI2SAlignmentMetrics(
+        pair_count=pair_count,
+        good_pairs=int(good_pairs.sum()),
+        reserved_zero_good_pairs=int(reserved_zero[good_pairs].sum()),
+        active_pairs=int(active_pairs.sum()),
+        fft_pairs=int(fft_pairs.sum()),
+        bfpexp_pairs=int(bfpexp_pairs.sum()),
+        bfpexp_equal_pairs=int(bfpexp_equal.sum()),
+        invalid_pairs=int((~good_pairs).sum()),
+        longest_fft_run=longest_fft_run,
+        bfpexp_to_fft_transitions=bfpexp_to_fft_transitions,
+    )
+
+
+def _score_tagged_alignment_candidate(
+    words_u32: np.ndarray,
+    *,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+    tag_idle: int,
+    tag_bfpexp: int,
+    tag_fft: int,
+    search_pair_limit: int,
+) -> int:
+    metrics = _collect_tagged_alignment_metrics(
+        words_u32,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+        tag_idle=tag_idle,
+        tag_bfpexp=tag_bfpexp,
+        tag_fft=tag_fft,
+        search_pair_limit=search_pair_limit,
+    )
+    if metrics.pair_count < 4:
+        return -1_000_000
+
+    score = 0
+    score += metrics.good_pairs * 120
+    score += metrics.reserved_zero_good_pairs * 80
+    score += metrics.active_pairs * 35
+    score += metrics.fft_pairs * 18
+    score += metrics.bfpexp_equal_pairs * 110
+    score += metrics.longest_fft_run * 25
+    score += metrics.bfpexp_to_fft_transitions * 160
+    score -= metrics.invalid_pairs * 260
+    score -= max(0, metrics.good_pairs - metrics.reserved_zero_good_pairs) * 180
+
+    if metrics.active_pairs == 0:
         score -= 2_000
-    if reserved_zero[good_pairs].sum() < max(2, good_pairs.sum() // 2):
-        score -= 800
+    if metrics.longest_fft_run < 4:
+        score -= 600
 
     return score
 
 
-def detect_tagged_i2s_alignment(
+def _rank_tagged_alignment_candidates(
     stereo: np.ndarray,
     *,
-    tag_shift: int = _DEFAULT_TAG_SHIFT,
-    tag_mask: int = _DEFAULT_TAG_MASK,
-    payload_bits: int = _DEFAULT_PAYLOAD_BITS,
-    tag_idle: int = _DEFAULT_TAG_IDLE,
-    tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
-    tag_fft: int = _DEFAULT_TAG_FFT,
-    search_pair_limit: int = 128,
-) -> Optional[TaggedI2SAlignment]:
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+    tag_idle: int,
+    tag_bfpexp: int,
+    tag_fft: int,
+    search_pair_limit: int,
+) -> list[TaggedI2SAlignment]:
     stereo_i32 = np.asarray(stereo, dtype=np.int32)
     if stereo_i32.size < 8 or (stereo_i32.size % 2) != 0:
-        return None
+        return []
 
     words_u32 = stereo_i32.reshape(-1).astype(np.uint32, copy=False)
-    best: Optional[TaggedI2SAlignment] = None
+    candidates: list[TaggedI2SAlignment] = []
 
     for bit_offset in range(32):
         reframed = _reframe_tagged_words(words_u32, bit_offset)
@@ -156,15 +251,68 @@ def detect_tagged_i2s_alignment(
                     search_pair_limit=search_pair_limit,
                 )
 
-                alignment = TaggedI2SAlignment(
-                    bit_offset=bit_offset,
-                    initial_word_skip=initial_word_skip,
-                    swap_channels=swap_channels,
-                    score=score,
+                candidates.append(
+                    TaggedI2SAlignment(
+                        bit_offset=bit_offset,
+                        initial_word_skip=initial_word_skip,
+                        swap_channels=swap_channels,
+                        score=score,
+                    )
                 )
-                if best is None or alignment.score > best.score:
-                    best = alignment
 
+    candidates.sort(key=lambda alignment: alignment.score, reverse=True)
+    return candidates
+
+
+def _detect_best_alignment_candidates(
+    stereo: np.ndarray,
+    *,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+    tag_idle: int,
+    tag_bfpexp: int,
+    tag_fft: int,
+    search_pair_limit: int,
+) -> tuple[Optional[TaggedI2SAlignment], Optional[TaggedI2SAlignment]]:
+    candidates = _rank_tagged_alignment_candidates(
+        stereo,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+        tag_idle=tag_idle,
+        tag_bfpexp=tag_bfpexp,
+        tag_fft=tag_fft,
+        search_pair_limit=search_pair_limit,
+    )
+    if not candidates:
+        return None, None
+    best = candidates[0]
+    runner_up = candidates[1] if len(candidates) > 1 else None
+    return best, runner_up
+
+
+def detect_tagged_i2s_alignment(
+    stereo: np.ndarray,
+    *,
+    tag_shift: int = _DEFAULT_TAG_SHIFT,
+    tag_mask: int = _DEFAULT_TAG_MASK,
+    payload_bits: int = _DEFAULT_PAYLOAD_BITS,
+    tag_idle: int = _DEFAULT_TAG_IDLE,
+    tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
+    tag_fft: int = _DEFAULT_TAG_FFT,
+    search_pair_limit: int = _DEFAULT_ALIGNMENT_SEARCH_PAIR_LIMIT,
+) -> Optional[TaggedI2SAlignment]:
+    best, _runner_up = _detect_best_alignment_candidates(
+        stereo,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+        tag_idle=tag_idle,
+        tag_bfpexp=tag_bfpexp,
+        tag_fft=tag_fft,
+        search_pair_limit=search_pair_limit,
+    )
     if best is None or best.score < 120:
         return None
 
@@ -181,6 +329,15 @@ class TaggedI2SRealigner:
         tag_idle: int = _DEFAULT_TAG_IDLE,
         tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
         tag_fft: int = _DEFAULT_TAG_FFT,
+        search_pair_limit: int = _DEFAULT_ALIGNMENT_SEARCH_PAIR_LIMIT,
+        confirm_pairs: int = _DEFAULT_ALIGNMENT_CONFIRM_PAIRS,
+        validate_pairs: int = _DEFAULT_ALIGNMENT_VALIDATE_PAIRS,
+        min_lock_score: int = _DEFAULT_ALIGNMENT_LOCK_MIN_SCORE,
+        min_lock_margin: int = _DEFAULT_ALIGNMENT_LOCK_MIN_MARGIN,
+        min_good_ratio: float = _DEFAULT_ALIGNMENT_MIN_GOOD_RATIO,
+        min_reserved_ratio: float = _DEFAULT_ALIGNMENT_MIN_RESERVED_RATIO,
+        max_raw_words: int = _DEFAULT_ALIGNMENT_MAX_RAW_WORDS,
+        preferred_swap_channels: Optional[bool] = None,
     ):
         self._tag_shift = tag_shift
         self._tag_mask = tag_mask
@@ -188,10 +345,20 @@ class TaggedI2SRealigner:
         self._tag_idle = tag_idle
         self._tag_bfpexp = tag_bfpexp
         self._tag_fft = tag_fft
+        self._search_pair_limit = max(8, int(search_pair_limit))
+        self._confirm_pairs = max(1, int(confirm_pairs))
+        self._validate_pairs = max(4, int(validate_pairs))
+        self._min_lock_score = int(min_lock_score)
+        self._min_lock_margin = int(min_lock_margin)
+        self._min_good_ratio = float(min_good_ratio)
+        self._min_reserved_ratio = float(min_reserved_ratio)
+        self._max_raw_words = max(32, int(max_raw_words))
+        self._preferred_swap_channels = preferred_swap_channels
         self._alignment: Optional[TaggedI2SAlignment] = None
         self._raw_word_buffer = np.empty(0, dtype=np.uint32)
         self._aligned_word_buffer = np.empty(0, dtype=np.uint32)
         self._initial_skip_done = False
+        self._output_enabled = False
 
     @property
     def alignment(self) -> Optional[TaggedI2SAlignment]:
@@ -202,6 +369,154 @@ class TaggedI2SRealigner:
         self._raw_word_buffer = np.empty(0, dtype=np.uint32)
         self._aligned_word_buffer = np.empty(0, dtype=np.uint32)
         self._initial_skip_done = False
+        self._output_enabled = False
+
+    def _trim_raw_word_buffer(self) -> None:
+        if self._raw_word_buffer.size <= self._max_raw_words:
+            return
+        self._raw_word_buffer = self._raw_word_buffer[-self._max_raw_words :].copy()
+
+    def _try_lock_alignment(self) -> bool:
+        search_word_count = (self._raw_word_buffer.size // 2) * 2
+        if search_word_count < 8:
+            return False
+        search_words = self._raw_word_buffer[:search_word_count]
+
+        candidates = _rank_tagged_alignment_candidates(
+            search_words.view(np.int32).reshape(-1, 2),
+            tag_shift=self._tag_shift,
+            tag_mask=self._tag_mask,
+            payload_bits=self._payload_bits,
+            tag_idle=self._tag_idle,
+            tag_bfpexp=self._tag_bfpexp,
+            tag_fft=self._tag_fft,
+            search_pair_limit=self._search_pair_limit,
+        )
+        if not candidates:
+            return False
+        best = candidates[0]
+        runner_up = candidates[1] if len(candidates) > 1 else None
+
+        if self._preferred_swap_channels is not None:
+            for candidate in candidates:
+                if candidate.score != best.score:
+                    break
+                if candidate.bit_offset != best.bit_offset or candidate.initial_word_skip != best.initial_word_skip:
+                    continue
+                if candidate.swap_channels == self._preferred_swap_channels:
+                    best = candidate
+                    break
+        if best is None or best.score < self._min_lock_score:
+            return False
+
+        if runner_up is not None and search_word_count >= 32:
+            same_boundary = (
+                best.bit_offset == runner_up.bit_offset
+                and best.initial_word_skip == runner_up.initial_word_skip
+            )
+            if ((best.score - runner_up.score) < self._min_lock_margin) and (not same_boundary):
+                return False
+
+        self._alignment = best
+        if self._preferred_swap_channels is None:
+            self._preferred_swap_channels = best.swap_channels
+        self._initial_skip_done = False
+        self._output_enabled = False
+        return True
+
+    def _reset_for_relock(self, raw_snapshot: Optional[np.ndarray] = None, *, drop_words: int = 1) -> None:
+        preserved = np.empty(0, dtype=np.uint32)
+        if raw_snapshot is not None and raw_snapshot.size > drop_words:
+            preserved = raw_snapshot[drop_words:]
+            if preserved.size > self._max_raw_words:
+                preserved = preserved[-self._max_raw_words :]
+            preserved = preserved.copy()
+
+        self._alignment = None
+        self._raw_word_buffer = preserved
+        self._aligned_word_buffer = np.empty(0, dtype=np.uint32)
+        self._initial_skip_done = False
+        self._output_enabled = False
+
+    def _consume_aligned_words(self) -> tuple[np.ndarray, np.ndarray]:
+        raw_snapshot = self._raw_word_buffer.copy()
+        if self._alignment is None:
+            return raw_snapshot, np.empty(0, dtype=np.uint32)
+
+        if self._alignment.bit_offset == 0:
+            new_aligned = raw_snapshot
+            self._raw_word_buffer = np.empty(0, dtype=np.uint32)
+            return raw_snapshot, new_aligned
+
+        if raw_snapshot.size < 2:
+            return raw_snapshot, np.empty(0, dtype=np.uint32)
+
+        new_aligned = _reframe_tagged_words(raw_snapshot, self._alignment.bit_offset)
+        self._raw_word_buffer = raw_snapshot[-1:].copy()
+        return raw_snapshot, new_aligned
+
+    def _window_is_valid(self, pair_words: np.ndarray) -> bool:
+        if pair_words.size == 0:
+            return True
+
+        window = np.asarray(pair_words, dtype=np.int32)
+        if window.ndim != 2 or window.shape[1] != 2:
+            window = window.reshape(-1, 2)
+        if window.shape[0] < 2:
+            return True
+
+        window = window[-min(window.shape[0], self._validate_pairs) :]
+        metrics = _collect_tagged_alignment_metrics(
+            window.reshape(-1).astype(np.uint32, copy=False),
+            tag_shift=self._tag_shift,
+            tag_mask=self._tag_mask,
+            payload_bits=self._payload_bits,
+            tag_idle=self._tag_idle,
+            tag_bfpexp=self._tag_bfpexp,
+            tag_fft=self._tag_fft,
+            search_pair_limit=window.shape[0],
+        )
+        if metrics.pair_count == 0:
+            return False
+
+        good_ratio = metrics.good_pairs / metrics.pair_count
+        reserved_ratio = (
+            metrics.reserved_zero_good_pairs / metrics.good_pairs if metrics.good_pairs > 0 else 0.0
+        )
+        return good_ratio >= self._min_good_ratio and reserved_ratio >= self._min_reserved_ratio
+
+    def _pair_is_valid(self, pair_words: np.ndarray) -> bool:
+        pair = np.asarray(pair_words, dtype=np.int32).reshape(-1, 2)
+        if pair.shape[0] != 1:
+            raise ValueError("_pair_is_valid expects exactly one stereo pair")
+
+        metrics = _collect_tagged_alignment_metrics(
+            pair.reshape(-1).astype(np.uint32, copy=False),
+            tag_shift=self._tag_shift,
+            tag_mask=self._tag_mask,
+            payload_bits=self._payload_bits,
+            tag_idle=self._tag_idle,
+            tag_bfpexp=self._tag_bfpexp,
+            tag_fft=self._tag_fft,
+            search_pair_limit=1,
+        )
+        return metrics.pair_count == 1 and metrics.good_pairs == 1 and metrics.reserved_zero_good_pairs == 1
+
+    def _drop_leading_invalid_pairs(self, candidate_words: np.ndarray) -> np.ndarray:
+        pair_word_count = (candidate_words.size // 2) * 2
+        if pair_word_count == 0:
+            return candidate_words
+
+        pair_words = candidate_words[:pair_word_count].reshape(-1, 2)
+        drop_pairs = 0
+        while drop_pairs < pair_words.shape[0]:
+            if self._pair_is_valid(pair_words[drop_pairs : drop_pairs + 1]):
+                break
+            drop_pairs += 1
+
+        if drop_pairs == 0:
+            return candidate_words
+        return candidate_words[drop_pairs * 2 :]
 
     def push_pairs(self, stereo: np.ndarray) -> np.ndarray:
         stereo_i32 = np.asarray(stereo, dtype=np.int32)
@@ -215,53 +530,60 @@ class TaggedI2SRealigner:
             self._raw_word_buffer = words_u32.copy()
         else:
             self._raw_word_buffer = np.concatenate((self._raw_word_buffer, words_u32))
+        self._trim_raw_word_buffer()
 
-        if self._alignment is None:
-            self._alignment = detect_tagged_i2s_alignment(
-                self._raw_word_buffer.view(np.int32).reshape(-1, 2),
-                tag_shift=self._tag_shift,
-                tag_mask=self._tag_mask,
-                payload_bits=self._payload_bits,
-                tag_idle=self._tag_idle,
-                tag_bfpexp=self._tag_bfpexp,
-                tag_fft=self._tag_fft,
-            )
-            if self._alignment is None:
+        for _attempt in range(3):
+            if self._alignment is None and (not self._try_lock_alignment()):
                 return np.empty((0, 2), dtype=np.int32)
 
-        if self._alignment.bit_offset == 0:
-            new_aligned = self._raw_word_buffer
-            self._raw_word_buffer = np.empty(0, dtype=np.uint32)
-        else:
-            if self._raw_word_buffer.size < 2:
+            raw_snapshot, new_aligned = self._consume_aligned_words()
+            if new_aligned.size == 0:
                 return np.empty((0, 2), dtype=np.int32)
-            new_aligned = _reframe_tagged_words(self._raw_word_buffer, self._alignment.bit_offset)
-            self._raw_word_buffer = self._raw_word_buffer[-1:].copy()
 
-        if self._aligned_word_buffer.size == 0:
-            self._aligned_word_buffer = new_aligned
-        else:
-            self._aligned_word_buffer = np.concatenate((self._aligned_word_buffer, new_aligned))
+            if self._aligned_word_buffer.size == 0:
+                candidate_words = new_aligned
+            else:
+                candidate_words = np.concatenate((self._aligned_word_buffer, new_aligned))
 
-        if (not self._initial_skip_done) and self._alignment.initial_word_skip:
-            if self._aligned_word_buffer.size <= self._alignment.initial_word_skip:
+            if (not self._initial_skip_done) and self._alignment is not None and self._alignment.initial_word_skip:
+                if candidate_words.size <= self._alignment.initial_word_skip:
+                    self._aligned_word_buffer = candidate_words
+                    return np.empty((0, 2), dtype=np.int32)
+                candidate_words = candidate_words[self._alignment.initial_word_skip :]
+                self._initial_skip_done = True
+            else:
+                self._initial_skip_done = True
+
+            candidate_words = self._drop_leading_invalid_pairs(candidate_words)
+
+            pair_word_count = (candidate_words.size // 2) * 2
+            if pair_word_count == 0:
+                self._aligned_word_buffer = candidate_words
                 return np.empty((0, 2), dtype=np.int32)
-            self._aligned_word_buffer = self._aligned_word_buffer[self._alignment.initial_word_skip :]
-            self._initial_skip_done = True
-        else:
-            self._initial_skip_done = True
 
-        pair_word_count = (self._aligned_word_buffer.size // 2) * 2
-        if pair_word_count == 0:
-            return np.empty((0, 2), dtype=np.int32)
+            pair_words = candidate_words[:pair_word_count].reshape(-1, 2)
+            swap_output = False
+            if self._preferred_swap_channels is None:
+                swap_output = bool(self._alignment is not None and self._alignment.swap_channels)
+            else:
+                swap_output = self._preferred_swap_channels
+            if swap_output:
+                pair_words = pair_words[:, ::-1]
 
-        pair_words = self._aligned_word_buffer[:pair_word_count].reshape(-1, 2)
-        self._aligned_word_buffer = self._aligned_word_buffer[pair_word_count:]
+            if not self._window_is_valid(pair_words):
+                self._reset_for_relock(raw_snapshot, drop_words=1)
+                continue
 
-        if self._alignment.swap_channels:
-            pair_words = pair_words[:, ::-1]
+            if (not self._output_enabled) and pair_words.shape[0] < self._confirm_pairs:
+                self._aligned_word_buffer = candidate_words
+                return np.empty((0, 2), dtype=np.int32)
 
-        return pair_words.astype(np.uint32, copy=False).view(np.int32)
+            self._output_enabled = True
+            self._aligned_word_buffer = candidate_words[pair_word_count:]
+            return pair_words.astype(np.uint32, copy=False).view(np.int32)
+
+        self._reset_for_relock()
+        return np.empty((0, 2), dtype=np.int32)
 
 
 def build_arecord_cmd(device: str, rate: int) -> list[str]:

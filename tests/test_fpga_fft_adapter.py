@@ -26,8 +26,8 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         cfg = FFTAdapterConfig(frame_bins=512, useful_bins=256)
         rx = FPGAFFTReceiver(cfg)
 
-        self.assertEqual(rx._poll_pairs, 512)
-        self.assertEqual(rx._poll_bytes, 4096)
+        self.assertEqual(rx._poll_pairs, 2048)
+        self.assertEqual(rx._poll_bytes, 16384)
 
     def test_read_available_pairs_can_return_partial_chunk(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4)

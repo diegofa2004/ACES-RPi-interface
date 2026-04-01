@@ -1,4 +1,5 @@
 import argparse
+import collections
 import csv
 import os
 import signal
@@ -35,12 +36,62 @@ except ImportError:
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
-DEFAULT_LOGGER_CHUNK_FRAMES = 1024
-DEFAULT_CSV_FLUSH_EVERY_CHUNKS = 32
+DEFAULT_LOGGER_CHUNK_FRAMES = 4096
+DEFAULT_CSV_FLUSH_EVERY_CHUNKS = 8
 
 
 def format_i32_hex(value: int) -> str:
     return f"0x{int(value) & 0xFFFFFFFF:08X}"
+
+
+class MirroredPairNormalizer:
+    def __init__(self):
+        self._preferred_by_signature: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def normalize(self, stereo: np.ndarray) -> np.ndarray:
+        stereo_i32 = np.asarray(stereo, dtype=np.int32)
+        if stereo_i32.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        if stereo_i32.ndim != 2 or stereo_i32.shape[1] != 2:
+            stereo_i32 = stereo_i32.reshape(-1, 2)
+
+        stereo_u32 = stereo_i32.astype(np.uint32, copy=False)
+        counts = collections.Counter((int(left), int(right)) for left, right in stereo_u32)
+        chunk_preference: dict[tuple[int, int], tuple[int, int]] = {}
+
+        for (left, right), count in counts.items():
+            if left == right:
+                continue
+
+            reversed_pair = (right, left)
+            key = (left, right) if left < right else (right, left)
+            preferred = self._preferred_by_signature.get(key)
+            if preferred is None:
+                reversed_count = counts.get(reversed_pair, 0)
+                if reversed_count > count:
+                    preferred = reversed_pair
+                else:
+                    preferred = (left, right)
+                self._preferred_by_signature[key] = preferred
+            chunk_preference[key] = preferred
+
+        if not chunk_preference:
+            return stereo_i32.copy()
+
+        normalized = stereo_u32.copy()
+        for row in normalized:
+            left = int(row[0])
+            right = int(row[1])
+            if left == right:
+                continue
+            key = (left, right) if left < right else (right, left)
+            preferred = chunk_preference.get(key)
+            if preferred is None:
+                continue
+            if (left, right) != preferred:
+                row[0], row[1] = row[1], row[0]
+
+        return normalized.view(np.int32)
 
 
 def decode_stereo_frames(raw: bytes) -> np.ndarray:
@@ -116,7 +167,8 @@ def main() -> int:
     seq = 0
     chunk_index = 0
     stop = False
-    realigner = TaggedI2SRealigner()
+    realigner = TaggedI2SRealigner(preferred_swap_channels=True)
+    normalizer = MirroredPairNormalizer()
 
     def handle_stop(_sig: int, _frame: Optional[object]) -> None:
         nonlocal stop
@@ -160,6 +212,7 @@ def main() -> int:
                 stereo = realigner.push_pairs(stereo)
                 if stereo.size == 0:
                     continue
+                stereo = normalizer.normalize(stereo)
 
                 seq = write_csv_rows(writer, stereo, seq)
                 chunk_index += 1

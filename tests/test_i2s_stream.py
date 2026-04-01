@@ -22,6 +22,22 @@ class I2SStreamTests(unittest.TestCase):
         shifted = shifted[: (shifted.size // 2) * 2]
         return shifted.view(np.int32).reshape(-1, 2)
 
+    @staticmethod
+    def _is_valid_tagged_output(pairs: np.ndarray) -> bool:
+        if pairs.size == 0:
+            return True
+        metrics = i2s_stream._collect_tagged_alignment_metrics(
+            np.asarray(pairs, dtype=np.int32).reshape(-1).astype(np.uint32),
+            tag_shift=30,
+            tag_mask=0x3,
+            payload_bits=18,
+            tag_idle=0,
+            tag_bfpexp=1,
+            tag_fft=2,
+            search_pair_limit=max(4, len(pairs)),
+        )
+        return metrics.pair_count > 0 and metrics.invalid_pairs == 0 and metrics.good_pairs == metrics.pair_count
+
     def test_build_arecord_cmd_uses_expected_format(self):
         cmd = i2s_stream.build_arecord_cmd("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
         self.assertEqual(
@@ -90,7 +106,7 @@ class I2SStreamTests(unittest.TestCase):
         alignment = i2s_stream.detect_tagged_i2s_alignment(observed)
         self.assertIsNotNone(alignment)
 
-        realigner = i2s_stream.TaggedI2SRealigner()
+        realigner = i2s_stream.TaggedI2SRealigner(confirm_pairs=4, validate_pairs=4)
         recovered = realigner.push_pairs(observed)
         self.assertGreaterEqual(recovered.shape[0], 3)
 
@@ -118,7 +134,7 @@ class I2SStreamTests(unittest.TestCase):
         ).view(np.int32)
         observed = self._misframe_pairs(true_pairs, 18)
 
-        realigner = i2s_stream.TaggedI2SRealigner()
+        realigner = i2s_stream.TaggedI2SRealigner(confirm_pairs=4, validate_pairs=4)
         chunks = [observed[:2], observed[2:4], observed[4:]]
         recovered_parts = [realigner.push_pairs(chunk) for chunk in chunks]
         recovered = np.concatenate([part for part in recovered_parts if part.size], axis=0)
@@ -127,6 +143,28 @@ class I2SStreamTests(unittest.TestCase):
         self.assertTrue(
             np.array_equal(recovered[:3], true_pairs[1:4]) or np.array_equal(recovered[:3], true_pairs[2:5])
         )
+
+    def test_tagged_realigner_relocks_after_midstream_phase_jump(self):
+        segment_a = np.asarray(
+            [[0x40000012, 0x40000012]] + [[0x80015555, 0x8000AAAB]] * 8,
+            dtype=np.uint32,
+        ).view(np.int32)
+        segment_b = np.asarray(
+            [[0x40000012, 0x40000012]] + [[0x80015555, 0x8000AAAB]] * 8,
+            dtype=np.uint32,
+        ).view(np.int32)
+        observed_a = self._misframe_pairs(segment_a, 9)
+        observed_b = self._misframe_pairs(segment_b, 23)
+        observed = np.concatenate((observed_a, observed_b), axis=0)
+
+        realigner = i2s_stream.TaggedI2SRealigner(confirm_pairs=4, validate_pairs=8)
+        chunks = [observed[idx : idx + 3] for idx in range(0, observed.shape[0], 3)]
+        recovered_parts = [realigner.push_pairs(chunk) for chunk in chunks]
+        recovered = np.concatenate([part for part in recovered_parts if part.size], axis=0)
+
+        self.assertGreaterEqual(recovered.shape[0], 4)
+        self.assertTrue(self._is_valid_tagged_output(recovered))
+        self.assertTrue(np.any(np.all(recovered == segment_a[1], axis=1)))
 
 
 if __name__ == "__main__":

@@ -37,6 +37,30 @@ class FFTI2SLoggerTests(unittest.TestCase):
             ["1000,7,0x0000000A,0x00000014", "1001,8,0xFFFFFFFF,0x12345678"],
         )
 
+    def test_mirrored_pair_normalizer_keeps_preferred_orientation(self):
+        normalizer = fft_i2s_logger.MirroredPairNormalizer()
+        stereo = np.asarray(
+            [
+                [0x80015555, 0x8000AAAB],
+                [0x8000AAAB, 0x80015555],
+                [0x80015555, 0x8000AAAB],
+                [0x40000012, 0x40000012],
+            ],
+            dtype=np.uint32,
+        ).view(np.int32)
+
+        normalized = normalizer.normalize(stereo)
+        expected = np.asarray(
+            [
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+                [0x40000012, 0x40000012],
+            ],
+            dtype=np.uint32,
+        ).view(np.int32)
+        np.testing.assert_array_equal(normalized, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

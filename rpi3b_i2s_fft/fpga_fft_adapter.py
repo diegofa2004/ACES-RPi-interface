@@ -92,9 +92,9 @@ class FPGAFFTReceiver:
         self._proc: Optional[subprocess.Popen] = None
         self._bytes_per_pair = 8  # real(int32) + imag(int32)
         self._frame_bytes = self.cfg.frame_bins * self._bytes_per_pair
-        # Poll at least one full FFT frame per read so Python/GPIO overhead
-        # does not force the ALSA capture side to run near the overrun limit.
-        self._poll_pairs = max(64, self.cfg.frame_bins)
+        # Poll multiple FFT frames per read so Python/GPIO overhead stays low
+        # and ALSA has more headroom before an overrun forces a stream restart.
+        self._poll_pairs = max(2048, self.cfg.frame_bins)
         self._poll_bytes = self._poll_pairs * self._bytes_per_pair
         self._byte_buffer = bytearray()
         self._line_request = None
@@ -102,7 +102,11 @@ class FPGAFFTReceiver:
         self._done_line = None
         self._gpio_api = None
         self._gpio_chip = None
-        self._tagged_realigner = TaggedI2SRealigner()
+        self._tagged_realigner = TaggedI2SRealigner(
+            confirm_pairs=min(64, max(4, self.cfg.frame_bins)),
+            validate_pairs=min(64, max(4, self.cfg.frame_bins)),
+            preferred_swap_channels=True,
+        )
 
         payload_mask = (1 << self.cfg.payload_bits) - 1
         self._payload_mask = payload_mask
