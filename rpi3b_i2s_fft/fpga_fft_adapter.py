@@ -9,6 +9,7 @@ try:
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
+        TaggedI2SRealigner,
         build_arecord_cmd,
         resolve_audio_device,
         start_arecord_process,
@@ -19,6 +20,7 @@ except ImportError:
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
+        TaggedI2SRealigner,
         build_arecord_cmd,
         resolve_audio_device,
         start_arecord_process,
@@ -100,6 +102,7 @@ class FPGAFFTReceiver:
         self._done_line = None
         self._gpio_api = None
         self._gpio_chip = None
+        self._tagged_realigner = TaggedI2SRealigner()
 
         payload_mask = (1 << self.cfg.payload_bits) - 1
         self._payload_mask = payload_mask
@@ -357,6 +360,9 @@ class FPGAFFTReceiver:
             pairs = self._pop_pairs(self._poll_pairs, exact=False)
             if pairs is None:
                 return None
+            pairs = self._tagged_realigner.push_pairs(pairs)
+            if pairs.size == 0:
+                continue
             for idx, pair in enumerate(pairs):
                 kind, payload = self._pair_kind_and_payload(pair)
 
@@ -398,6 +404,7 @@ class FPGAFFTReceiver:
         self.cfg.device = resolved_device
         cmd = build_arecord_cmd(resolved_device, self.cfg.sample_rate)
         self._byte_buffer.clear()
+        self._tagged_realigner.reset()
         try:
             self._proc = start_arecord_process(resolved_device, self.cfg.sample_rate)
             self._setup_gpio()
@@ -415,6 +422,7 @@ class FPGAFFTReceiver:
             stop_process(self._proc)
             self._proc = None
         self._byte_buffer.clear()
+        self._tagged_realigner.reset()
         self._teardown_gpio()
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:

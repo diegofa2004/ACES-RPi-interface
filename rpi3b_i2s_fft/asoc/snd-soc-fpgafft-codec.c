@@ -24,6 +24,58 @@
 #define FPGAFFT_SLOT_WIDTH_BITS 32
 #define FPGAFFT_TDM_SLOTS 2
 
+static const char *fpgafft_fmt_to_string(unsigned int format)
+{
+	switch (format) {
+	case SND_SOC_DAIFMT_I2S:
+		return "i2s";
+	case SND_SOC_DAIFMT_LEFT_J:
+		return "left_j";
+	case SND_SOC_DAIFMT_RIGHT_J:
+		return "right_j";
+	case SND_SOC_DAIFMT_DSP_A:
+		return "dsp_a";
+	case SND_SOC_DAIFMT_DSP_B:
+		return "dsp_b";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *fpgafft_inv_to_string(unsigned int inversion)
+{
+	switch (inversion) {
+	case SND_SOC_DAIFMT_NB_NF:
+		return "nb_nf";
+	case SND_SOC_DAIFMT_NB_IF:
+		return "nb_if";
+	case SND_SOC_DAIFMT_IB_NF:
+		return "ib_nf";
+	case SND_SOC_DAIFMT_IB_IF:
+		return "ib_if";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *fpgafft_master_to_string(unsigned int master)
+{
+	switch (master) {
+	case 0:
+		return "unspecified";
+	case SND_SOC_DAIFMT_CBM_CFM:
+		return "cbm_cfm";
+	case SND_SOC_DAIFMT_CBM_CFS:
+		return "cbm_cfs";
+	case SND_SOC_DAIFMT_CBS_CFM:
+		return "cbs_cfm";
+	case SND_SOC_DAIFMT_CBS_CFS:
+		return "cbs_cfs";
+	default:
+		return "unknown";
+	}
+}
+
 static int fpgafft_codec_startup(struct snd_pcm_substream *substream,
 				 struct snd_soc_dai *dai)
 {
@@ -46,7 +98,6 @@ static int fpgafft_codec_hw_params(struct snd_pcm_substream *substream,
 				   struct snd_soc_dai *dai)
 {
 	(void)substream;
-	(void)dai;
 
 	if (params_rate(params) != FPGAFFT_CAPTURE_HOST_RATE_HZ)
 		return -EINVAL;
@@ -60,6 +111,13 @@ static int fpgafft_codec_hw_params(struct snd_pcm_substream *substream,
 	if (params_width(params) != FPGAFFT_SLOT_WIDTH_BITS)
 		return -EINVAL;
 
+	dev_info(dai->dev,
+		 "hw_params rate=%u channels=%u format=%u width=%u\n",
+		 params_rate(params),
+		 params_channels(params),
+		 params_format(params),
+		 params_width(params));
+
 	return 0;
 }
 
@@ -69,19 +127,41 @@ static int fpgafft_codec_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int inversion = fmt & SND_SOC_DAIFMT_INV_MASK;
 	unsigned int master = fmt & SND_SOC_DAIFMT_MASTER_MASK;
 
-	(void)dai;
+	dev_info(dai->dev,
+		 "set_fmt raw=0x%x format=%s inversion=%s master=%s\n",
+		 fmt,
+		 fpgafft_fmt_to_string(format),
+		 fpgafft_inv_to_string(inversion),
+		 fpgafft_master_to_string(master));
+
+	switch (format) {
+	case SND_SOC_DAIFMT_I2S:
+	case SND_SOC_DAIFMT_LEFT_J:
+		break;
+	default:
+		return -EINVAL;
+	}
 
 	if (format != SND_SOC_DAIFMT_I2S)
+		dev_warn(dai->dev,
+			 "accepting experimental format=%s for bcm2835-i2s investigation\n",
+			 fpgafft_fmt_to_string(format));
+
+	switch (inversion) {
+	case SND_SOC_DAIFMT_NB_NF:
+	case SND_SOC_DAIFMT_NB_IF:
+	case SND_SOC_DAIFMT_IB_NF:
+	case SND_SOC_DAIFMT_IB_IF:
+		break;
+	default:
 		return -EINVAL;
+	}
 
 	if (inversion != SND_SOC_DAIFMT_NB_NF)
-		return -EINVAL;
+		dev_warn(dai->dev,
+			 "accepting experimental inversion=%s for bcm2835-i2s investigation\n",
+			 fpgafft_inv_to_string(inversion));
 
-	/*
-	 * The clock-master role is declared by simple-audio-card in DT. The
-	 * codec stub does not drive pins itself, but we still reject formats
-	 * that contradict the fixed FPGA-master topology.
-	 */
 	if (master != 0 && master != SND_SOC_DAIFMT_CBM_CFM)
 		return -EINVAL;
 
@@ -103,6 +183,10 @@ static int fpgafft_codec_set_tdm_slot(struct snd_soc_dai *dai,
 
 	if (slot_width != FPGAFFT_SLOT_WIDTH_BITS)
 		return -EINVAL;
+
+	dev_info(dai->dev,
+		 "set_tdm_slot tx_mask=0x%x rx_mask=0x%x slots=%d slot_width=%d\n",
+		 tx_mask, rx_mask, slots, slot_width);
 
 	return 0;
 }

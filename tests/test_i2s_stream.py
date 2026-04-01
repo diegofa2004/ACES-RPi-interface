@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
@@ -13,6 +15,13 @@ from rpi3b_i2s_fft import i2s_stream
 
 
 class I2SStreamTests(unittest.TestCase):
+    @staticmethod
+    def _misframe_pairs(pairs: np.ndarray, bit_offset: int) -> np.ndarray:
+        words = np.asarray(pairs, dtype=np.int32).reshape(-1).astype(np.uint32)
+        shifted = i2s_stream._reframe_tagged_words(words, bit_offset)
+        shifted = shifted[: (shifted.size // 2) * 2]
+        return shifted.view(np.int32).reshape(-1, 2)
+
     def test_build_arecord_cmd_uses_expected_format(self):
         cmd = i2s_stream.build_arecord_cmd("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
         self.assertEqual(
@@ -63,6 +72,61 @@ class I2SStreamTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 i2s_stream.resolve_audio_device("auto")
         self.assertIn("Multiple ALSA capture devices were found", str(ctx.exception))
+
+    def test_detect_tagged_alignment_recovers_expected_words_from_bit_shifted_stream(self):
+        true_pairs = np.asarray(
+            [
+                [0x40000012, 0x40000012],
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+                [0x40000012, 0x40000012],
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+            ],
+            dtype=np.uint32,
+        ).view(np.int32)
+        observed = self._misframe_pairs(true_pairs, 14)
+
+        alignment = i2s_stream.detect_tagged_i2s_alignment(observed)
+        self.assertIsNotNone(alignment)
+
+        realigner = i2s_stream.TaggedI2SRealigner()
+        recovered = realigner.push_pairs(observed)
+        self.assertGreaterEqual(recovered.shape[0], 3)
+
+        recovered_words = recovered.reshape(-1).astype(np.uint32)
+        true_words = true_pairs.reshape(-1).astype(np.uint32)
+
+        found_match = False
+        for start in range(len(true_words) - len(recovered_words[:6]) + 1):
+            if np.array_equal(recovered_words[:6], true_words[start : start + 6]):
+                found_match = True
+                break
+        self.assertTrue(found_match)
+
+    def test_tagged_realigner_survives_chunk_boundaries(self):
+        true_pairs = np.asarray(
+            [
+                [0x40000012, 0x40000012],
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+                [0x40000012, 0x40000012],
+                [0x80015555, 0x8000AAAB],
+                [0x80015555, 0x8000AAAB],
+            ],
+            dtype=np.uint32,
+        ).view(np.int32)
+        observed = self._misframe_pairs(true_pairs, 18)
+
+        realigner = i2s_stream.TaggedI2SRealigner()
+        chunks = [observed[:2], observed[2:4], observed[4:]]
+        recovered_parts = [realigner.push_pairs(chunk) for chunk in chunks]
+        recovered = np.concatenate([part for part in recovered_parts if part.size], axis=0)
+
+        self.assertGreaterEqual(recovered.shape[0], 3)
+        self.assertTrue(
+            np.array_equal(recovered[:3], true_pairs[1:4]) or np.array_equal(recovered[:3], true_pairs[2:5])
+        )
 
 
 if __name__ == "__main__":

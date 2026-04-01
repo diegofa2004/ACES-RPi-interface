@@ -12,6 +12,7 @@ try:
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
+        TaggedI2SRealigner,
         build_arecord_cmd,
         read_exactly,
         resolve_audio_device,
@@ -23,6 +24,7 @@ except ImportError:
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
+        TaggedI2SRealigner,
         build_arecord_cmd,
         read_exactly,
         resolve_audio_device,
@@ -114,6 +116,7 @@ def main() -> int:
     seq = 0
     chunk_index = 0
     stop = False
+    realigner = TaggedI2SRealigner()
 
     def handle_stop(_sig: int, _frame: Optional[object]) -> None:
         nonlocal stop
@@ -151,6 +154,10 @@ def main() -> int:
                     continue
 
                 stereo = decode_stereo_frames(raw)
+                if stereo.size == 0:
+                    continue
+
+                stereo = realigner.push_pairs(stereo)
                 if stereo.size == 0:
                     continue
 

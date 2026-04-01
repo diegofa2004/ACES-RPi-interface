@@ -10,6 +10,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from rpi3b_i2s_fft import fpga_fft_adapter
+from rpi3b_i2s_fft import i2s_stream
 from rpi3b_i2s_fft.fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
 from tests.test_support import FakeProcess, pack_raw_pairs, pack_tagged_pairs
 
@@ -170,6 +171,36 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             ]
         )
         rx._proc = FakeProcess(stream)
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_realigns_bit_shifted_stream(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            require_bfpexp_before_fft=False,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+
+        stream = pack_tagged_pairs(
+            [
+                (1, 7, 7),
+                (2, 3, 4),
+                (2, 5, 12),
+                (2, -8, 15),
+                (2, 7, -24),
+                (1, 9, 9),
+            ]
+        )
+        words = np.frombuffer(stream, dtype=np.int32).astype(np.uint32)
+        misframed = i2s_stream._reframe_tagged_words(words, 14)
+        misframed = misframed[: (misframed.size // 2) * 2].astype(np.uint32).view(np.int32).tobytes()
+        rx._proc = FakeProcess(misframed)
 
         frame = rx.read_frame()
         self.assertIsNotNone(frame)

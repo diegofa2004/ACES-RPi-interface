@@ -1,5 +1,14 @@
 MODULE_NAME := snd-soc-fpgafft-codec
 OVERLAY_NAME := fpga-i2s-rx-32x2-slave
+OVERLAY_VARIANTS := \
+	fpga-i2s-rx-32x2-slave \
+	fpga-i2s-rx-32x2-slave-bitclock-inv \
+	fpga-i2s-rx-32x2-slave-frame-inv \
+	fpga-i2s-rx-32x2-slave-bitclock-frame-inv \
+	fpga-leftj-rx-32x2-slave \
+	fpga-leftj-rx-32x2-slave-bitclock-inv \
+	fpga-leftj-rx-32x2-slave-frame-inv \
+	fpga-leftj-rx-32x2-slave-bitclock-frame-inv
 
 obj-m += $(MODULE_NAME).o
 
@@ -7,7 +16,7 @@ KERNEL_RELEASE ?= $(shell uname -r)
 KERNEL_BUILD_DIR ?= /lib/modules/$(KERNEL_RELEASE)/build
 DTC ?= dtc
 
-.PHONY: all module overlay clean help
+.PHONY: all module overlay overlay-variants clean help
 
 all: module overlay
 
@@ -16,7 +25,9 @@ module:
 
 overlay: $(OVERLAY_NAME).dtbo
 
-$(OVERLAY_NAME).dtbo: $(OVERLAY_NAME)-overlay.dts
+overlay-variants: $(addsuffix .dtbo,$(OVERLAY_VARIANTS))
+
+%.dtbo: %-overlay.dts
 	$(DTC) -@ -I dts -O dtb -o $@ $<
 
 clean:
@@ -30,6 +41,7 @@ help:
 	@echo "  make all     - build the codec module and overlay"
 	@echo "  make module  - build $(MODULE_NAME).ko"
 	@echo "  make overlay - build $(OVERLAY_NAME).dtbo"
+	@echo "  make overlay-variants - build all overlay polarity variants"
 	@echo "  make clean   - clean build outputs"
 	@echo
 	@echo "Variables:"

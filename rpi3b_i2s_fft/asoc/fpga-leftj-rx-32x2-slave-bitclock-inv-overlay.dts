@@ -4,22 +4,6 @@
 / {
 	compatible = "brcm,bcm2835";
 
-	/*
-	 * GPIO18  -> PCM_CLK  <- FPGA BCLK
-	 * GPIO19  -> PCM_FS   <- FPGA LRCLK/WS
-	 * GPIO20  -> PCM_DIN  <- FPGA SD
-	 * GPIO21  -> PCM_DOUT (unused by the capture path)
-	 *
-	 * Variante base:
-	 * - formato I2S
-	 * - sem inversao explicita de BCLK/FS no simple-audio-card
-	 *
-	 * Para investigar problemas de polaridade/sincronismo no bcm2835-i2s,
-	 * use os overlays variantes desta pasta que acrescentam:
-	 * - simple-audio-card,bitclock-inversion
-	 * - simple-audio-card,frame-inversion
-	 */
-
 	fragment@0 {
 		target = <&i2s>;
 		__overlay__ {
@@ -38,8 +22,9 @@
 
 			fpgafft_sound: fpgafft-sound {
 				compatible = "simple-audio-card";
-				simple-audio-card,name = "aces-fpgafft";
-				simple-audio-card,format = "i2s";
+				simple-audio-card,name = "aces-fpgafft-leftj-bclk-inv";
+				simple-audio-card,format = "left_j";
+				simple-audio-card,bitclock-inversion;
 				simple-audio-card,bitclock-master = <&fpgafft_codec_link>;
 				simple-audio-card,frame-master = <&fpgafft_codec_link>;
 				status = "okay";
