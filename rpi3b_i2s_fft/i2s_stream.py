@@ -6,10 +6,13 @@ from typing import BinaryIO
 
 AUTO_AUDIO_DEVICE = "auto"
 BYTES_PER_STEREO_FRAME = 8
+DEFAULT_CAPTURE_RATE_HZ = 48828
 DEFAULT_ARECORD_BUFFER_TIME_US = 250000
 DEFAULT_ARECORD_PERIOD_TIME_US = 50000
 _CAPTURE_DEVICE_RE = re.compile(r"^card\s+(?P<card>\d+):.*device\s+(?P<device>\d+):", re.IGNORECASE)
 _PREFERRED_CAPTURE_KEYWORDS = (
+    "aces-fpgafft",
+    "fpgafft",
     "googlevoicehat",
     "voicehat",
     "voice hat",
@@ -90,7 +93,8 @@ def resolve_audio_device(device: str) -> str:
     devices = list_capture_devices()
     if not devices:
         raise RuntimeError(
-            "No ALSA capture device was found. Check the dtoverlay, reboot the Pi, and run 'arecord -l'."
+            "No ALSA capture device was found. "
+            "Check the fpgafft overlay installation, reboot the Pi, and run 'arecord -l'."
         )
 
     if len(devices) == 1:

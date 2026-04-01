@@ -10,6 +10,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from rpi3b_i2s_fft import plotFFT
+from rpi3b_i2s_fft.i2s_stream import DEFAULT_CAPTURE_RATE_HZ
 
 
 class PlotFFTTests(unittest.TestCase):
@@ -29,7 +30,14 @@ class PlotFFTTests(unittest.TestCase):
         fig, ax = plt.subplots(figsize=(6, 4))
         fft_cache = np.abs(np.arange(1, 41, dtype=np.float32).reshape(5, 8))
 
-        plotFFT._render_plot(ax, fft_cache, rate=48000, frame_bins=512, max_freq=8000.0, step_hz=1000.0)
+        plotFFT._render_plot(
+            ax,
+            fft_cache,
+            rate=DEFAULT_CAPTURE_RATE_HZ,
+            frame_bins=512,
+            max_freq=8000.0,
+            step_hz=1000.0,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "fft.png"

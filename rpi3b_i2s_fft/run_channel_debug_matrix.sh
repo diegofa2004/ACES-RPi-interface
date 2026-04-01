@@ -23,7 +23,7 @@ Usage:
 
 Options:
   -D, --device DEV             ALSA device passed to analyzer (default: auto)
-  -r, --rate HZ                Sample rate (default: 48000)
+  -r, --rate HZ                Sample rate (default: 48828)
       --frame-bins N           FFT bins per frame (default: 512)
       --useful-bins N          Useful bins kept by analyzer config (default: 256)
       --seconds S              Shared raw capture time (default: 12)
@@ -57,7 +57,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
 
 DEVICE="${AUDIO_DEVICE:-auto}"
-RATE=48000
+RATE=48828
 FRAME_BINS=512
 USEFUL_BINS=256
 CAPTURE_SECONDS=12

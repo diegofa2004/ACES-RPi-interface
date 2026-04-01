@@ -12,6 +12,7 @@ if str(TEST_ROOT) not in sys.path:
 
 from rpi3b_i2s_fft import analyzer_from_fpga_fft
 from rpi3b_i2s_fft.fpga_fft_adapter import FFTAdapterConfig
+from rpi3b_i2s_fft.i2s_stream import DEFAULT_CAPTURE_RATE_HZ
 from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_word
 
 
@@ -189,7 +190,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(payloads[3]["top_fft_run_lengths"], [2])
 
     def test_frames_for_seconds_rounds_up(self):
-        self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(48000, 512, 5.0), 469)
+        self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(DEFAULT_CAPTURE_RATE_HZ, 512, 5.0), 477)
 
     def test_arm_recording_only_arms_once(self):
         buffers = analyzer_from_fpga_fft.create_analysis_buffers(8, 2, prebuffer_seconds=1.0, history_seconds=2.0)

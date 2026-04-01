@@ -11,6 +11,7 @@ import numpy as np
 try:
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_RATE_HZ,
         build_arecord_cmd,
         read_exactly,
         resolve_audio_device,
@@ -21,6 +22,7 @@ try:
 except ImportError:
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_RATE_HZ,
         build_arecord_cmd,
         read_exactly,
         resolve_audio_device,
@@ -31,6 +33,8 @@ except ImportError:
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
+DEFAULT_LOGGER_CHUNK_FRAMES = 1024
+DEFAULT_CSV_FLUSH_EVERY_CHUNKS = 32
 
 
 def decode_stereo_frames(raw: bytes) -> np.ndarray:
@@ -48,9 +52,11 @@ def write_csv_rows(
     timestamp_ns_fn=time.time_ns,
 ) -> int:
     seq = seq_start
+    rows = []
     for row in stereo:
-        writer.writerow([timestamp_ns_fn(), seq, int(row[0]), int(row[1])])
+        rows.append([timestamp_ns_fn(), seq, int(row[0]), int(row[1])])
         seq = (seq + 1) & 0xFFFFFFFF
+    writer.writerows(rows)
     return seq
 
 
@@ -64,15 +70,34 @@ def main() -> int:
         default=DEFAULT_AUDIO_DEVICE,
         help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
     )
-    parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate in Hz")
-    parser.add_argument("--chunk-frames", type=int, default=256, help="Frames read per chunk")
+    parser.add_argument(
+        "-r",
+        "--rate",
+        type=int,
+        default=DEFAULT_CAPTURE_RATE_HZ,
+        help="Host-side ALSA sample rate in Hz (nominal wire rate is 48828.125 Hz)",
+    )
+    parser.add_argument(
+        "--chunk-frames",
+        type=int,
+        default=DEFAULT_LOGGER_CHUNK_FRAMES,
+        help="Frames read per chunk",
+    )
     parser.add_argument("--csv", default="fft_capture.csv", help="Output CSV path")
+    parser.add_argument(
+        "--flush-every-chunks",
+        type=int,
+        default=DEFAULT_CSV_FLUSH_EVERY_CHUNKS,
+        help="Flush CSV data every N chunks instead of every chunk",
+    )
     args = parser.parse_args()
 
     if args.rate <= 0:
         parser.error("--rate must be positive")
     if args.chunk_frames <= 0:
         parser.error("--chunk-frames must be positive")
+    if args.flush_every_chunks <= 0:
+        parser.error("--flush-every-chunks must be positive")
 
     try:
         device = resolve_audio_device(args.device)
@@ -83,6 +108,7 @@ def main() -> int:
     chunk_bytes = args.chunk_frames * bytes_per_frame
 
     seq = 0
+    chunk_index = 0
     stop = False
 
     def handle_stop(_sig: int, _frame: Optional[object]) -> None:
@@ -104,7 +130,7 @@ def main() -> int:
         return 1
 
     try:
-        with open(args.csv, "w", newline="", encoding="ascii") as f_csv:
+        with open(args.csv, "w", newline="", encoding="ascii", buffering=1024 * 1024) as f_csv:
             writer = csv.writer(f_csv)
             writer.writerow(["timestamp_ns", "seq", "real", "imag"])
 
@@ -125,7 +151,11 @@ def main() -> int:
                     continue
 
                 seq = write_csv_rows(writer, stereo, seq)
-                f_csv.flush()
+                chunk_index += 1
+                if (chunk_index % args.flush_every_chunks) == 0:
+                    f_csv.flush()
+
+            f_csv.flush()
 
     finally:
         stop_process(proc)

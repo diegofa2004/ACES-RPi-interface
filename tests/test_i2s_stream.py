@@ -14,7 +14,7 @@ from rpi3b_i2s_fft import i2s_stream
 
 class I2SStreamTests(unittest.TestCase):
     def test_build_arecord_cmd_uses_expected_format(self):
-        cmd = i2s_stream.build_arecord_cmd("hw:1,0", 48000)
+        cmd = i2s_stream.build_arecord_cmd("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
         self.assertEqual(
             cmd,
             [
@@ -31,7 +31,7 @@ class I2SStreamTests(unittest.TestCase):
                 "-c",
                 "2",
                 "-r",
-                "48000",
+                str(i2s_stream.DEFAULT_CAPTURE_RATE_HZ),
                 "-t",
                 "raw",
             ],
@@ -46,7 +46,7 @@ class I2SStreamTests(unittest.TestCase):
         proc = SimpleNamespace(
             stdout=(
                 "card 0: Loopback [Loopback], device 0: Loopback PCM [Loopback PCM]\n"
-                "card 2: sndrpii2s [snd_rpi_i2s], device 0: I2S PCM [I2S PCM]\n"
+                "card 2: acesfpgafft [aces-fpgafft], device 0: FPGA FFT Capture [FPGA FFT Capture]\n"
             )
         )
         with mock.patch.object(i2s_stream.subprocess, "run", return_value=proc):

@@ -1,3 +1,8 @@
+> Nota de historico: este documento registra a fase de comparacao entre overlays.
+> A solucao oficial implementada no projeto agora esta em
+> `docs/overlay_implemenation_plan.md` e em
+> `rpi3b_i2s_fft/asoc/fpga-i2s-rx-32x2-slave-overlay.dts`.
+>
 Para o que vocês estão fazendo, eu dividiria os overlays em três níveis de adequação:
 
 ## 1. Overlay ideal: **um overlay próprio do projeto**

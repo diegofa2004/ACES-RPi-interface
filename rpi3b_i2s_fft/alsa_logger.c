@@ -79,7 +79,7 @@ static int set_hw_params(
 
 int main(int argc, char **argv) {
     const char *device = "hw:2,0";
-    unsigned int rate = 48000;
+    unsigned int rate = 48828;
     snd_pcm_uframes_t frames_per_read = 512;
     snd_pcm_uframes_t period_frames = 512;
     snd_pcm_uframes_t buffer_frames = 2048;
@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
 
     if (rate == 0 || frames_per_read == 0) {
         fprintf(stderr, "Uso: %s [device] [rate] [frames_per_read]\n", argv[0]);
+        fprintf(stderr, "Rate padrao do host: 48828 Hz (wire nominal = 48828.125 Hz)\n");
         return 1;
     }
 

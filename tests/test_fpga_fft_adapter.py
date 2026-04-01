@@ -48,7 +48,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
              mock.patch.object(fpga_fft_adapter, "start_arecord_process", return_value=fake_proc) as start_mock, \
              mock.patch.object(fpga_fft_adapter, "stop_process") as stop_mock:
             rx.start()
-            start_mock.assert_called_once_with("hw:2,0", 48000)
+            start_mock.assert_called_once_with("hw:2,0", 48828)
             rx.stop()
             stop_mock.assert_called_once_with(fake_proc)
 

@@ -1,0 +1,56 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	/*
+	 * GPIO18  -> PCM_CLK  <- FPGA BCLK
+	 * GPIO19  -> PCM_FS   <- FPGA LRCLK/WS
+	 * GPIO20  -> PCM_DIN  <- FPGA SD
+	 * GPIO21  -> PCM_DOUT (unused by the capture path)
+	 */
+
+	fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			fpgafft_codec: fpgafft-codec {
+				compatible = "aces,fpgafft-codec";
+				#sound-dai-cells = <0>;
+				status = "okay";
+			};
+
+			fpgafft_sound: fpgafft-sound {
+				compatible = "simple-audio-card";
+				simple-audio-card,name = "aces-fpgafft";
+				simple-audio-card,format = "i2s";
+				simple-audio-card,bitclock-master = <&fpgafft_codec_link>;
+				simple-audio-card,frame-master = <&fpgafft_codec_link>;
+				status = "okay";
+
+				simple-audio-card,cpu {
+					sound-dai = <&i2s>;
+					dai-tdm-slot-num = <2>;
+					dai-tdm-slot-width = <32>;
+				};
+
+				fpgafft_codec_link: simple-audio-card,codec {
+					sound-dai = <&fpgafft_codec>;
+					dai-tdm-slot-num = <2>;
+					dai-tdm-slot-width = <32>;
+				};
+			};
+		};
+	};
+
+	__overrides__ {
+		card_name = <&fpgafft_sound>, "simple-audio-card,name";
+	};
+};

@@ -13,11 +13,11 @@ import numpy as np
 try:
     from .compararEvento import compararEvento
     from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
+    from .i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
 except ImportError:
     from compararEvento import compararEvento
     from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
+    from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -801,7 +801,13 @@ def main() -> int:
         default=DEFAULT_AUDIO_DEVICE,
         help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
     )
-    parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
+    parser.add_argument(
+        "-r",
+        "--rate",
+        type=int,
+        default=DEFAULT_CAPTURE_RATE_HZ,
+        help="Host-side ALSA sample rate in Hz (nominal wire rate is 48828.125 Hz)",
+    )
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
     parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip used for handshake")

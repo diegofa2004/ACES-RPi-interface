@@ -364,13 +364,14 @@ Ponto de entrada do programa.
 Device ALSA padrão. Você pode trocar via linha de comando.
 
 ```c
-    unsigned int rate = 48000;
+    unsigned int rate = 48828;
 ```
 
-Taxa de amostragem padrão.
+Taxa de amostragem padrao do host ALSA. No projeto atual, isso corresponde ao
+enlace fisico nominal de `48 828.125 Hz`.
 
 ```c
-    snd_pcm_uframes_t frames_per_read = 256;
+    snd_pcm_uframes_t frames_per_read = 512;
 ```
 
 Quantidade de frames lidos por chamada.
@@ -381,13 +382,13 @@ Lembre:
 * aqui, 1 frame = left + right
 
 ```c
-    snd_pcm_uframes_t period_frames = 256;
+    snd_pcm_uframes_t period_frames = 512;
 ```
 
 Período ALSA padrão.
 
 ```c
-    snd_pcm_uframes_t buffer_frames = 1024;
+    snd_pcm_uframes_t buffer_frames = 2048;
 ```
 
 Buffer ALSA total padrão.

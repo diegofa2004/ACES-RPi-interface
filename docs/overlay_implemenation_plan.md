@@ -1,409 +1,244 @@
-A seguir está a **documentação técnica completa** para servir como fonte de verdade da implementação do overlay, do codec mínimo e do script de instalação. Ela já incorpora a decisão final de arquitetura:
+# FPGA -> Raspberry Pi 3B ASoC / Overlay Implementation Plan
 
-* **overlay próprio**
-* **codec mínimo próprio**
-* **FPGA sempre como I2S master**
-* **Pi sempre como slave/capture side**
-* **o kernel só transporta words**
-* **parsing do protocolo fica no user space**
+Este documento e a implementacao em `submodules/ACES-RPi-interface/rpi3b_i2s_fft/asoc/`
+sao a fonte de verdade da infraestrutura minima de kernel/overlay para o projeto
+FPGA -> Raspberry Pi.
 
-O Raspberry Pi carrega overlays via `dtoverlay=` no `config.txt`, e o binding `simple-audio-card` é apropriado para descrever a ligação entre o DAI do SoC e um codec-side DAI com propriedades como `format`, `bitclock-master`, `frame-master`, `dai-tdm-slot-num` e `dai-tdm-slot-width`. ([Raspberry Pi][1])
+## 1. Objetivo desta etapa
 
----
+Entregar a infraestrutura minima, correta e auditavel para que o Raspberry Pi 3B
+exponha uma sound card ALSA/ASoC de captura I2S vinda da FPGA, mantendo toda a
+semantica do protocolo no user space.
 
-# Documento técnico de referência
+O resultado esperado desta etapa e:
 
-## FPGA I2S FFT Capture Sound Card para Raspberry Pi 3B
+- sound card ALSA/ASoC estavel e identificavel;
+- captura `S32_LE`, 2 canais, 32 bits por slot;
+- FPGA sempre como mestre de `BCLK` e `LRCLK`;
+- Raspberry Pi sempre como slave/capture side;
+- raw mode e tagged mode compartilhando exatamente o mesmo transporte;
+- parsing do protocolo inteiramente fora do kernel.
 
-## 1. Objetivo
+## 2. Premissas fechadas
 
-Criar uma solução mínima, robusta e auditável para que o Raspberry Pi 3B enxergue, via ALSA/ASoC, uma **sound card de captura I2S** conectada à FPGA.
+Estas decisoes nao devem ser alteradas por esta camada:
 
-Essa solução deve permitir:
+1. O kernel nao interpreta BFPEXP, FFT ou IDLE.
+2. O kernel so transporta words.
+3. O codec do projeto e um stub ASoC minimo, sem plano de controle.
+4. Nao existe configuracao da FPGA por I2C, SPI ou controle equivalente.
+5. O overlay oficial usa `simple-audio-card`.
+6. A FPGA e sempre `bitclock-master` e `frame-master`.
+7. O enlace e sempre:
+   - formato `I2S` Philips
+   - 2 slots
+   - 32 bits por slot
+   - `S32_LE` no host
+8. A taxa fisica nominal do enlace e `48 828.125 Hz`.
+9. A taxa inteira exposta ao ALSA/host e `48828 Hz`.
 
-* criação de uma sound card estável no Linux;
-* captura correta dos **words de 32 bits** que chegam da FPGA;
-* funcionamento tanto para **raw mode** quanto para **tagged mode**;
-* independência entre a camada de transporte no kernel e a interpretação do protocolo no user space.
+## 3. Implementacao final
 
----
+### 3.1 Localizacao dos artefatos
 
-## 2. Escopo funcional
+Todos os artefatos especificos de ASoC/overlay foram colocados em:
 
-### 2.1 O que a solução deve fazer
+`submodules/ACES-RPi-interface/rpi3b_i2s_fft/asoc/`
 
-A solução deve:
+Arquivos implementados:
 
-* habilitar o bloco I2S/PCM do Raspberry Pi;
-* registrar uma sound card ALSA/ASoC própria do projeto;
-* operar com **I2S Philips**;
-* operar com **2 slots fixos de 32 bits** por frame;
-* operar com a FPGA fornecendo:
+- `snd-soc-fpgafft-codec.c`
+- `fpga-i2s-rx-32x2-slave-overlay.dts`
+- `Makefile`
+- `install_fpgafft_overlay.sh`
+- `README.md`
 
-  * `BCLK`
-  * `LRCLK/WS`
-* permitir que aplicações user space leiam os words como `S32_LE`, 2 canais.
+Arquivos atualizados para refletir o fluxo final:
 
-### 2.2 O que a solução não deve fazer
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/setup_rpi_i2s_fft.sh`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/README.md`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/i2s_stream.py`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/fpga_fft_adapter.py`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/analyzer_from_fpga_fft.py`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/fft_i2s_logger.py`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/plotFFT.py`
+- `submodules/ACES-RPi-interface/rpi3b_i2s_fft/alsa_logger.c`
 
-A solução **não deve**:
+### 3.2 Nomes oficiais
 
-* interpretar BFPEXP/FFT/IDLE no kernel;
-* validar tags no kernel;
-* reconstruir frames FFT no kernel;
-* negociar ou configurar parâmetros na FPGA;
-* oferecer plano de controle entre kernel e FPGA.
+Os nomes oficiais adotados nesta implementacao sao:
 
----
+- nome do modulo/driver: `snd-soc-fpgafft-codec`
+- `compatible` do codec em DT: `aces,fpgafft-codec`
+- nome do DAI do codec: `fpgafft-codec-dai`
+- nome estavel da sound card ALSA: `aces-fpgafft`
+- nome do overlay: `fpga-i2s-rx-32x2-slave`
 
-## 3. Decisão arquitetural
+Esses nomes foram escolhidos para serem:
 
-A arquitetura escolhida é:
+- especificos do projeto;
+- curtos o suficiente para `arecord -l`;
+- faceis de buscar em logs e scripts;
+- sem dependencia de nomes de HATs de terceiros.
 
-### 3.1 Overlay próprio
+## 4. Decisao tecnica para o codec minimo
 
-Será criado um overlay próprio do projeto para Raspberry Pi, carregado por `dtoverlay=` no boot. O mecanismo oficial de overlays do Raspberry Pi passa pelo `config.txt`. ([Raspberry Pi][1])
+### 4.1 O que o codec faz
 
-### 3.2 Codec mínimo próprio
+O arquivo `snd-soc-fpgafft-codec.c` implementa um codec ASoC minimo, capture-only,
+registrado como `platform_driver` casado por Device Tree.
 
-Será implementado um **codec mínimo próprio**, cuja única função é existir como endpoint `sound-dai` para o ASoC, permitindo que o `simple-audio-card` feche a topologia.
+Ele faz apenas o necessario para fechar a topologia com `simple-audio-card`:
 
-Esse codec:
+- registra um componente ASoC;
+- registra um DAI de captura;
+- aceita `I2S` Philips;
+- aceita `2` slots de `32` bits;
+- expõe somente `S32_LE`;
+- restringe a abertura do host para `48828 Hz`.
 
-* não controla a FPGA;
-* não possui interface de configuração;
-* não interpreta o protocolo;
-* existe apenas para expor os parâmetros corretos do enlace ao ALSA.
+### 4.2 O que o codec nao faz
 
-### 3.3 User space como camada semântica
+Ele nao:
 
-Toda a interpretação do conteúdo dos words continua fora do kernel:
+- interpreta protocolo;
+- conhece tags;
+- configura FPGA;
+- fala I2C/SPI;
+- expõe mixers, ganhos ou controles;
+- implementa DAPM sofisticado.
 
-* raw mode
-* tagged mode
-* BFPEXP/FFT/IDLE
-* reconstrução de quadro FFT
-* MFCC
-* comparação de eventos
+### 4.3 Justificativa
 
----
+O codec existe apenas para fornecer o endpoint `sound-dai` do lado externo.
+Toda a semantica do stream continua no user space, como ja estava decidido.
 
-## 4. Premissas técnicas fechadas
+## 5. Decisao tecnica para o overlay
 
-Estas premissas são parte do contrato do sistema:
+### 5.1 Topologia registrada
 
-* plataforma: **Raspberry Pi 3B**
-* barramento: **I2S Philips**
-* direção: **captura**
-* FPGA: **sempre master**
-* Raspberry Pi: **sempre slave**
-* slots por frame: **2**
-* largura por slot: **32 bits**
-* formato ALSA esperado: **`S32_LE`**
-* tagged e raw compartilham o mesmo transporte
-* os 32 bits do slot sempre são válidos como word completo no host
-* taxa nominal:
+O overlay `fpga-i2s-rx-32x2-slave-overlay.dts` faz duas coisas:
 
-  * `BCLK = 3,125 MHz`
-  * `LRCLK = 48 828,125 Hz`
-* essa taxa decorre de clock de 50 MHz na FPGA e divisão fixa conforme o projeto
+1. habilita `&i2s`;
+2. cria a sound card `simple-audio-card`.
 
-O binding do `simple-audio-card` suporta exatamente os parâmetros que precisamos fixar: `format`, `bitclock-master`, `frame-master`, `dai-tdm-slot-num` e `dai-tdm-slot-width`. ([Kernel.org][2])
+Topologia logica:
 
----
+- CPU DAI: bloco `i2s` do Raspberry Pi
+- Codec DAI: stub `aces,fpgafft-codec`
+- Card: `simple-audio-card`
 
-## 5. Motivação para usar codec mínimo próprio
+### 5.2 Como o codec e referenciado
 
-Foi considerada a possibilidade de usar um codec pronto, mas a decisão final é usar um **codec mínimo próprio** por estes motivos:
+O overlay cria um no raiz:
 
-* a FPGA não oferece plano de controle;
-* os parâmetros do enlace são totalmente fixos;
-* não há ganho real em reaproveitar um codec rico;
-* um codec pronto pode impor restrições incompatíveis;
-* o objetivo do codec aqui é apenas criar a sound card correta.
+- `fpgafft_codec: fpgafft-codec { compatible = "aces,fpgafft-codec"; #sound-dai-cells = <0>; }`
 
-Portanto, o codec do projeto deve ser entendido como um **stub ASoC de captura digital**, e não como um codec de áudio tradicional com registradores, ganho, mixer ou configuração dinâmica.
+Depois o `simple-audio-card,codec` referencia:
 
----
+- `sound-dai = <&fpgafft_codec>;`
 
-## 6. Modelo em camadas
+As propriedades:
 
-A solução fica organizada em três camadas.
+- `simple-audio-card,bitclock-master`
+- `simple-audio-card,frame-master`
 
-### 6.1 Camada 1 — hardware físico
+apontam para o subno codec-side do link (`fpgafft_codec_link`), deixando a
+topologia explicitamente alinhada com FPGA master / Pi slave.
 
-* FPGA transmite I2S
-* Pi recebe I2S
-* clocks externos vindos da FPGA
+### 5.3 Parametros fixos do link
 
-### 6.2 Camada 2 — kernel/ASoC/ALSA
+O overlay fixa:
 
-* overlay habilita I2S e registra sound card
-* codec mínimo próprio fornece `sound-dai`
-* `simple-audio-card` conecta CPU DAI ↔ codec DAI
-* ALSA expõe dispositivo de captura
+- `simple-audio-card,format = "i2s"`
+- `dai-tdm-slot-num = <2>`
+- `dai-tdm-slot-width = <32>`
 
-### 6.3 Camada 3 — user space
+Isso vale tanto para raw quanto para tagged, porque o kernel nao diferencia os modos.
 
-* utilitário C lê words hex
-* scripts Python capturam stream bruto
-* parser interpreta raw/tagged
-* aplicação entende BFPEXP/FFT/IDLE
+## 6. Taxa de amostragem: verdade de hardware vs verdade de host
 
----
+### 6.1 Taxa fisica
 
-## 7. Topologia lógica ASoC
+A taxa real do enlace continua sendo:
 
-A topologia desejada é:
+- `48 828.125 Hz`
 
-* **CPU DAI**: bloco I2S/PCM do SoC do Raspberry Pi
-* **Codec DAI**: codec mínimo próprio do projeto
-* **Card**: `simple-audio-card`
+Essa verdade de hardware vem do clock fixo da FPGA.
 
-### 7.1 Papel dos clocks
+### 6.2 Taxa exposta ao ALSA
 
-Como a FPGA é sempre master, o codec-side do enlace deve ser declarado como:
+O driver restringe o host para:
 
-* `bitclock-master`
-* `frame-master`
+- `48828 Hz`
 
-Isso indica, na topologia ASoC, que o lado externo é o originador dos clocks do enlace I2S. O binding do `simple-audio-card` prevê exatamente esse modelo. ([Kernel.org][2])
+Motivo: a API ALSA trabalha com taxa inteira em Hz. Nesta camada minima nao ha
+vantagem em inventar semantica especial no kernel para representar o `0.125 Hz`
+residual. O contrato correto fica:
 
----
+- documentar a taxa fisica nominal real;
+- abrir o host em `48828`;
+- validar no hardware que o transporte bruto esta coerente.
 
-## 8. Especificação do codec mínimo
+## 7. Fluxo oficial de build
 
-## 8.1 Objetivo do codec mínimo
+Build manual no Raspberry Pi:
 
-O codec mínimo deve existir apenas para:
-
-* registrar um componente ASoC;
-* registrar um DAI de captura;
-* declarar os parâmetros fixos do enlace;
-* permitir que o `simple-audio-card` registre a card.
-
-## 8.2 Requisitos do codec mínimo
-
-O codec mínimo deve:
-
-* expor **capture only**
-* expor **2 canais**
-* expor **32 bits por sample**
-* expor taxa nominal do projeto
-* não depender de I2C/SPI
-* não depender de registradores programáveis
-* não exigir controles DAPM complexos
-* não implementar plano de controle com a FPGA
-
-## 8.3 Requisitos negativos
-
-O codec mínimo não deve:
-
-* reconfigurar taxa
-* trocar formato
-* alterar largura de slot
-* entender tags
-* decidir framing FFT
-* aplicar filtros ou transformações
-
----
-
-## 9. Especificação do overlay
-
-## 9.1 Objetivo do overlay
-
-O overlay deve:
-
-* habilitar o `&i2s`;
-* criar a sound card do projeto;
-* usar `compatible = "simple-audio-card"`;
-* ligar o `sound-dai` do Pi ao `sound-dai` do codec mínimo;
-* fixar:
-
-  * `format = "i2s"`
-  * `dai-tdm-slot-num = <2>`
-  * `dai-tdm-slot-width = <32>`
-  * lado externo como `bitclock-master` e `frame-master`
-
-## 9.2 Estrutura esperada
-
-O `.dts` do overlay deverá ter:
-
-* `fragment@0`: habilitação do `&i2s`
-* `fragment@1`: criação da sound card na raiz
-* `simple-audio-card,cpu`
-* `simple-audio-card,codec`
-
-A documentação oficial do Raspberry Pi cobre o uso de overlays via `config.txt`, e o binding do `simple-audio-card` cobre a forma do card. ([Raspberry Pi][1])
-
-## 9.3 Esqueleto conceitual
-
-```dts
-/dts-v1/;
-/plugin/;
-
-/ {
-    compatible = "brcm,bcm2835";
-
-    fragment@0 {
-        target = <&i2s>;
-        __overlay__ {
-            status = "okay";
-        };
-    };
-
-    fragment@1 {
-        target-path = "/";
-        __overlay__ {
-            fpgafft_sound: fpgafft-sound {
-                compatible = "simple-audio-card";
-                simple-audio-card,name = "fpgafft";
-                simple-audio-card,format = "i2s";
-
-                simple-audio-card,bitclock-master = <&fpgafft_codec>;
-                simple-audio-card,frame-master = <&fpgafft_codec>;
-
-                simple-audio-card,cpu {
-                    sound-dai = <&i2s>;
-                    dai-tdm-slot-num = <2>;
-                    dai-tdm-slot-width = <32>;
-                };
-
-                fpgafft_codec: simple-audio-card,codec {
-                    sound-dai = <&fpgafft_codec_dai>;
-                    dai-tdm-slot-num = <2>;
-                    dai-tdm-slot-width = <32>;
-                };
-            };
-        };
-    };
-};
+```bash
+cd submodules/ACES-RPi-interface/rpi3b_i2s_fft/asoc
+make all
 ```
 
-Esse trecho é apenas conceitual; os phandles e o nó concreto do codec mínimo dependerão de como o driver será registrado.
+O `Makefile` produz:
 
----
+- `snd-soc-fpgafft-codec.ko`
+- `fpga-i2s-rx-32x2-slave.dtbo`
 
-## 10. Taxa de amostragem e política de abertura do ALSA
+Dependencias esperadas no Raspberry Pi:
 
-A taxa nominal do projeto é **48 828,125 Hz**.
+- `build-essential`
+- `device-tree-compiler`
+- `raspberrypi-kernel-headers`
 
-### 10.1 Verdade de hardware
+## 8. Fluxo oficial de instalacao
 
-Essa taxa deve ser documentada como taxa real do enlace.
+Instalacao direta:
 
-### 10.2 Verdade de software
+```bash
+cd submodules/ACES-RPi-interface/rpi3b_i2s_fft/asoc
+sudo ./install_fpgafft_overlay.sh
+```
 
-A abertura do ALSA deve buscar essa taxa primeiro.
+O instalador oficial faz:
 
-### 10.3 Risco conhecido
+- localiza `config.txt` em `/boot/firmware/config.txt` ou `/boot/config.txt`;
+- cria backup versionado do `config.txt`;
+- recompila modulo e overlay, salvo `--skip-build`;
+- instala o `.dtbo` no diretorio correto de overlays;
+- instala o `.ko` em `/lib/modules/$(uname -r)/extra/`;
+- executa `depmod -a`;
+- garante `dtoverlay=fpga-i2s-rx-32x2-slave`;
+- opcionalmente garante `dtparam=i2s=on`.
 
-Nem todo caminho ALSA aceita qualquer taxa arbitrária de forma perfeita. Portanto, o processo de validação deve verificar:
+Wrapper mais completo para preparar tambem Python e `.venv`:
 
-* se o device aceita essa taxa;
-* se ajusta para perto dela;
-* se o comportamento continua semanticamente correto.
+```bash
+cd submodules/ACES-RPi-interface/rpi3b_i2s_fft
+sudo ./setup_rpi_i2s_fft.sh
+```
 
----
+Esse wrapper instala dependencias de build/runtime e delega a instalacao do
+overlay ao script oficial em `asoc/`.
 
-## 11. Integração com raw e tagged mode
+## 9. Criterios de validacao pos-reboot
 
-O overlay e o codec mínimo devem ser **agnósticos ao conteúdo** do word.
+Depois de instalar, reinicie:
 
-Isso significa:
+```bash
+sudo reboot
+```
 
-* raw mode: tratado como words estéreo de 32 bits
-* tagged mode: tratado como words estéreo de 32 bits
-* o kernel não distingue os dois
-
-Essa neutralidade é obrigatória, porque a responsabilidade semântica foi fixada para o user space.
-
----
-
-## 12. Nomeação e artefatos
-
-A implementação deve produzir, no mínimo, estes artefatos:
-
-### 12.1 Driver do codec mínimo
-
-Arquivo sugerido:
-
-* `snd-soc-fpgafft-codec.c`
-
-### 12.2 Overlay
-
-Arquivo sugerido:
-
-* `fpga-i2s-rx-32x2-slave-overlay.dts`
-
-### 12.3 Overlay compilado
-
-Arquivo gerado:
-
-* `fpga-i2s-rx-32x2-slave.dtbo`
-
-### 12.4 Documentação
-
-Arquivo sugerido:
-
-* `docs/rpi_fpgafft_asoc_overlay.md`
-
-### 12.5 Script de instalação
-
-Arquivo sugerido:
-
-* `install_fpgafft_overlay.sh`
-
----
-
-## 13. Script de instalação
-
-## 13.1 Objetivo
-
-O projeto deve incluir um script de instalação para reduzir erro operacional e padronizar a ativação do driver/overlay.
-
-## 13.2 O que o script deve fazer
-
-O script de instalação deve:
-
-* verificar se está rodando com privilégios adequados;
-* localizar o `config.txt` correto:
-
-  * `/boot/firmware/config.txt`
-  * ou `/boot/config.txt`
-* criar backup versionado do `config.txt`;
-* copiar o `.dtbo` para o diretório correto de overlays;
-* garantir a linha `dtoverlay=fpga-i2s-rx-32x2-slave`;
-* opcionalmente garantir `dtparam=i2s=on`;
-* executar `depmod -a` se o módulo do codec mínimo for instalado;
-* orientar o usuário a reiniciar;
-* imprimir passos de validação pós-reboot.
-
-A documentação oficial do Raspberry Pi confirma que `config.txt` é o local de configuração para `dtoverlay`. ([Raspberry Pi][1])
-
-## 13.3 O que o script não deve fazer
-
-O script não deve:
-
-* assumir que a sound card já está válida só por copiar o overlay;
-* tentar validar o protocolo raw/tagged;
-* ocultar erros de instalação;
-* forçar autodetecção do melhor device ALSA.
-
-## 13.4 Estrutura lógica esperada do script
-
-O script deve conter funções como:
-
-* `find_config_file`
-* `find_overlay_dir`
-* `backup_config`
-* `install_dtbo`
-* `ensure_dtoverlay_line`
-* `print_post_reboot_checklist`
-
-## 13.5 Checklist pós-reboot que o script deve imprimir
-
-Após a instalação, o script deve orientar:
+Checklist obrigatorio:
 
 ```bash
 arecord -l
@@ -413,176 +248,55 @@ pinctrl get 19
 pinctrl get 20
 pinctrl get 21
 dmesg -l err,warn
-```
-
-Além disso, pode sugerir olhar `/proc/device-tree` e testar o overlay em runtime com `dtoverlay` durante o debug; isso é uma prática útil mencionada em orientação de debug da comunidade Raspberry Pi. ([Fóruns Raspberry Pi][3])
-
----
-
-## 14. Procedimento de build
-
-## 14.1 Compilação do overlay
-
-O overlay deve ser compilado com `dtc -@`, para preservar símbolos/phandles adequados a overlays.
-
-Exemplo:
-
-```bash
-dtc -@ -I dts -O dtb -o fpga-i2s-rx-32x2-slave.dtbo fpga-i2s-rx-32x2-slave-overlay.dts
-```
-
-## 14.2 Instalação do overlay
-
-O `.dtbo` deve ser copiado para:
-
-* `/boot/overlays`
-* ou `/boot/firmware/overlays`
-
-dependendo da imagem instalada.
-
-## 14.3 Ativação
-
-No `config.txt`:
-
-```ini
-dtoverlay=fpga-i2s-rx-32x2-slave
-```
-
----
-
-## 15. Procedimento de validação
-
-## 15.1 Validação do boot e do Device Tree
-
-Após reinício:
-
-* confirmar presença da sound card em `arecord -l`
-* confirmar ausência de erros críticos em `dmesg -l err,warn`
-* confirmar presença das mudanças esperadas em `/proc/device-tree`, se necessário. A orientação de debug de overlays do Raspberry Pi recomenda exatamente essas verificações. ([Fóruns Raspberry Pi][3])
-
-## 15.2 Validação do pinmux
-
-Executar:
-
-```bash
-pinctrl get 18
-pinctrl get 19
-pinctrl get 20
-pinctrl get 21
-```
-
-## 15.3 Validação do ALSA
-
-Executar:
-
-```bash
 arecord --dump-hw-params -D hw:X,Y
 ```
 
-## 15.4 Validação do conteúdo bruto
+Resultados esperados:
 
-Usar o utilitário em C que imprime:
+- aparece uma card identificavel como `aces-fpgafft`;
+- o pinmux coloca GPIO18/19/20/21 em funcao PCM/I2S;
+- nao ha erro relevante de overlay/ASoC no boot;
+- o device aceita captura `S32_LE`, 2 canais.
 
-```text
-0xLEFTWORD 0xRIGHTWORD
+## 10. Validacao obrigatoria do conteudo bruto
+
+Antes de voltar ao parser Python, validar em hexadecimal:
+
+```bash
+cd submodules/ACES-RPi-interface/rpi3b_i2s_fft
+gcc -O2 -Wall -Wextra -o alsa_logger alsa_logger.c -lasound
+./alsa_logger hw:X,Y 48828
 ```
 
-Essa validação é obrigatória antes de voltar ao parser Python.
+Objetivo desta etapa:
 
-## 15.5 Validação semântica posterior
+- verificar words esquerdo/direito em hexadecimal;
+- confirmar que o transporte bruto esta coerente;
+- tirar kernel/overlay/ASoC da posicao de suspeito principal.
 
-Somente após o transporte estar correto:
+So depois disso retomar:
 
-* testar raw capture
-* testar tagged mode
-* testar debug replay
-* testar FFT parser
+- parser Python;
+- raw mode semantico;
+- tagged mode semantico;
+- BFPEXP/FFT/IDLE no user space.
 
----
+## 11. Limitacoes conhecidas
 
-## 16. Critérios de aceitação
+1. O driver nao representa `48 828.125 Hz` com fracao no ALSA; ele expoe `48828`.
+2. O modulo e o overlay foram implementados para build no Raspberry Pi alvo; este
+   workspace nao tem kernel headers do Pi nem hardware para validacao final de boot.
+3. O sucesso de `arecord -l` nao prova que o stream semantico esta correto.
+4. Se o stream bruto estiver errado, a causa ainda pode estar no RTL I2S da FPGA.
 
-A implementação será aceita quando:
+## 12. Aceitacao desta etapa
 
-1. o codec mínimo carregar e registrar corretamente seu DAI;
-2. o overlay carregar no boot sem erro relevante;
-3. a sound card aparecer em `arecord -l`;
-4. o ALSA aceitar captura estéreo `S32_LE`;
-5. o utilitário C ler words coerentes com padrões conhecidos transmitidos pela FPGA;
-6. raw e tagged funcionarem sobre o mesmo transporte;
-7. a camada kernel/overlay deixar de ser suspeita principal na análise de erro.
+Esta etapa e considerada entregue quando:
 
----
-
-## 17. Riscos técnicos
-
-### Risco 1 — foco excessivo no overlay
-
-Mesmo com overlay e codec corretos, o stream ainda pode estar errado por causa do RTL I2S da FPGA.
-
-### Risco 2 — taxa nominal incomum
-
-A taxa de 48 828,125 Hz pode exigir cuidado na abertura do ALSA e na validação.
-
-### Risco 3 — falsa sensação de sucesso
-
-A sound card pode aparecer e abrir, mas ainda assim o stream bruto pode estar semanticamente quebrado. Por isso o utilitário C e a validação em hex são mandatórios.
-
-### Risco 4 — instalação parcial
-
-Instalar só o overlay sem o codec mínimo, ou vice-versa, não fecha a topologia ASoC.
-
----
-
-## 18. Ordem recomendada de implementação
-
-### Fase 1
-
-Escrever a documentação técnica final.
-
-### Fase 2
-
-Implementar o codec mínimo.
-
-### Fase 3
-
-Implementar o `.dts` do overlay.
-
-### Fase 4
-
-Implementar o script de instalação.
-
-### Fase 5
-
-Instalar e validar:
-
-* boot
-* ALSA
-* pinmux
-* utilitário C
-
-### Fase 6
-
-Só depois retomar o parser Python e o protocolo tagged.
-
----
-
-## 19. Síntese executiva
-
-A solução oficial do projeto passa a ser:
-
-* **um codec mínimo próprio**, sem plano de controle;
-* **um overlay próprio baseado em `simple-audio-card`**;
-* **FPGA sempre como mestre de clock**;
-* **Pi sempre como receptor I2S**;
-* **ALSA expondo estéreo `S32_LE`**;
-* **user space responsável por toda interpretação do protocolo**;
-* **um script de instalação oficial** para copiar o `.dtbo`, editar `config.txt`, orientar reboot e checklist de validação.
-
-Essa arquitetura é coerente com o mecanismo de overlays do Raspberry Pi e com o binding do `simple-audio-card`. ([Raspberry Pi][1])
-
----
-
-[1]: https://www.raspberrypi.com/documentation/computers/config_txt.html?utm_source=chatgpt.com "config.txt - Raspberry Pi Documentation"
-[2]: https://www.kernel.org/doc/Documentation/devicetree/bindings/sound/simple-card.txt?utm_source=chatgpt.com "simple-card.txt"
-[3]: https://forums.raspberrypi.com/viewtopic.php?t=387792&utm_source=chatgpt.com "How to debug overlays?"
+1. o modulo `snd-soc-fpgafft-codec` compila e instala;
+2. o overlay `fpga-i2s-rx-32x2-slave` instala sem editar `config.txt` manualmente;
+3. a sound card `aces-fpgafft` aparece em `arecord -l`;
+4. o device abre como `S32_LE`, 2 canais, `48828 Hz`;
+5. o utilitario C mostra words hex coerentes;
+6. raw e tagged continuam compartilhando o mesmo transporte bruto;
+7. o kernel permanece semanticamente neutro em relacao ao protocolo.

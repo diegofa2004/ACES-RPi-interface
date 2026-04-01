@@ -6,10 +6,24 @@ from typing import Optional, Tuple
 import numpy as np
 
 try:
-    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
+    from .i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_RATE_HZ,
+        build_arecord_cmd,
+        resolve_audio_device,
+        start_arecord_process,
+        stop_process,
+    )
     from .spectral_features import build_dct_matrix, build_mel_filter
 except ImportError:
-    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
+    from i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_RATE_HZ,
+        build_arecord_cmd,
+        resolve_audio_device,
+        start_arecord_process,
+        stop_process,
+    )
     from spectral_features import build_dct_matrix, build_mel_filter
 
 try:
@@ -21,7 +35,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 @dataclass
 class FFTAdapterConfig:
     device: str = AUTO_AUDIO_DEVICE
-    sample_rate: int = 48000
+    sample_rate: int = DEFAULT_CAPTURE_RATE_HZ
     frame_bins: int = 512
     useful_bins: int = 256
     gpio_chip: str = "/dev/gpiochip0"

@@ -7,7 +7,8 @@ For the repository-level rationale behind the current FPGA/host workflow, see
 
 ## Files
 
-- `setup_rpi_i2s_fft.sh`: enables I2S in boot config and installs dependencies.
+- `setup_rpi_i2s_fft.sh`: installs the official fpgafft overlay/codec plus Python dependencies.
+- `asoc/`: minimal ASoC codec stub, `simple-audio-card` overlay, build helpers, and the official installer.
 - `fft_i2s_logger.py`: logs raw I2S real/imag pairs to CSV.
 - `fpga_fft_adapter.py`: converts FPGA complex FFT bins from I2S into magnitude bins + MFCC.
 - `compararEvento.py`: local comparison function used directly by the analyzer.
@@ -23,11 +24,8 @@ For the repository-level rationale behind the current FPGA/host workflow, see
 - FPGA I2S `sd` output -> RPi GPIO20 (pin 38) `DIN`
 - GND <-> GND
 
-Alternative (RPi as I2S master):
-
-- RPi GPIO18 (pin 12) `BCLK` -> FPGA I2S `sck` input
-- RPi GPIO19 (pin 35) `LRCLK/WS` -> FPGA I2S `ws` input
-- FPGA I2S `sd` output -> RPi GPIO20 (pin 38) `DIN`
+This project no longer documents or supports a Pi-master audio topology in this folder.
+The source of truth is FPGA master + Pi slave/capture only.
 
 Optional GPIO handshake wires (if used):
 
@@ -48,9 +46,14 @@ Electrical notes:
 
 ## Setup on Raspberry Pi
 
-For FPGA-master clocking, the Pi must be configured with an I2S/ALSA overlay that matches your hardware and supports external BCLK/LRCLK input.
-The setup script uses `I2S_OVERLAY` from environment (default is `googlevoicehat-soundcard`).
-If that default does not match your FPGA-master wiring, run setup with your own overlay value.
+The official kernel-side path now lives in `rpi3b_i2s_fft/asoc/`:
+
+- codec driver: `snd-soc-fpgafft-codec.c`
+- overlay: `fpga-i2s-rx-32x2-slave-overlay.dts`
+- stable ALSA card name: `aces-fpgafft`
+
+`setup_rpi_i2s_fft.sh` installs build dependencies, delegates to the official
+overlay installer, and then creates the project virtualenv.
 
 ```bash
 cd rpi3b_i2s_fft
@@ -66,6 +69,7 @@ For Raspberry Pi 3 Model B specifically:
 - the PCM/I2S pins are the same GPIO18/GPIO19/GPIO20 mapping documented below
 - the ALSA card index is not stable, so this project now auto-detects the capture device instead of assuming `hw:2,0`
 - if auto-detection still picks the wrong source, run `arecord -l` and pass `-D hw:X,Y`
+- the physical wire rate is `48 828.125 Hz`, and the host-side ALSA rate used by this project is `48828`
 
 Reboot after setup:
 
@@ -113,6 +117,8 @@ aplay -l
 arecord -l
 ```
 
+You should see a capture card named `aces-fpgafft`.
+
 3. Confirm clocks are actually present from FPGA (FPGA-master mode):
 
 - Use a scope/logic analyzer on GPIO18 (BCLK) and GPIO19 (LRCLK).
@@ -132,7 +138,7 @@ Terminal 1 (required):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -r 48000 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py -r 48828 --frame-bins 512 --useful-bins 256
 ```
 
 What happens in Terminal 1:
@@ -147,7 +153,7 @@ Terminal 2 (optional, recommended when you want visualization):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python plotFFT.py --rate 48000 --frame-bins 512
+.venv/bin/python plotFFT.py --rate 48828 --frame-bins 512
 ```
 
 This terminal only visualizes the saved `fft.npy`. It is not required for detection.
@@ -159,7 +165,7 @@ Terminal 3 (optional, only if you want a raw CSV dump of the incoming I2S stream
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_logger.py -r 48000 --csv fft_capture.csv
+.venv/bin/python fft_i2s_logger.py -r 48828 --csv fft_capture.csv
 ```
 
 You only need 1 terminal for the full comparison flow, 2 if you also want the FFT viewer, and 3 only if you additionally want the raw CSV logger.
@@ -172,7 +178,7 @@ or otherwise make the package parent directory visible to Python.
 ```python
 from rpi3b_i2s_fft import FFTAdapterConfig, FPGAFFTReceiver
 
-cfg = FFTAdapterConfig(sample_rate=48000, frame_bins=512, useful_bins=256)
+cfg = FFTAdapterConfig(sample_rate=48828, frame_bins=512, useful_bins=256)
 rx = FPGAFFTReceiver(cfg)
 rx.start()
 try:
@@ -219,7 +225,7 @@ Run the adapter example:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -r 48000 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py -r 48828 --frame-bins 512 --useful-bins 256
 ```
 
 This script now mirrors the `pyserial/transmissaoAudioDireto.py` flow:
@@ -340,7 +346,7 @@ cd rpi3b_i2s_fft
 Example (line numbers are GPIO chip offsets):
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -r 48828 \
 	--frame-bins 512 --useful-bins 256 \
 	--bfpexp-flag-line 23 --done-line 24
 ```
@@ -370,7 +376,7 @@ Frame start logic in tagged mode:
 Example tagged mode run:
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -r 48000 \
+.venv/bin/python analyzer_from_fpga_fft.py -r 48828 \
 	--frame-bins 512 --useful-bins 256 \
 	--use-i2s-tags --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
 	--tag-idle 0 --tag-bfpexp 1 --tag-fft 2 \
