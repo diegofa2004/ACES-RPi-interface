@@ -82,6 +82,7 @@ Defaults do preset `--strict-sync`:
 
 - modo tagged habilitado
 - `bfpexp-hold-pairs = 128`
+- `loss-tolerance-pairs = 3`
 - `allow-fft-without-bfpexp = false`
 
 ### 2. Analisador em modo tolerante para attach no meio do burst
@@ -108,6 +109,7 @@ Defaults do preset `--tolerant-sync`:
 
 - modo tagged habilitado
 - `bfpexp-hold-pairs = 128`
+- `loss-tolerance-pairs = 3`
 - `allow-fft-without-bfpexp = true`
 
 ### 3. Plot com matplotlib
@@ -209,6 +211,7 @@ cd ~/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft
   --rate 48828 \
   --frame-bins 512 \
   --bfpexp-hold-pairs 128 \
+  --loss-tolerance-pairs 3 \
   --tag-shift 30 \
   --tag-mask 0x3 \
   --payload-bits 18 \
@@ -228,6 +231,14 @@ O CSV inclui, entre outros campos:
 - `contract_phase`
 - `contract_frame`
 - `contract_index`
+
+Observacao de robustez:
+
+- perdas pontuais que decodam como `tag_mismatch`, `idle` ou `unknown_tag`
+  dentro do preambulo BFPEXP ou da janela FFT sao toleradas por default ate
+  `3` pares por burst
+- no receptor, essas perdas pontuais dentro da FFT sao contabilizadas como
+  bins ausentes e preenchidas com zero, evitando perder a janela inteira
 
 ## Arquivos gerados no Raspberry Pi
 

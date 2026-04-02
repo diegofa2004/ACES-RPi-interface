@@ -33,6 +33,7 @@ class FFTI2SLoggerTests(unittest.TestCase):
             frame_bins=2,
             bfpexp_hold_pairs=1,
             allow_fft_without_bfpexp=False,
+            loss_tolerance_pairs=0,
         )
         next_seq = fft_i2s_logger.write_csv_rows(
             writer,
@@ -92,6 +93,7 @@ class FFTI2SLoggerTests(unittest.TestCase):
             frame_bins=4,
             bfpexp_hold_pairs=3,
             allow_fft_without_bfpexp=False,
+            loss_tolerance_pairs=0,
         )
 
         self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "idle"), ("search_idle", 0, -1))
@@ -108,6 +110,7 @@ class FFTI2SLoggerTests(unittest.TestCase):
             frame_bins=4,
             bfpexp_hold_pairs=1,
             allow_fft_without_bfpexp=False,
+            loss_tolerance_pairs=0,
         )
 
         self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
@@ -118,6 +121,27 @@ class FFTI2SLoggerTests(unittest.TestCase):
             ("protocol_reset_idle", 0, -1),
         )
         self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
+
+    def test_contract_tracker_tolerates_loss_inside_preamble_and_fft_frame(self):
+        tracker = fft_i2s_logger.create_contract_tracker(
+            frame_bins=4,
+            bfpexp_hold_pairs=2,
+            allow_fft_without_bfpexp=False,
+            loss_tolerance_pairs=1,
+        )
+
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
+        self.assertEqual(
+            fft_i2s_logger.advance_contract_tracker(tracker, "tag_mismatch"),
+            ("bfpexp_preamble_gap", 0, 1),
+        )
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
+        self.assertEqual(
+            fft_i2s_logger.advance_contract_tracker(tracker, "idle"),
+            ("fft_frame_gap", 0, 1),
+        )
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 2))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 3))
 
 
 if __name__ == "__main__":

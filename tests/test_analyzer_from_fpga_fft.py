@@ -24,6 +24,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
             sync_preset="strict",
             use_i2s_tags=None,
             bfpexp_hold_pairs=None,
+            loss_tolerance_pairs=None,
             allow_fft_without_bfpexp=None,
         )
 
@@ -32,6 +33,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(resolved["sync_mode"], "strict")
         self.assertTrue(resolved["use_i2s_tags"])
         self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertEqual(resolved["loss_tolerance_pairs"], analyzer_from_fpga_fft.DEFAULT_TAG_LOSS_TOLERANCE_PAIRS)
         self.assertFalse(resolved["allow_fft_without_bfpexp"])
 
     def test_resolve_sync_cli_defaults_prefers_tolerant_defaults(self):
@@ -40,6 +42,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
             sync_preset="tolerant",
             use_i2s_tags=None,
             bfpexp_hold_pairs=None,
+            loss_tolerance_pairs=None,
             allow_fft_without_bfpexp=None,
         )
 
@@ -48,6 +51,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(resolved["sync_mode"], "tolerant")
         self.assertTrue(resolved["use_i2s_tags"])
         self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertEqual(resolved["loss_tolerance_pairs"], analyzer_from_fpga_fft.DEFAULT_TAG_LOSS_TOLERANCE_PAIRS)
         self.assertTrue(resolved["allow_fft_without_bfpexp"])
 
     def test_resolve_sync_cli_defaults_respects_explicit_overrides(self):
@@ -56,6 +60,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
             sync_preset=None,
             use_i2s_tags=False,
             bfpexp_hold_pairs=64,
+            loss_tolerance_pairs=5,
             allow_fft_without_bfpexp=False,
         )
 
@@ -64,6 +69,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(resolved["sync_mode"], "tolerant")
         self.assertFalse(resolved["use_i2s_tags"])
         self.assertEqual(resolved["bfpexp_hold_pairs"], 64)
+        self.assertEqual(resolved["loss_tolerance_pairs"], 5)
         self.assertFalse(resolved["allow_fft_without_bfpexp"])
 
     def test_process_channel_debug_chunk_reports_kinds_and_fft_runs(self):

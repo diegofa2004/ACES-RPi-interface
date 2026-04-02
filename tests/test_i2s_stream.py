@@ -62,6 +62,34 @@ class I2SStreamTests(unittest.TestCase):
             ],
         )
 
+    def test_resolve_capture_command_defaults_to_arecord_when_native_helper_is_missing(self):
+        with mock.patch.object(i2s_stream, "find_native_capture_binary", return_value=None):
+            backend, cmd = i2s_stream.resolve_capture_command("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
+
+        self.assertEqual(backend, i2s_stream.CAPTURE_BACKEND_ARECORD)
+        self.assertEqual(cmd, i2s_stream.build_arecord_cmd("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ))
+
+    def test_resolve_capture_command_prefers_native_helper_when_present(self):
+        helper_path = "/tmp/alsa_logger"
+        with mock.patch.object(i2s_stream, "find_native_capture_binary", return_value=helper_path):
+            backend, cmd = i2s_stream.resolve_capture_command("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
+
+        self.assertEqual(backend, i2s_stream.CAPTURE_BACKEND_NATIVE)
+        self.assertEqual(cmd[0], helper_path)
+        self.assertIn("--mode", cmd)
+        self.assertIn("raw", cmd)
+
+    def test_resolve_capture_command_requires_binary_for_explicit_native_backend(self):
+        with mock.patch.object(i2s_stream, "find_native_capture_binary", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                i2s_stream.resolve_capture_command(
+                    "hw:1,0",
+                    i2s_stream.DEFAULT_CAPTURE_RATE_HZ,
+                    backend=i2s_stream.CAPTURE_BACKEND_NATIVE,
+                )
+
+        self.assertIn("no compiled helper was found", str(ctx.exception))
+
     def test_trim_incomplete_frames_discards_partial_tail(self):
         raw = b"\x00" * 19
         trimmed = i2s_stream.trim_incomplete_frames(raw, bytes_per_frame=8)

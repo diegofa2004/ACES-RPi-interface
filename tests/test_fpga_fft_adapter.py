@@ -46,10 +46,22 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         rx = FPGAFFTReceiver(cfg)
 
         with mock.patch.object(fpga_fft_adapter, "resolve_audio_device", return_value="hw:2,0"), \
-             mock.patch.object(fpga_fft_adapter, "start_arecord_process", return_value=fake_proc) as start_mock, \
+             mock.patch.object(fpga_fft_adapter, "build_capture_cmd", return_value=["fake-capture", "--raw"]) as build_mock, \
+             mock.patch.object(fpga_fft_adapter, "start_capture_process", return_value=fake_proc) as start_mock, \
              mock.patch.object(fpga_fft_adapter, "stop_process") as stop_mock:
             rx.start()
-            start_mock.assert_called_once_with("hw:2,0", 48828)
+            build_mock.assert_called_once_with(
+                "hw:2,0",
+                48828,
+                backend="auto",
+                capture_binary=None,
+            )
+            start_mock.assert_called_once_with(
+                "hw:2,0",
+                48828,
+                backend="auto",
+                capture_binary=None,
+            )
             rx.stop()
             stop_mock.assert_called_once_with(fake_proc)
 
@@ -232,6 +244,65 @@ class FPGAFFTReceiverTests(unittest.TestCase):
                     (1, 5, 5),
                     (2, 3, 4),
                     (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_tolerates_loss_inside_preamble_and_fft_frame(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            bfpexp_pairs_required=2,
+            loss_tolerance_pairs=1,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        mismatch_stream = np.asarray(
+            [
+                [pack_tagged_word(1, 9), pack_tagged_word(1, 9)],
+                [pack_tagged_word(0, 0), pack_tagged_word(0, 0)],  # tolerated loss inside BFPEXP preamble
+                [pack_tagged_word(2, 3), pack_tagged_word(2, 4)],
+                [pack_tagged_word(2, 0), pack_tagged_word(1, 1)],  # tolerated tag mismatch inside FFT frame
+                [pack_tagged_word(2, -8), pack_tagged_word(2, 15)],
+                [pack_tagged_word(2, 7), pack_tagged_word(2, -24)],
+                [pack_tagged_word(2, 11), pack_tagged_word(2, 5)],
+                [pack_tagged_word(2, -3), pack_tagged_word(2, 6)],
+            ],
+            dtype=np.int32,
+        ).tobytes()
+        rx._proc = FakeProcess(mismatch_stream)
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 0.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_ignores_idle_padding_inside_fft_frame(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            bfpexp_pairs_required=1,
+            loss_tolerance_pairs=0,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (1, 9, 9),
+                    (2, 3, 4),
+                    (0, 0, 0),
+                    (2, 5, 12),
+                    (0, 0, 0),
                     (2, -8, 15),
                     (2, 7, -24),
                 ]
