@@ -1,69 +1,111 @@
 import os
 import time
 from collections import deque
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 
-EPSILON = 1e-9
-FFT_BAND_COUNT = 32
-BACKGROUND_PERCENTILE = 35.0
+EPSILON = 1e-6
+DEFAULT_BAND_COUNT = 32
+DEFAULT_USEFUL_BINS = 256
+
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+EVENTO_FILENAME = os.path.join(MODULE_DIR, "evento.npy")
+FFT_FILENAME = os.path.join(MODULE_DIR, "fft.npy")
 SIMILARITY_STATE_FILENAME = os.path.join(MODULE_DIR, "similaridade.flag")
 SIMILARITY_STATE_TMP_FILENAME = os.path.join(MODULE_DIR, "similaridade_tmp.flag")
 
 
-def _zscore_1d(x: np.ndarray) -> np.ndarray:
+@dataclass(frozen=True)
+class DirectComparatorConfig:
+    cooldown_seconds: float = 15.0
+    poll_interval_seconds: float = 0.05
+    min_consecutive_hits: int = 2
+    score_history_size: int = 60
+    absolute_threshold: float = 0.78
+    margin_threshold: float = 0.08
+    min_energy_ratio: float = 0.35
+    band_count: int = DEFAULT_BAND_COUNT
+    useful_bins: int = DEFAULT_USEFUL_BINS
+    activity_percentile: float = 25.0
+    activity_ratio: float = 0.30
+    activity_gap_frames: int = 2
+    reference_padding_frames: int = 3
+    min_reference_frames: int = 8
+    max_reference_frames: int = 32
+    search_margin_frames: int = 24
+    max_search_frames: int = 64
+
+
+@dataclass(frozen=True)
+class ReferenceTemplate:
+    band_frames_unit: np.ndarray
+    envelope_unit: np.ndarray
+    mean_energy: float
+    peak_energy: float
+    frame_count: int
+    start_frame: int
+    stop_frame: int
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    score: float
+    spectral_score: float
+    envelope_score: float
+    energy_score: float
+    baseline_score: float
+    valid_windows: int
+    total_windows: int
+    best_index: int
+    search_frames: int
+
+
+def _unit_rows(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-    return (x - np.mean(x, dtype=np.float32)) / (np.std(x, dtype=np.float32) + EPSILON)
+    centered = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    norms = np.linalg.norm(centered, axis=1, keepdims=True) + EPSILON
+    return centered / norms
 
 
-def _zscore_rows(x: np.ndarray) -> np.ndarray:
+def _unit_vector(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-    media = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    desvio = np.std(x, axis=1, keepdims=True, dtype=np.float32) + EPSILON
-    return (x - media) / desvio
+    centered = x - np.mean(x, dtype=np.float32)
+    norm = np.linalg.norm(centered) + EPSILON
+    return centered / norm
 
 
-def _cosine_batch(batch: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    batch = np.asarray(batch, dtype=np.float32)
-    ref = np.asarray(ref, dtype=np.float32)
-    numerador = batch @ ref
-    denominador = (np.linalg.norm(batch, axis=1) * np.linalg.norm(ref)) + EPSILON
-    return numerador / denominador
+def _window_mean_2d(x: np.ndarray, window_size: int, step: int = 1) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    prefix = np.zeros((x.shape[0] + 1, x.shape[1]), dtype=np.float32)
+    prefix[1:] = np.cumsum(x, axis=0, dtype=np.float32)
+    window_sum = prefix[window_size:] - prefix[:-window_size]
+    return window_sum[::step] / np.float32(window_size)
 
 
-def _cosine_batch_weighted(batch: np.ndarray, ref: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    batch = np.asarray(batch, dtype=np.float32)
-    ref = np.asarray(ref, dtype=np.float32)
-    weights = np.asarray(weights, dtype=np.float32)
-    numerador = batch @ (ref * weights)
-    norma_batch = np.sqrt(np.sum((batch * batch) * weights, axis=1, dtype=np.float32))
-    norma_ref = np.sqrt(np.sum((ref * ref) * weights, dtype=np.float32))
-    return numerador / ((norma_batch * norma_ref) + EPSILON)
+def _window_mean_1d(x: np.ndarray, window_size: int, step: int = 1) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    prefix = np.zeros(x.shape[0] + 1, dtype=np.float32)
+    prefix[1:] = np.cumsum(x, dtype=np.float32)
+    window_sum = prefix[window_size:] - prefix[:-window_size]
+    return window_sum[::step] / np.float32(window_size)
 
 
-def _prepara_mfcc(m: np.ndarray) -> np.ndarray:
-    return np.asarray(m, dtype=np.float32)[:, :8]
-
-
-def _prepara_fft(f: np.ndarray) -> np.ndarray:
-    f = np.asarray(f, dtype=np.float32)
-    f = np.log1p(f[:, :256])
-    noise_floor = np.percentile(f, 20, axis=1, keepdims=True)
-    f = f - noise_floor
-    return np.maximum(f, 0.0)
-
-
-def _agrupar_bandas_fft(f: np.ndarray, band_count: int = FFT_BAND_COUNT) -> np.ndarray:
-    f = np.asarray(f, dtype=np.float32)
-    if f.ndim != 2:
+def _agrupar_bandas_fft(
+    fft_frames: np.ndarray,
+    *,
+    band_count: int = DEFAULT_BAND_COUNT,
+    useful_bins: int = DEFAULT_USEFUL_BINS,
+) -> np.ndarray:
+    fft_frames = np.asarray(fft_frames, dtype=np.float32)
+    if fft_frames.ndim != 2:
         raise ValueError("FFT data must be 2D")
 
-    useful = f[:, :256]
-    if useful.shape[1] == 0:
-        return np.zeros((useful.shape[0], 0), dtype=np.float32)
+    useful_bins = max(1, min(int(useful_bins), fft_frames.shape[1]))
+    useful = np.log1p(np.maximum(fft_frames[:, :useful_bins], 0.0))
     band_count = max(1, min(int(band_count), useful.shape[1]))
 
     if useful.shape[1] % band_count == 0:
@@ -80,109 +122,191 @@ def _agrupar_bandas_fft(f: np.ndarray, band_count: int = FFT_BAND_COUNT) -> np.n
     return bands
 
 
-def _suprime_ruido_estacionario(f_bands: np.ndarray, percentile: float = BACKGROUND_PERCENTILE) -> np.ndarray:
-    f_bands = np.asarray(f_bands, dtype=np.float32)
-    if f_bands.ndim != 2 or f_bands.shape[0] == 0:
-        return f_bands
-
-    noise_profile = np.percentile(f_bands, percentile, axis=0, keepdims=True).astype(np.float32)
-    return np.maximum(f_bands - noise_profile, 0.0)
+def _energia_frames(bands: np.ndarray) -> np.ndarray:
+    return np.sum(np.asarray(bands, dtype=np.float32), axis=1, dtype=np.float32)
 
 
-def _prepara_fft_bandas(f_prepared: np.ndarray) -> np.ndarray:
-    return _suprime_ruido_estacionario(_agrupar_bandas_fft(f_prepared))
+def _fill_short_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool).copy()
+    if max_gap <= 0 or mask.size == 0:
+        return mask
 
-
-def _energia_frames_fft_raw(f: np.ndarray) -> np.ndarray:
-    f = np.asarray(f, dtype=np.float32)
-    return np.sum(np.log1p(f[:, :256]), axis=1, dtype=np.float32)
-
-
-def _pesos_bandas_referencia(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float32)
-    baseline = np.float32(np.median(v))
-    destaque = np.maximum(v - baseline, 0.0)
-    soma = float(np.sum(destaque, dtype=np.float32))
-    if soma <= EPSILON:
-        return np.ones_like(v, dtype=np.float32)
-
-    normalized = destaque / soma
-    return 0.25 + (normalized * np.float32(v.size))
-
-
-def _assinatura_fft(f_sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    f_bands = _prepara_fft_bandas(f_sel)
-    mean_bands = np.mean(f_bands, axis=0, dtype=np.float32)
-    return _zscore_1d(mean_bands), _pesos_bandas_referencia(mean_bands)
-
-
-def _assinatura_mfcc(m_sel: np.ndarray) -> np.ndarray:
-    return _zscore_1d(np.mean(m_sel, axis=0, dtype=np.float32))
-
-
-def _assinatura_env(f_sel_raw: np.ndarray) -> np.ndarray:
-    return _zscore_1d(_energia_frames_fft_raw(f_sel_raw))
-
-
-def _fluxo_espectral_bandas(f_bands: np.ndarray) -> np.ndarray:
-    f_bands = np.asarray(f_bands, dtype=np.float32)
-    if f_bands.ndim != 2:
-        raise ValueError("Band FFT data must be 2D")
-    if f_bands.shape[0] < 2:
-        return np.zeros((0, f_bands.shape[1]), dtype=np.float32)
-    return np.maximum(np.diff(f_bands, axis=0), 0.0)
-
-
-def _assinatura_fluxo(f_sel: np.ndarray) -> np.ndarray:
-    fluxo = _fluxo_espectral_bandas(_prepara_fft_bandas(f_sel))
-    if fluxo.shape[0] == 0:
-        return np.zeros((FFT_BAND_COUNT,), dtype=np.float32)
-    return _zscore_1d(np.mean(fluxo, axis=0, dtype=np.float32))
-
-
-def _window_mean_2d(x: np.ndarray, window_size: int, step: int) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    prefix = np.zeros((x.shape[0] + 1, x.shape[1]), dtype=np.float32)
-    prefix[1:] = np.cumsum(x, axis=0, dtype=np.float32)
-    window_sum = prefix[window_size:] - prefix[:-window_size]
-    return window_sum[::step] / np.float32(window_size)
-
-
-def _window_mean_1d(x: np.ndarray, window_size: int, step: int) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    prefix = np.zeros(x.shape[0] + 1, dtype=np.float32)
-    prefix[1:] = np.cumsum(x, dtype=np.float32)
-    window_sum = prefix[window_size:] - prefix[:-window_size]
-    return window_sum[::step] / np.float32(window_size)
-
-
-def _melhor_bloco_continuo(energia: np.ndarray, min_frac: float = 0.12, max_frac: float = 0.30) -> tuple[int, int]:
-    n = len(energia)
-    if n < 8:
-        return 0, n
-
-    min_len = max(8, int(n * min_frac))
-    max_len = max(min_len, int(n * max_frac))
-
-    prefix = np.zeros(n + 1, dtype=np.float32)
-    prefix[1:] = np.cumsum(energia, dtype=np.float32)
-
-    melhor_i = 0
-    melhor_j = min_len
-    melhor_media = -1.0
-
-    for window_len in range(min_len, max_len + 1):
-        window_sum = prefix[window_len:] - prefix[:-window_len]
-        if window_sum.size == 0:
+    idx = 0
+    size = mask.size
+    while idx < size:
+        if mask[idx]:
+            idx += 1
             continue
-        idx = int(np.argmax(window_sum))
-        media = float(window_sum[idx] / np.float32(window_len))
-        if media > melhor_media:
-            melhor_media = media
-            melhor_i = idx
-            melhor_j = idx + window_len
+        gap_start = idx
+        while idx < size and not mask[idx]:
+            idx += 1
+        gap_stop = idx
+        if gap_start == 0 or gap_stop == size:
+            continue
+        if (gap_stop - gap_start) <= max_gap:
+            mask[gap_start:gap_stop] = True
+    return mask
 
-    return melhor_i, melhor_j
+
+def _longest_true_run(mask: np.ndarray) -> tuple[int, int]:
+    mask = np.asarray(mask, dtype=bool)
+    best_start = 0
+    best_stop = 0
+    idx = 0
+    while idx < mask.size:
+        if not mask[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < mask.size and mask[idx]:
+            idx += 1
+        stop = idx
+        if (stop - start) > (best_stop - best_start):
+            best_start = start
+            best_stop = stop
+    return best_start, best_stop
+
+
+def _highest_energy_window(energy: np.ndarray, window_size: int) -> tuple[int, int]:
+    energy = np.asarray(energy, dtype=np.float32)
+    if energy.size <= window_size:
+        return 0, int(energy.size)
+
+    prefix = np.zeros(energy.size + 1, dtype=np.float32)
+    prefix[1:] = np.cumsum(energy, dtype=np.float32)
+    window_sum = prefix[window_size:] - prefix[:-window_size]
+    start = int(np.argmax(window_sum))
+    return start, start + int(window_size)
+
+
+def _select_reference_slice(energy: np.ndarray, cfg: DirectComparatorConfig) -> tuple[int, int]:
+    energy = np.asarray(energy, dtype=np.float32)
+    frame_count = energy.size
+    if frame_count == 0:
+        return 0, 0
+    if frame_count <= cfg.min_reference_frames:
+        return 0, frame_count
+
+    floor = float(np.percentile(energy, cfg.activity_percentile))
+    ceiling = float(np.percentile(energy, 95.0))
+    threshold = floor + (cfg.activity_ratio * max(ceiling - floor, EPSILON))
+
+    active = _fill_short_gaps(energy >= threshold, cfg.activity_gap_frames)
+    start, stop = _longest_true_run(active)
+    if stop <= start:
+        peak = int(np.argmax(energy))
+        start = max(0, peak - (cfg.min_reference_frames // 2))
+        stop = min(frame_count, start + cfg.min_reference_frames)
+        start = max(0, stop - cfg.min_reference_frames)
+
+    start = max(0, start - cfg.reference_padding_frames)
+    stop = min(frame_count, stop + cfg.reference_padding_frames)
+
+    if (stop - start) < cfg.min_reference_frames:
+        peak = int(np.argmax(energy))
+        start = max(0, peak - (cfg.min_reference_frames // 2))
+        stop = min(frame_count, start + cfg.min_reference_frames)
+        start = max(0, stop - cfg.min_reference_frames)
+
+    if (stop - start) > cfg.max_reference_frames:
+        rel_start, rel_stop = _highest_energy_window(energy[start:stop], cfg.max_reference_frames)
+        start += rel_start
+        stop = start + (rel_stop - rel_start)
+
+    return start, stop
+
+
+def _search_tail_frames(template_len: int, cfg: DirectComparatorConfig) -> int:
+    desired = max(template_len + cfg.search_margin_frames, template_len * 2)
+    return max(template_len, min(desired, cfg.max_search_frames))
+
+
+def build_reference_template(
+    evento_fft: np.ndarray,
+    *,
+    config: Optional[DirectComparatorConfig] = None,
+) -> ReferenceTemplate:
+    cfg = config or DirectComparatorConfig()
+    bands = _agrupar_bandas_fft(evento_fft, band_count=cfg.band_count, useful_bins=cfg.useful_bins)
+    energy = _energia_frames(bands)
+    start, stop = _select_reference_slice(energy, cfg)
+
+    ref_bands = bands[start:stop]
+    ref_energy = energy[start:stop]
+
+    return ReferenceTemplate(
+        band_frames_unit=_unit_rows(ref_bands),
+        envelope_unit=_unit_vector(ref_energy),
+        mean_energy=float(np.mean(ref_energy, dtype=np.float32) + EPSILON),
+        peak_energy=float(np.max(ref_energy) + EPSILON),
+        frame_count=int(ref_bands.shape[0]),
+        start_frame=int(start),
+        stop_frame=int(stop),
+    )
+
+
+def score_history_against_template(
+    snapshot_fft: np.ndarray,
+    template: ReferenceTemplate,
+    *,
+    config: Optional[DirectComparatorConfig] = None,
+) -> ComparisonResult:
+    cfg = config or DirectComparatorConfig()
+    snapshot_fft = np.asarray(snapshot_fft, dtype=np.float32)
+    if snapshot_fft.ndim != 2:
+        raise ValueError("FFT history must be 2D")
+    if snapshot_fft.shape[0] < template.frame_count or template.frame_count <= 0:
+        raise ValueError("FFT history shorter than template")
+
+    bands = _agrupar_bandas_fft(snapshot_fft, band_count=cfg.band_count, useful_bins=cfg.useful_bins)
+    energy = _energia_frames(bands)
+
+    search_frames = _search_tail_frames(template.frame_count, cfg)
+    if bands.shape[0] > search_frames:
+        bands = bands[-search_frames:]
+        energy = energy[-search_frames:]
+
+    normalized_bands = _unit_rows(bands)
+    band_windows = sliding_window_view(normalized_bands, template.frame_count, axis=0)
+    band_windows = np.moveaxis(band_windows, -1, 1)
+    energy_windows = sliding_window_view(energy, template.frame_count)
+
+    frame_cosine = np.sum(band_windows * template.band_frames_unit[None, :, :], axis=2, dtype=np.float32)
+    spectral_score = np.mean(frame_cosine, axis=1, dtype=np.float32)
+
+    energy_centered = energy_windows - np.mean(energy_windows, axis=1, keepdims=True, dtype=np.float32)
+    energy_norm = np.linalg.norm(energy_centered, axis=1) + EPSILON
+    envelope_score = (energy_centered @ template.envelope_unit) / energy_norm
+
+    mean_energy = np.mean(energy_windows, axis=1, dtype=np.float32)
+    peak_energy = np.max(energy_windows, axis=1)
+    energy_ratio = np.maximum(mean_energy / np.float32(template.mean_energy), EPSILON)
+    energy_score = 1.0 - (np.minimum(np.abs(np.log2(energy_ratio)), 1.5) / 1.5)
+    energy_score = np.clip(energy_score, 0.0, 1.0)
+
+    valid = (mean_energy >= (template.mean_energy * cfg.min_energy_ratio)) & (
+        peak_energy >= (template.peak_energy * cfg.min_energy_ratio)
+    )
+
+    score = (
+        0.70 * ((spectral_score + 1.0) * 0.5)
+        + 0.20 * ((envelope_score + 1.0) * 0.5)
+        + 0.10 * energy_score
+    )
+    score = np.where(valid, score, 0.0)
+
+    best_index = int(np.argmax(score))
+    return ComparisonResult(
+        score=float(score[best_index]),
+        spectral_score=float(spectral_score[best_index]),
+        envelope_score=float(envelope_score[best_index]),
+        energy_score=float(energy_score[best_index]),
+        baseline_score=float(mean_energy[best_index]),
+        valid_windows=int(np.count_nonzero(valid)),
+        total_windows=int(score.size),
+        best_index=best_index,
+        search_frames=int(bands.shape[0]),
+    )
 
 
 def _write_similarity_state(active: bool) -> None:
@@ -191,179 +315,87 @@ def _write_similarity_state(active: bool) -> None:
     os.replace(SIMILARITY_STATE_TMP_FILENAME, SIMILARITY_STATE_FILENAME)
 
 
-def compararEvento(buffer2, buffer4, lock, get_lastEventTime):
-    COOLDOWN = 15
-    PASSO_JANELA = 1
-    FRAMES_MIN_DETECCAO = 2
-    MIN_ENERGIA_JANELA = 0.20
-    POLL_INTERVAL_SECONDS = 0.20
+def compararEvento(buffer2, buffer4, lock, get_lastEventTime, config: Optional[DirectComparatorConfig] = None):
+    del buffer2
+    cfg = config or DirectComparatorConfig()
 
+    template = None
     detectando = False
-    contador = 0
-
-    hist_scores = deque(maxlen=30)
-
-    bloco_mfcc_ref = None
-    bloco_fft_ref = None
-    bloco_fft_pesos = None
-    bloco_fluxo_ref = None
-    bloco_env_ref = None
-    bloco_tamanho_cache = 0
-    energia_bloco_ref_cache = 0.0
-    last_mtime_evento = 0
-    last_mtime_fft = 0
     similarity_state = None
+    consecutive_hits = 0
+    last_event_mtime = 0.0
+    last_fft_mtime = 0.0
+    recent_scores = deque(maxlen=cfg.score_history_size)
 
     _write_similarity_state(False)
 
     while True:
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(cfg.poll_interval_seconds)
 
-        if time.time() - get_lastEventTime() < COOLDOWN:
+        if time.time() - get_lastEventTime() < cfg.cooldown_seconds:
             continue
 
-        if not os.path.exists("evento.npy") or not os.path.exists("fft.npy"):
+        if not os.path.exists(EVENTO_FILENAME) or not os.path.exists(FFT_FILENAME):
             continue
 
-        mtime_evento = os.path.getmtime("evento.npy")
-        mtime_fft = os.path.getmtime("fft.npy")
-
-        if (
-            bloco_mfcc_ref is None
-            or bloco_fft_ref is None
-            or bloco_fft_pesos is None
-            or bloco_fluxo_ref is None
-            or bloco_env_ref is None
-            or mtime_evento != last_mtime_evento
-            or mtime_fft != last_mtime_fft
-        ):
-            print("evento atualizado!")
-
-            evento_mfcc_raw = np.load("evento.npy")
-            evento_fft_raw = np.load("fft.npy").astype(np.float32)
-
-            energia_total = _energia_frames_fft_raw(evento_fft_raw)
-            i0, i1 = _melhor_bloco_continuo(energia_total)
-
-            bloco_mfcc = _prepara_mfcc(evento_mfcc_raw)[i0:i1]
-            bloco_fft = _prepara_fft(evento_fft_raw)[i0:i1]
-            bloco_fft_raw = evento_fft_raw[i0:i1]
-
-            bloco_mfcc_ref = _assinatura_mfcc(bloco_mfcc)
-            bloco_fft_ref, bloco_fft_pesos = _assinatura_fft(bloco_fft)
-            bloco_fluxo_ref = _assinatura_fluxo(bloco_fft)
-            bloco_env_ref = _assinatura_env(bloco_fft_raw)
-
-            bloco_tamanho_cache = i1 - i0
-            energia_bloco_ref_cache = float(np.mean(_energia_frames_fft_raw(bloco_fft_raw), dtype=np.float32) + EPSILON)
-
-            last_mtime_evento = mtime_evento
-            last_mtime_fft = mtime_fft
-            hist_scores.clear()
-            contador = 0
+        event_mtime = os.path.getmtime(EVENTO_FILENAME)
+        fft_mtime = os.path.getmtime(FFT_FILENAME)
+        if template is None or event_mtime != last_event_mtime or fft_mtime != last_fft_mtime:
+            evento_fft = np.load(FFT_FILENAME).astype(np.float32)
+            template = build_reference_template(evento_fft, config=cfg)
+            last_event_mtime = event_mtime
+            last_fft_mtime = fft_mtime
+            recent_scores.clear()
+            consecutive_hits = 0
             detectando = False
             if similarity_state is not False:
                 _write_similarity_state(False)
                 similarity_state = False
 
-            print(f"bloco usado: {i0}:{i1} tamanho={bloco_tamanho_cache}")
-
-        bloco_tamanho = bloco_tamanho_cache
-        energia_bloco_ref = energia_bloco_ref_cache
+            print(
+                f"referencia atualizada: frames={template.frame_count} "
+                f"janela={template.start_frame}:{template.stop_frame}",
+                flush=True,
+            )
 
         with lock:
-            snapshot_mfcc = list(buffer2)
             snapshot_fft = list(buffer4)
 
-        if len(snapshot_mfcc) < bloco_tamanho or len(snapshot_fft) < bloco_tamanho:
+        if template is None or len(snapshot_fft) < template.frame_count:
             continue
 
         loop_start = time.perf_counter()
+        result = score_history_against_template(np.asarray(snapshot_fft, dtype=np.float32), template, config=cfg)
 
-        atual_mfcc_full = np.asarray(snapshot_mfcc, dtype=np.float32)
-        atual_fft_full = np.asarray(snapshot_fft, dtype=np.float32)
-
-        energia_frames = _energia_frames_fft_raw(atual_fft_full)
-        energia_janelas = _window_mean_1d(energia_frames, bloco_tamanho, PASSO_JANELA)
-        energia_baseline = float(np.percentile(energia_frames, 35))
-        energia_quieta = energia_frames[energia_frames <= np.percentile(energia_frames, 50)]
-        if energia_quieta.size == 0:
-            energia_quieta = energia_frames
-        energia_spread = float(np.std(energia_quieta, dtype=np.float32) + EPSILON)
-        min_energia_janela = max(MIN_ENERGIA_JANELA * energia_bloco_ref, energia_baseline + (0.5 * energia_spread))
-        validas = energia_janelas >= min_energia_janela
-
-        mfcc_medias = _window_mean_2d(_prepara_mfcc(atual_mfcc_full), bloco_tamanho, PASSO_JANELA)
-        fft_bands = _prepara_fft_bandas(_prepara_fft(atual_fft_full))
-        fft_medias = _window_mean_2d(fft_bands, bloco_tamanho, PASSO_JANELA)
-        fluxo_frames = _fluxo_espectral_bandas(fft_bands)
-        fluxo_tamanho = max(1, bloco_tamanho - 1)
-        if fluxo_frames.shape[0] >= fluxo_tamanho:
-            fluxo_medias = _window_mean_2d(fluxo_frames, fluxo_tamanho, PASSO_JANELA)
-            ref_fluxo = _zscore_rows(fluxo_medias)
-            s_fluxo = _cosine_batch(ref_fluxo, bloco_fluxo_ref)
-        else:
-            s_fluxo = np.zeros((fft_medias.shape[0],), dtype=np.float32)
-        env_janelas = sliding_window_view(energia_frames, bloco_tamanho)[::PASSO_JANELA]
-
-        ref_mfcc = _zscore_rows(mfcc_medias)
-        ref_fft = _zscore_rows(fft_medias)
-        ref_env = _zscore_rows(np.asarray(env_janelas, dtype=np.float32))
-
-        s_mfcc = _cosine_batch(ref_mfcc, bloco_mfcc_ref)
-        s_fft = _cosine_batch_weighted(ref_fft, bloco_fft_ref, bloco_fft_pesos)
-        s_env = _cosine_batch(ref_env, bloco_env_ref)
-
-        score = (0.10 * s_mfcc) + (0.40 * s_fft) + (0.30 * s_fluxo) + (0.20 * s_env)
-        score = np.where(validas, score, -np.inf)
-
-        if np.all(~validas):
-            melhor_score = 0.0
-            melhor_mfcc = 0.0
-            melhor_fft = 0.0
-            melhor_fluxo = 0.0
-            melhor_env = 0.0
-        else:
-            melhor_idx = int(np.argmax(score))
-            melhor_score = float(score[melhor_idx])
-            melhor_mfcc = float(s_mfcc[melhor_idx])
-            melhor_fft = float(s_fft[melhor_idx])
-            melhor_fluxo = float(s_fluxo[melhor_idx])
-            melhor_env = float(s_env[melhor_idx])
-
-        hist_scores.append(melhor_score)
-
-        if len(hist_scores) >= 10:
-            arr = np.asarray(hist_scores, dtype=np.float32)
-            baseline = float(np.median(arr))
-            spread = float(np.std(arr, dtype=np.float32) + EPSILON)
-        else:
-            baseline = 0.0
-            spread = 1.0
-
-        score_rel = (melhor_score - baseline) / spread
+        baseline = float(np.median(np.asarray(recent_scores, dtype=np.float32))) if recent_scores else 0.0
+        margin = result.score - baseline
         elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
 
         print(
-            f"score={melhor_score:.3f} "
-            f"rel={score_rel:.3f} "
+            f"score={result.score:.3f} "
             f"base={baseline:.3f} "
-            f"mfcc={melhor_mfcc:.3f} "
-            f"fft={melhor_fft:.3f} "
-            f"fluxo={melhor_fluxo:.3f} "
-            f"env={melhor_env:.3f} "
-            f"janelas={len(score)} "
-            f"proc_ms={elapsed_ms:.1f}"
+            f"margem={margin:.3f} "
+            f"espectro={result.spectral_score:.3f} "
+            f"env={result.envelope_score:.3f} "
+            f"energia={result.energy_score:.3f} "
+            f"janelas={result.total_windows} "
+            f"validas={result.valid_windows} "
+            f"ref={template.frame_count} "
+            f"busca={result.search_frames} "
+            f"proc_ms={elapsed_ms:.1f}",
+            flush=True,
         )
 
-        if score_rel > 1.8:
-            contador += 1
+        is_hit = result.score >= cfg.absolute_threshold and (not recent_scores or margin >= cfg.margin_threshold)
+        if is_hit:
+            consecutive_hits += 1
         else:
-            contador = 0
+            consecutive_hits = 0
+            recent_scores.append(result.score)
 
-        if contador >= FRAMES_MIN_DETECCAO:
+        if consecutive_hits >= cfg.min_consecutive_hits:
             if not detectando:
-                print("OPA! SOM SEMELHANTE!!!")
+                print("OPA! SOM SEMELHANTE!!!", flush=True)
                 detectando = True
             if similarity_state is not True:
                 _write_similarity_state(True)

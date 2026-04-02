@@ -11,13 +11,29 @@ from typing import Iterator, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from .compararEvento import compararEvento
-    from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, FFTAdapterConfig, FPGAFFTReceiver
-    from .i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
+    from .compararEvento import DirectComparatorConfig, compararEvento
+    from .fpga_fft_adapter import (
+        DEFAULT_BFPEXP_HOLD_PAIRS,
+        DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        FFTAdapterConfig,
+        FPGAFFTReceiver,
+    )
+    from .i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
+        DEFAULT_CAPTURE_RATE_HZ,
+        build_capture_cmd,
+        resolve_audio_device,
+    )
 except ImportError:
-    from compararEvento import compararEvento
-    from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, FFTAdapterConfig, FPGAFFTReceiver
-    from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
+    from compararEvento import DirectComparatorConfig, compararEvento
+    from fpga_fft_adapter import (
+        DEFAULT_BFPEXP_HOLD_PAIRS,
+        DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        FFTAdapterConfig,
+        FPGAFFTReceiver,
+    )
+    from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_BACKEND, DEFAULT_CAPTURE_RATE_HZ, build_capture_cmd, resolve_audio_device
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -462,11 +478,22 @@ def _build_debug_session_start(
         "protocol_enforced": False,
         "done_pulses_emitted": False,
         "device": device,
-        "arecord_cmd": build_arecord_cmd(device, cfg.sample_rate) if device else None,
+        "capture_cmd": (
+            build_capture_cmd(
+                device,
+                cfg.sample_rate,
+                backend=cfg.capture_backend,
+                capture_binary=cfg.capture_binary,
+            )
+            if device
+            else None
+        ),
         "config": {
             "sample_rate": cfg.sample_rate,
             "frame_bins": cfg.frame_bins,
             "useful_bins": cfg.useful_bins,
+            "capture_backend": cfg.capture_backend,
+            "capture_binary": cfg.capture_binary,
             "use_i2s_tags": cfg.use_i2s_tags,
             "tag_shift": cfg.tag_shift,
             "tag_mask": cfg.tag_mask,
@@ -476,6 +503,7 @@ def _build_debug_session_start(
             "tag_fft": cfg.tag_fft,
             "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
             "bfpexp_pairs_required": cfg.bfpexp_pairs_required,
+            "loss_tolerance_pairs": cfg.loss_tolerance_pairs,
             "bfpexp_flag_line": cfg.bfpexp_flag_line,
             "done_line": cfg.done_line,
         },
@@ -805,6 +833,11 @@ def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
     else:
         bfpexp_hold_pairs = DEFAULT_BFPEXP_HOLD_PAIRS
 
+    if args.loss_tolerance_pairs is not None:
+        loss_tolerance_pairs = args.loss_tolerance_pairs
+    else:
+        loss_tolerance_pairs = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
+
     if args.allow_fft_without_bfpexp is not None:
         allow_fft_without_bfpexp = args.allow_fft_without_bfpexp
     else:
@@ -823,6 +856,7 @@ def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
         "sync_mode": sync_mode,
         "use_i2s_tags": use_i2s_tags,
         "bfpexp_hold_pairs": bfpexp_hold_pairs,
+        "loss_tolerance_pairs": loss_tolerance_pairs,
         "allow_fft_without_bfpexp": allow_fft_without_bfpexp,
     }
 
@@ -836,6 +870,17 @@ def main() -> int:
         "--device",
         default=DEFAULT_AUDIO_DEVICE,
         help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
+    )
+    parser.add_argument(
+        "--capture-backend",
+        choices=("auto", "arecord", "alsa-c"),
+        default=DEFAULT_CAPTURE_BACKEND,
+        help="Capture backend used to read the ALSA stream",
+    )
+    parser.add_argument(
+        "--capture-binary",
+        default=None,
+        help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
     )
     parser.add_argument(
         "-r",
@@ -921,6 +966,12 @@ def main() -> int:
         help="Required consecutive BFPEXP-tagged stereo pairs before a new FFT burst is accepted",
     )
     parser.add_argument(
+        "--loss-tolerance-pairs",
+        type=int,
+        default=None,
+        help="Tolerated corrupted/missing tagged stereo pairs per BFPEXP preamble or FFT burst",
+    )
+    parser.add_argument(
         "--allow-fft-without-bfpexp",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -964,6 +1015,42 @@ def main() -> int:
         default=DEFAULT_DEBUG_PREVIEW_PAIRS,
         help="Number of raw pairs previewed inside each JSONL debug chunk",
     )
+    parser.add_argument(
+        "--compare-threshold",
+        type=float,
+        default=DirectComparatorConfig.absolute_threshold,
+        help="Absolute similarity threshold for the direct FFT comparator",
+    )
+    parser.add_argument(
+        "--compare-margin",
+        type=float,
+        default=DirectComparatorConfig.margin_threshold,
+        help="Minimum score margin above the recent baseline for the direct comparator",
+    )
+    parser.add_argument(
+        "--compare-poll-ms",
+        type=float,
+        default=DirectComparatorConfig.poll_interval_seconds * 1000.0,
+        help="Polling interval of the direct comparator in milliseconds",
+    )
+    parser.add_argument(
+        "--compare-min-energy-ratio",
+        type=float,
+        default=DirectComparatorConfig.min_energy_ratio,
+        help="Minimum energy ratio accepted for candidate windows",
+    )
+    parser.add_argument(
+        "--compare-max-reference-frames",
+        type=int,
+        default=DirectComparatorConfig.max_reference_frames,
+        help="Maximum number of FFT frames kept from the recorded reference event",
+    )
+    parser.add_argument(
+        "--compare-search-frames",
+        type=int,
+        default=DirectComparatorConfig.max_search_frames,
+        help="Maximum number of recent FFT frames searched for a match",
+    )
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -977,17 +1064,32 @@ def main() -> int:
     sync_cfg = _resolve_sync_cli_defaults(args)
     use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
+    loss_tolerance_pairs = int(sync_cfg["loss_tolerance_pairs"])
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
     sync_mode = str(sync_cfg["sync_mode"])
 
     if bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
+    if loss_tolerance_pairs < 0:
+        parser.error("--loss-tolerance-pairs must be non-negative")
     if args.debug_capture_seconds <= 0:
         parser.error("--debug-capture-seconds must be positive")
     if args.debug_chunk_pairs <= 0:
         parser.error("--debug-chunk-pairs must be positive")
     if args.debug_preview_pairs < 0:
         parser.error("--debug-preview-pairs must be non-negative")
+    if not 0.0 < args.compare_threshold <= 1.0:
+        parser.error("--compare-threshold must satisfy 0 < compare-threshold <= 1")
+    if args.compare_margin < 0.0:
+        parser.error("--compare-margin must be non-negative")
+    if args.compare_poll_ms <= 0.0:
+        parser.error("--compare-poll-ms must be positive")
+    if args.compare_min_energy_ratio <= 0.0:
+        parser.error("--compare-min-energy-ratio must be positive")
+    if args.compare_max_reference_frames <= 0:
+        parser.error("--compare-max-reference-frames must be positive")
+    if args.compare_search_frames <= 0:
+        parser.error("--compare-search-frames must be positive")
     if args.debug_replay_raw and not args.debug_channel_log:
         parser.error("--debug-replay-raw requires --debug-channel-log")
     if args.debug_raw_capture and args.debug_replay_raw:
@@ -1020,6 +1122,8 @@ def main() -> int:
             sample_rate=args.rate,
             frame_bins=args.frame_bins,
             useful_bins=args.useful_bins,
+            capture_backend=args.capture_backend,
+            capture_binary=args.capture_binary,
             gpio_chip=args.gpio_chip,
             bfpexp_flag_line=args.bfpexp_flag_line,
             done_line=args.done_line,
@@ -1036,6 +1140,7 @@ def main() -> int:
             tag_fft=args.tag_fft,
             require_bfpexp_before_fft=not allow_fft_without_bfpexp,
             bfpexp_pairs_required=bfpexp_hold_pairs,
+            loss_tolerance_pairs=loss_tolerance_pairs,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -1075,6 +1180,14 @@ def main() -> int:
     buffers = create_analysis_buffers(args.rate, args.frame_bins)
     lock = threading.Lock()
     state = create_runtime_state()
+    compare_config = DirectComparatorConfig(
+        absolute_threshold=args.compare_threshold,
+        margin_threshold=args.compare_margin,
+        poll_interval_seconds=args.compare_poll_ms / 1000.0,
+        min_energy_ratio=args.compare_min_energy_ratio,
+        max_reference_frames=args.compare_max_reference_frames,
+        max_search_frames=args.compare_search_frames,
+    )
 
     def trigger_recording(source: str) -> bool:
         with lock:
@@ -1122,7 +1235,7 @@ def main() -> int:
     threading.Thread(target=watch_record_trigger, daemon=True).start()
     threading.Thread(
         target=compararEvento,
-        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"]),
+        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"], compare_config),
         daemon=True,
     ).start()
 
@@ -1137,6 +1250,11 @@ def main() -> int:
             f"and a new burst normally starts after {cfg.bfpexp_pairs_required} consecutive BFPEXP-tagged pairs.",
             flush=True,
         )
+        if cfg.loss_tolerance_pairs > 0:
+            print(
+                f"Tagged mode robustness: allowing up to {cfg.loss_tolerance_pairs} corrupted/missing pairs inside each BFPEXP preamble and FFT frame.",
+                flush=True,
+            )
         if allow_fft_without_bfpexp:
             print("Tagged mode sync: FFT tags may start a frame even without a BFPEXP tag.", flush=True)
         elif args.done_line is not None:
@@ -1161,6 +1279,14 @@ def main() -> int:
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)
+    print(
+        "Direct comparator:",
+        f"threshold={compare_config.absolute_threshold:.3f}",
+        f"margin={compare_config.margin_threshold:.3f}",
+        f"search_frames={compare_config.max_search_frames}",
+        f"ref_frames_max={compare_config.max_reference_frames}",
+        flush=True,
+    )
     print("Press Ctrl+C to stop.", flush=True)
 
     try:

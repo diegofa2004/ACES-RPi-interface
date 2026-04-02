@@ -34,6 +34,7 @@ apt-get update
 apt-get install -y \
   build-essential \
   device-tree-compiler \
+  libasound2-dev \
   raspberrypi-kernel-headers \
   python3 \
   python3-pip \
@@ -50,6 +51,11 @@ fi
 
 "${PROJECT_DIR}/.venv/bin/pip" install --upgrade pip
 "${PROJECT_DIR}/.venv/bin/pip" install -r "${PROJECT_DIR}/requirements.txt"
+
+gcc -O2 -Wall -Wextra -pthread \
+  -o "${PROJECT_DIR}/alsa_logger" \
+  "${PROJECT_DIR}/alsa_logger.c" \
+  -lasound
 
 if ! "${PROJECT_DIR}/.venv/bin/python" -c "import gpiod" >/dev/null 2>&1; then
   cat <<'EOF'
@@ -72,13 +78,13 @@ Next steps:
    arecord -l
 3. Recommended event-comparison flow:
    cd ${PROJECT_DIR}
-   .venv/bin/python analyzer_from_fpga_fft.py -r ${HOST_RATE_HZ} --frame-bins 512 --useful-bins 256
+   .venv/bin/python analyzer_from_fpga_fft.py -r ${HOST_RATE_HZ} --frame-bins 512 --useful-bins 256 --capture-backend alsa-c
 4. Optional second terminal for FFT visualization:
    cd ${PROJECT_DIR}
    .venv/bin/python plotFFT.py --rate ${HOST_RATE_HZ} --frame-bins 512
 5. Optional third terminal for raw CSV logging:
    cd ${PROJECT_DIR}
-   .venv/bin/python fft_i2s_logger.py -r ${HOST_RATE_HZ} --csv fft_capture.csv
+   .venv/bin/python fft_i2s_logger.py -r ${HOST_RATE_HZ} --csv fft_capture.csv --capture-backend alsa-c
 
 If auto-detection chooses the wrong input, set AUDIO_DEVICE or pass -D hw:X,Y explicitly.
 The official overlay installed above keeps FPGA as I2S master and Pi as slave/capture side.

@@ -10,28 +10,30 @@ from typing import Optional
 import numpy as np
 
 try:
-    from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS
+    from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         TaggedI2SRealigner,
-        build_arecord_cmd,
+        build_capture_cmd,
         read_exactly,
         resolve_audio_device,
-        start_arecord_process,
+        start_capture_process,
         stop_process,
         trim_incomplete_frames,
     )
 except ImportError:
-    from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS
+    from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         TaggedI2SRealigner,
-        build_arecord_cmd,
+        build_capture_cmd,
         read_exactly,
         resolve_audio_device,
-        start_arecord_process,
+        start_capture_process,
         stop_process,
         trim_incomplete_frames,
     )
@@ -94,19 +96,27 @@ def classify_tagged_pair(
     return "unknown_tag"
 
 
+def is_tolerable_loss_kind(kind: str) -> bool:
+    return kind in ("tag_mismatch", "unknown_tag", "idle")
+
+
 def create_contract_tracker(
     *,
     frame_bins: int,
     bfpexp_hold_pairs: int,
     allow_fft_without_bfpexp: bool,
+    loss_tolerance_pairs: int,
 ) -> dict[str, object]:
     return {
         "frame_bins": int(frame_bins),
         "bfpexp_hold_pairs": int(bfpexp_hold_pairs),
         "allow_fft_without_bfpexp": bool(allow_fft_without_bfpexp),
+        "loss_tolerance_pairs": int(loss_tolerance_pairs),
         "frame_number": 0,
         "bfpexp_run": 0,
+        "bfpexp_loss_run": 0,
         "fft_index": 0,
+        "fft_loss_run": 0,
         "inside_fft": False,
         "bootstrapped": False,
     }
@@ -127,22 +137,49 @@ def advance_contract_tracker(
                 tracker["inside_fft"] = False
                 tracker["fft_index"] = 0
                 tracker["bfpexp_run"] = 0
+                tracker["bfpexp_loss_run"] = 0
+                tracker["fft_loss_run"] = 0
+                tracker["bootstrapped"] = False
+                tracker["frame_number"] = frame_number + 1
+            return phase, frame_number, fft_index
+        if is_tolerable_loss_kind(kind) and int(tracker["fft_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            fft_index = int(tracker["fft_index"])
+            tracker["fft_index"] = fft_index + 1
+            tracker["fft_loss_run"] = int(tracker["fft_loss_run"]) + 1
+            phase = "fft_frame_gap_bootstrap" if bool(tracker["bootstrapped"]) else "fft_frame_gap"
+            if int(tracker["fft_index"]) >= int(tracker["frame_bins"]):
+                tracker["inside_fft"] = False
+                tracker["fft_index"] = 0
+                tracker["bfpexp_run"] = 0
+                tracker["bfpexp_loss_run"] = 0
+                tracker["fft_loss_run"] = 0
                 tracker["bootstrapped"] = False
                 tracker["frame_number"] = frame_number + 1
             return phase, frame_number, fft_index
 
         tracker["inside_fft"] = False
         tracker["fft_index"] = 0
+        tracker["fft_loss_run"] = 0
         tracker["bootstrapped"] = False
         if kind == "bfpexp":
             tracker["bfpexp_run"] = 1
+            tracker["bfpexp_loss_run"] = 0
             return "protocol_reset_bfpexp", frame_number, 0
         tracker["bfpexp_run"] = 0
+        tracker["bfpexp_loss_run"] = 0
         return f"protocol_reset_{kind}", frame_number, -1
 
     if kind == "idle":
+        if int(tracker["bfpexp_run"]) == 0:
+            return "search_idle", frame_number, -1
+        if int(tracker["bfpexp_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            bfpexp_index = int(tracker["bfpexp_run"])
+            tracker["bfpexp_run"] = bfpexp_index + 1
+            tracker["bfpexp_loss_run"] = int(tracker["bfpexp_loss_run"]) + 1
+            return "bfpexp_preamble_gap", frame_number, bfpexp_index
         if int(tracker["bfpexp_run"]) != 0:
             tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
         return "search_idle", frame_number, -1
 
     if kind == "bfpexp":
@@ -150,26 +187,41 @@ def advance_contract_tracker(
         tracker["bfpexp_run"] = bfpexp_index + 1
         return "bfpexp_preamble", frame_number, bfpexp_index
 
+    if is_tolerable_loss_kind(kind):
+        if int(tracker["bfpexp_run"]) > 0 and int(tracker["bfpexp_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            bfpexp_index = int(tracker["bfpexp_run"])
+            tracker["bfpexp_run"] = bfpexp_index + 1
+            tracker["bfpexp_loss_run"] = int(tracker["bfpexp_loss_run"]) + 1
+            return "bfpexp_preamble_gap", frame_number, bfpexp_index
+        tracker["bfpexp_run"] = 0
+        tracker["bfpexp_loss_run"] = 0
+        return f"protocol_reset_{kind}", frame_number, -1
+
     if kind == "fft":
         bfpexp_run = int(tracker["bfpexp_run"])
         bootstrap = bfpexp_run == 0 and bool(tracker["allow_fft_without_bfpexp"])
         if (not bootstrap) and (bfpexp_run < int(tracker["bfpexp_hold_pairs"])):
             tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
             return "protocol_wait_bfpexp", frame_number, -1
 
         tracker["inside_fft"] = True
         tracker["bootstrapped"] = bootstrap
         tracker["fft_index"] = 1
+        tracker["fft_loss_run"] = 0
         phase = "fft_frame_bootstrap" if bootstrap else "fft_frame"
         if int(tracker["frame_bins"]) == 1:
             tracker["inside_fft"] = False
             tracker["fft_index"] = 0
             tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
+            tracker["fft_loss_run"] = 0
             tracker["bootstrapped"] = False
             tracker["frame_number"] = frame_number + 1
         return phase, frame_number, 0
 
     tracker["bfpexp_run"] = 0
+    tracker["bfpexp_loss_run"] = 0
     return f"protocol_reset_{kind}", frame_number, -1
 
 
@@ -307,6 +359,17 @@ def main() -> int:
         help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
     )
     parser.add_argument(
+        "--capture-backend",
+        choices=("auto", "arecord", "alsa-c"),
+        default=DEFAULT_CAPTURE_BACKEND,
+        help="Capture backend used to read the ALSA stream",
+    )
+    parser.add_argument(
+        "--capture-binary",
+        default=None,
+        help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
+    )
+    parser.add_argument(
         "-r",
         "--rate",
         type=int,
@@ -340,6 +403,12 @@ def main() -> int:
         help="Expected consecutive BFPEXP-tagged stereo pairs before each FFT burst",
     )
     parser.add_argument(
+        "--loss-tolerance-pairs",
+        type=int,
+        default=DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        help="Tolerated corrupted/missing tagged stereo pairs per BFPEXP preamble or FFT burst",
+    )
+    parser.add_argument(
         "--allow-fft-without-bfpexp",
         action="store_true",
         help="Annotate FFT bursts as valid even if they start without a BFPEXP preamble",
@@ -358,6 +427,8 @@ def main() -> int:
         parser.error("--payload-bits must be positive")
     if args.bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
+    if args.loss_tolerance_pairs < 0:
+        parser.error("--loss-tolerance-pairs must be non-negative")
 
     try:
         device = resolve_audio_device(args.device)
@@ -384,6 +455,7 @@ def main() -> int:
         frame_bins=args.frame_bins,
         bfpexp_hold_pairs=args.bfpexp_hold_pairs,
         allow_fft_without_bfpexp=args.allow_fft_without_bfpexp,
+        loss_tolerance_pairs=args.loss_tolerance_pairs,
     )
 
     def handle_stop(_sig: int, _frame: Optional[object]) -> None:
@@ -393,13 +465,23 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_stop)
     signal.signal(signal.SIGTERM, handle_stop)
 
-    cmd = build_arecord_cmd(device, args.rate)
+    cmd = build_capture_cmd(
+        device,
+        args.rate,
+        backend=args.capture_backend,
+        capture_binary=args.capture_binary,
+    )
     print("Using ALSA capture device:", device, flush=True)
     print("Starting:", " ".join(cmd), flush=True)
     print("Logging CSV to:", args.csv, flush=True)
 
     try:
-        proc = start_arecord_process(device, args.rate)
+        proc = start_capture_process(
+            device,
+            args.rate,
+            backend=args.capture_backend,
+            capture_binary=args.capture_binary,
+        )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1

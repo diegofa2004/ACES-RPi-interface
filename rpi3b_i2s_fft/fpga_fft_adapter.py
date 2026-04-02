@@ -10,9 +10,9 @@ try:
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
         TaggedI2SRealigner,
-        build_arecord_cmd,
+        build_capture_cmd,
         resolve_audio_device,
-        start_arecord_process,
+        start_capture_process,
         stop_process,
     )
     from .spectral_features import build_dct_matrix, build_mel_filter
@@ -21,9 +21,9 @@ except ImportError:
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_RATE_HZ,
         TaggedI2SRealigner,
-        build_arecord_cmd,
+        build_capture_cmd,
         resolve_audio_device,
-        start_arecord_process,
+        start_capture_process,
         stop_process,
     )
     from spectral_features import build_dct_matrix, build_mel_filter
@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 
 
 DEFAULT_BFPEXP_HOLD_PAIRS = 128
+DEFAULT_TAG_LOSS_TOLERANCE_PAIRS = 3
 
 
 @dataclass
@@ -43,6 +44,8 @@ class FFTAdapterConfig:
     sample_rate: int = DEFAULT_CAPTURE_RATE_HZ
     frame_bins: int = 512
     useful_bins: int = 256
+    capture_backend: str = "auto"
+    capture_binary: Optional[str] = None
     gpio_chip: str = "/dev/gpiochip0"
     bfpexp_flag_line: Optional[int] = None
     done_line: Optional[int] = None
@@ -59,6 +62,7 @@ class FFTAdapterConfig:
     tag_fft: int = 2
     require_bfpexp_before_fft: bool = True
     bfpexp_pairs_required: int = DEFAULT_BFPEXP_HOLD_PAIRS
+    loss_tolerance_pairs: int = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -90,6 +94,8 @@ class FFTAdapterConfig:
             raise ValueError("done_pulse_seconds must be non-negative")
         if self.bfpexp_pairs_required <= 0:
             raise ValueError("bfpexp_pairs_required must be positive")
+        if self.loss_tolerance_pairs < 0:
+            raise ValueError("loss_tolerance_pairs must be non-negative")
 
 
 class FPGAFFTReceiver:
@@ -123,6 +129,7 @@ class FPGAFFTReceiver:
         payload_mask = (1 << self.cfg.payload_bits) - 1
         self._payload_mask = payload_mask
         self._payload_sign_bit = 1 << (self.cfg.payload_bits - 1)
+        self._loss_placeholder_pair = (0, 0)
 
         n_fft = 2 * (self.cfg.useful_bins - 1)
         self.mel_filter = build_mel_filter(
@@ -332,6 +339,10 @@ class FPGAFFTReceiver:
         # if software attaches while a FFT burst is already in flight.
         return self.cfg.done_line is not None
 
+    @staticmethod
+    def _is_tolerable_loss_kind(kind: str) -> bool:
+        return kind in ("tag_mismatch", "unknown_tag", "idle")
+
     def _wait_for_fft_window(self) -> bool:
         if self.cfg.use_i2s_tags:
             return True
@@ -371,7 +382,10 @@ class FPGAFFTReceiver:
         fft_pairs = []
         waiting_for_start = True
         bfpexp_run = 0
+        bfpexp_loss_run = 0
+        fft_loss_run = 0
         required_bfpexp_pairs = self.cfg.bfpexp_pairs_required
+        tolerated_losses = self.cfg.loss_tolerance_pairs
 
         while time.monotonic() < deadline:
             pairs = self._pop_pairs(self._poll_pairs, exact=False)
@@ -385,29 +399,61 @@ class FPGAFFTReceiver:
 
                 if waiting_for_start:
                     if kind == "idle":
+                        if bfpexp_run == 0:
+                            continue
+                        if bfpexp_loss_run < tolerated_losses:
+                            bfpexp_run += 1
+                            bfpexp_loss_run += 1
+                            continue
                         if bfpexp_run != 0:
                             bfpexp_run = 0
+                            bfpexp_loss_run = 0
                         continue
                     if kind == "bfpexp":
                         bfpexp_run += 1
+                        fft_loss_run = 0
+                        continue
+                    if self._is_tolerable_loss_kind(kind):
+                        if bfpexp_run > 0 and bfpexp_loss_run < tolerated_losses:
+                            bfpexp_run += 1
+                            bfpexp_loss_run += 1
+                            continue
+                        bfpexp_run = 0
+                        bfpexp_loss_run = 0
                         continue
                     if kind == "fft":
                         full_bfpexp_preamble = bfpexp_run >= required_bfpexp_pairs
                         bootstrap_from_fft = (not full_bfpexp_preamble) and self._allow_tagged_fft_start_without_bfpexp()
                         if (not full_bfpexp_preamble) and (not bootstrap_from_fft):
                             bfpexp_run = 0
+                            bfpexp_loss_run = 0
                             continue
                         waiting_for_start = False
                         fft_pairs.append(payload)
+                        fft_loss_run = 0
                         if len(fft_pairs) >= self.cfg.frame_bins:
                             self._push_pairs_back(pairs[idx + 1 :])
                             return np.asarray(fft_pairs, dtype=np.int32)
                         continue
                     bfpexp_run = 0
+                    bfpexp_loss_run = 0
                     continue
 
                 if kind == "fft":
                     fft_pairs.append(payload)
+                    fft_loss_run = 0
+                    if len(fft_pairs) >= self.cfg.frame_bins:
+                        self._push_pairs_back(pairs[idx + 1 :])
+                        return np.asarray(fft_pairs, dtype=np.int32)
+                    continue
+                if kind == "idle":
+                    # The FPGA transport may insert tagged idle padding between valid
+                    # FFT payload pairs. Those words are not payload loss and should
+                    # not break the current frame.
+                    continue
+                if self._is_tolerable_loss_kind(kind) and fft_loss_run < tolerated_losses:
+                    fft_pairs.append(self._loss_placeholder_pair)
+                    fft_loss_run += 1
                     if len(fft_pairs) >= self.cfg.frame_bins:
                         self._push_pairs_back(pairs[idx + 1 :])
                         return np.asarray(fft_pairs, dtype=np.int32)
@@ -419,17 +465,29 @@ class FPGAFFTReceiver:
                 fft_pairs.clear()
                 waiting_for_start = True
                 bfpexp_run = 1 if kind == "bfpexp" else 0
+                bfpexp_loss_run = 0
+                fft_loss_run = 0
 
         return None
 
     def start(self) -> None:
         resolved_device = resolve_audio_device(self.cfg.device)
         self.cfg.device = resolved_device
-        cmd = build_arecord_cmd(resolved_device, self.cfg.sample_rate)
+        cmd = build_capture_cmd(
+            resolved_device,
+            self.cfg.sample_rate,
+            backend=self.cfg.capture_backend,
+            capture_binary=self.cfg.capture_binary,
+        )
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
         try:
-            self._proc = start_arecord_process(resolved_device, self.cfg.sample_rate)
+            self._proc = start_capture_process(
+                resolved_device,
+                self.cfg.sample_rate,
+                backend=self.cfg.capture_backend,
+                capture_binary=self.cfg.capture_binary,
+            )
             self._setup_gpio()
         except Exception:
             if self._proc is not None:

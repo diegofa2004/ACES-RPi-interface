@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import BinaryIO, Optional
 
 import numpy as np
@@ -10,8 +11,46 @@ import numpy as np
 AUTO_AUDIO_DEVICE = "auto"
 BYTES_PER_STEREO_FRAME = 8
 DEFAULT_CAPTURE_RATE_HZ = 48828
-DEFAULT_ARECORD_BUFFER_TIME_US = 1000000
-DEFAULT_ARECORD_PERIOD_TIME_US = 250000
+CAPTURE_BACKEND_AUTO = "auto"
+CAPTURE_BACKEND_ARECORD = "arecord"
+CAPTURE_BACKEND_NATIVE = "alsa-c"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_nonneg_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+# Keep ALSA periods short enough that each stdout write stays well below the
+# typical Linux pipe capacity. Large period bursts can block arecord on stdout
+# long enough to starve ALSA and trigger an overrun in the analyzer.
+DEFAULT_ARECORD_BUFFER_TIME_US = _env_int("FPGAFFT_ARECORD_BUFFER_TIME_US", 1000000)
+DEFAULT_ARECORD_PERIOD_TIME_US = _env_int("FPGAFFT_ARECORD_PERIOD_TIME_US", 20000)
+DEFAULT_ARECORD_PIPE_SIZE_BYTES = _env_int("FPGAFFT_ARECORD_PIPE_SIZE_BYTES", 1 << 20)
+DEFAULT_CAPTURE_BACKEND = (os.environ.get("FPGAFFT_CAPTURE_BACKEND") or CAPTURE_BACKEND_AUTO).strip().lower()
+DEFAULT_NATIVE_CAPTURE_READ_FRAMES = _env_int("FPGAFFT_NATIVE_CAPTURE_READ_FRAMES", 2048)
+DEFAULT_NATIVE_CAPTURE_PERIOD_FRAMES = _env_int("FPGAFFT_NATIVE_CAPTURE_PERIOD_FRAMES", 512)
+DEFAULT_NATIVE_CAPTURE_BUFFER_FRAMES = _env_int("FPGAFFT_NATIVE_CAPTURE_BUFFER_FRAMES", 8192)
+DEFAULT_NATIVE_CAPTURE_QUEUE_CHUNKS = _env_int("FPGAFFT_NATIVE_CAPTURE_QUEUE_CHUNKS", 512)
+DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES = _env_int("FPGAFFT_NATIVE_CAPTURE_PIPE_SIZE_BYTES", 1 << 20)
+DEFAULT_NATIVE_CAPTURE_STATS_INTERVAL_MS = _env_nonneg_int("FPGAFFT_NATIVE_CAPTURE_STATS_INTERVAL_MS", 0)
 _CAPTURE_DEVICE_RE = re.compile(r"^card\s+(?P<card>\d+):.*device\s+(?P<device>\d+):", re.IGNORECASE)
 _PREFERRED_CAPTURE_KEYWORDS = (
     "aces-fpgafft",
@@ -587,15 +626,17 @@ class TaggedI2SRealigner:
 
 
 def build_arecord_cmd(device: str, rate: int) -> list[str]:
+    period_time_us = max(1000, DEFAULT_ARECORD_PERIOD_TIME_US)
+    buffer_time_us = max(period_time_us * 4, DEFAULT_ARECORD_BUFFER_TIME_US)
     return [
         "arecord",
         "-q",
         "-D",
         device,
         "-B",
-        str(DEFAULT_ARECORD_BUFFER_TIME_US),
+        str(buffer_time_us),
         "-F",
-        str(DEFAULT_ARECORD_PERIOD_TIME_US),
+        str(period_time_us),
         "-f",
         "S32_LE",
         "-c",
@@ -607,15 +648,167 @@ def build_arecord_cmd(device: str, rate: int) -> list[str]:
     ]
 
 
+def find_native_capture_binary() -> Optional[str]:
+    env_path = os.environ.get("FPGAFFT_CAPTURE_BINARY", "").strip()
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    module_dir = Path(__file__).resolve().parent
+    for name in ("alsa_logger", "alsa_capture"):
+        candidate = module_dir / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return None
+
+
+def _normalize_capture_backend_name(backend: Optional[str]) -> str:
+    normalized = (backend or DEFAULT_CAPTURE_BACKEND or CAPTURE_BACKEND_AUTO).strip().lower()
+    if normalized in ("", CAPTURE_BACKEND_AUTO):
+        return CAPTURE_BACKEND_AUTO
+    if normalized in (CAPTURE_BACKEND_ARECORD,):
+        return CAPTURE_BACKEND_ARECORD
+    if normalized in (CAPTURE_BACKEND_NATIVE, "alsa", "native", "c"):
+        return CAPTURE_BACKEND_NATIVE
+    raise ValueError(f"Unknown capture backend: {backend}")
+
+
+def resolve_capture_command(
+    device: str,
+    rate: int,
+    *,
+    backend: Optional[str] = None,
+    capture_binary: Optional[str] = None,
+) -> tuple[str, list[str]]:
+    normalized_backend = _normalize_capture_backend_name(backend)
+
+    if normalized_backend == CAPTURE_BACKEND_ARECORD:
+        return CAPTURE_BACKEND_ARECORD, build_arecord_cmd(device, rate)
+
+    binary_path = capture_binary or find_native_capture_binary()
+    if normalized_backend == CAPTURE_BACKEND_NATIVE:
+        if not binary_path:
+            raise RuntimeError(
+                "Native C capture backend requested but no compiled helper was found. "
+                "Build rpi3b_i2s_fft/alsa_logger first or use --capture-backend arecord."
+            )
+        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(binary_path, device, rate)
+
+    if binary_path:
+        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(binary_path, device, rate)
+
+    return CAPTURE_BACKEND_ARECORD, build_arecord_cmd(device, rate)
+
+
+def build_native_capture_cmd(binary_path: str, device: str, rate: int) -> list[str]:
+    cmd = [
+        binary_path,
+        "--device",
+        device,
+        "--rate",
+        str(rate),
+        "--mode",
+        "raw",
+        "--read-frames",
+        str(DEFAULT_NATIVE_CAPTURE_READ_FRAMES),
+        "--period-frames",
+        str(DEFAULT_NATIVE_CAPTURE_PERIOD_FRAMES),
+        "--buffer-frames",
+        str(DEFAULT_NATIVE_CAPTURE_BUFFER_FRAMES),
+        "--queue-chunks",
+        str(DEFAULT_NATIVE_CAPTURE_QUEUE_CHUNKS),
+        "--stats-interval-ms",
+        str(DEFAULT_NATIVE_CAPTURE_STATS_INTERVAL_MS),
+    ]
+    if DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES > 0:
+        cmd.extend(["--pipe-size-bytes", str(DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES)])
+    return cmd
+
+
+def build_capture_cmd(
+    device: str,
+    rate: int,
+    *,
+    backend: Optional[str] = None,
+    capture_binary: Optional[str] = None,
+) -> list[str]:
+    _resolved_backend, cmd = resolve_capture_command(
+        device,
+        rate,
+        backend=backend,
+        capture_binary=capture_binary,
+    )
+    return cmd
+
+
 def start_arecord_process(device: str, rate: int) -> subprocess.Popen:
+    cmd = build_arecord_cmd(device, rate)
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": None,
+        "bufsize": 0,
+    }
     try:
-        return subprocess.Popen(
-            build_arecord_cmd(device, rate),
-            stdout=subprocess.PIPE,
-            stderr=None,
-            bufsize=0,
-        )
+        if DEFAULT_ARECORD_PIPE_SIZE_BYTES > 0:
+            try:
+                return subprocess.Popen(
+                    cmd,
+                    pipesize=DEFAULT_ARECORD_PIPE_SIZE_BYTES,
+                    **popen_kwargs,
+                )
+            except (TypeError, ValueError, PermissionError):
+                pass
+
+        return subprocess.Popen(cmd, **popen_kwargs)
     except FileNotFoundError as exc:
+        raise RuntimeError(
+            "The 'arecord' command was not found. Install alsa-utils on the Raspberry Pi."
+        ) from exc
+
+
+def start_capture_process(
+    device: str,
+    rate: int,
+    *,
+    backend: Optional[str] = None,
+    capture_binary: Optional[str] = None,
+) -> subprocess.Popen:
+    resolved_backend, cmd = resolve_capture_command(
+        device,
+        rate,
+        backend=backend,
+        capture_binary=capture_binary,
+    )
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": None,
+        "bufsize": 0,
+    }
+    try:
+        pipe_size_bytes = (
+            DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES
+            if resolved_backend == CAPTURE_BACKEND_NATIVE
+            else DEFAULT_ARECORD_PIPE_SIZE_BYTES
+        )
+        if pipe_size_bytes > 0:
+            try:
+                return subprocess.Popen(
+                    cmd,
+                    pipesize=pipe_size_bytes,
+                    **popen_kwargs,
+                )
+            except (TypeError, ValueError, PermissionError):
+                pass
+
+        return subprocess.Popen(cmd, **popen_kwargs)
+    except FileNotFoundError as exc:
+        if resolved_backend == CAPTURE_BACKEND_NATIVE:
+            raise RuntimeError(
+                f"Native capture helper not found: {cmd[0]}. "
+                "Build rpi3b_i2s_fft/alsa_logger or use --capture-backend arecord."
+            ) from exc
         raise RuntimeError(
             "The 'arecord' command was not found. Install alsa-utils on the Raspberry Pi."
         ) from exc

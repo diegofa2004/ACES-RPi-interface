@@ -168,8 +168,8 @@ Post-reboot checklist:
 
 Raw word validation:
   cd /path/to/submodules/ACES-RPi-interface/rpi3b_i2s_fft
-  gcc -O2 -Wall -Wextra -o alsa_logger alsa_logger.c -lasound
-  ./alsa_logger hw:X,Y ${HOST_RATE_HZ}
+  gcc -O2 -Wall -Wextra -pthread -o alsa_logger alsa_logger.c -lasound
+  ./alsa_logger --device hw:X,Y --rate ${HOST_RATE_HZ}
 
 The next stage is to confirm stable hexadecimal 32-bit words before returning
 to the Python parser and tagged-mode semantics.
