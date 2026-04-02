@@ -12,11 +12,11 @@ import numpy as np
 
 try:
     from .compararEvento import compararEvento
-    from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, FFTAdapterConfig, FPGAFFTReceiver
     from .i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
 except ImportError:
     from compararEvento import compararEvento
-    from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, FFTAdapterConfig, FPGAFFTReceiver
     from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_RATE_HZ, build_arecord_cmd, resolve_audio_device
 
 
@@ -475,6 +475,7 @@ def _build_debug_session_start(
             "tag_bfpexp": cfg.tag_bfpexp,
             "tag_fft": cfg.tag_fft,
             "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
+            "bfpexp_pairs_required": cfg.bfpexp_pairs_required,
             "bfpexp_flag_line": cfg.bfpexp_flag_line,
             "done_line": cfg.done_line,
         },
@@ -791,6 +792,41 @@ def run_channel_debug_replay(
     return 0
 
 
+def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
+    preset = getattr(args, "sync_mode", None) or getattr(args, "sync_preset", None)
+
+    if args.use_i2s_tags is not None:
+        use_i2s_tags = args.use_i2s_tags
+    else:
+        use_i2s_tags = True
+
+    if args.bfpexp_hold_pairs is not None:
+        bfpexp_hold_pairs = args.bfpexp_hold_pairs
+    else:
+        bfpexp_hold_pairs = DEFAULT_BFPEXP_HOLD_PAIRS
+
+    if args.allow_fft_without_bfpexp is not None:
+        allow_fft_without_bfpexp = args.allow_fft_without_bfpexp
+    else:
+        allow_fft_without_bfpexp = preset == "tolerant"
+
+    if preset == "strict":
+        sync_mode = "strict"
+    elif preset == "tolerant":
+        sync_mode = "tolerant"
+    elif allow_fft_without_bfpexp:
+        sync_mode = "tolerant"
+    else:
+        sync_mode = "strict"
+
+    return {
+        "sync_mode": sync_mode,
+        "use_i2s_tags": use_i2s_tags,
+        "bfpexp_hold_pairs": bfpexp_hold_pairs,
+        "allow_fft_without_bfpexp": allow_fft_without_bfpexp,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Feed circular buffers from FPGA I2S FFT stream using the same event logic as pyserial."
@@ -845,10 +881,32 @@ def main() -> int:
         default=1000.0,
         help="Timeout waiting for FFT window trigger in milliseconds",
     )
+    sync_group = parser.add_mutually_exclusive_group()
+    sync_group.add_argument(
+        "--sync-mode",
+        choices=("strict", "tolerant"),
+        default=None,
+        help="Advanced selector for tagged-stream sync behavior",
+    )
+    sync_group.add_argument(
+        "--strict-sync",
+        dest="sync_preset",
+        action="store_const",
+        const="strict",
+        help="Convenience preset for the TB contract: tagged mode with full BFPEXP preamble required",
+    )
+    sync_group.add_argument(
+        "--tolerant-sync",
+        dest="sync_preset",
+        action="store_const",
+        const="tolerant",
+        help="Convenience preset for startup attach mid-burst: allows FFT sync without BFPEXP preamble",
+    )
     parser.add_argument(
         "--use-i2s-tags",
-        action="store_true",
-        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream (default: enabled)",
     )
     parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
     parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
@@ -857,8 +915,15 @@ def main() -> int:
     parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
     parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
     parser.add_argument(
+        "--bfpexp-hold-pairs",
+        type=int,
+        default=None,
+        help="Required consecutive BFPEXP-tagged stereo pairs before a new FFT burst is accepted",
+    )
+    parser.add_argument(
         "--allow-fft-without-bfpexp",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
     )
     parser.add_argument(
@@ -909,6 +974,14 @@ def main() -> int:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    sync_cfg = _resolve_sync_cli_defaults(args)
+    use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
+    bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
+    allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
+    sync_mode = str(sync_cfg["sync_mode"])
+
+    if bfpexp_hold_pairs <= 0:
+        parser.error("--bfpexp-hold-pairs must be positive")
     if args.debug_capture_seconds <= 0:
         parser.error("--debug-capture-seconds must be positive")
     if args.debug_chunk_pairs <= 0:
@@ -954,14 +1027,15 @@ def main() -> int:
             done_pulse_seconds=max(0.0, args.done_pulse_ms / 1000.0),
             handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
             wait_for_flag_falling_edge=not args.wait_low_level,
-            use_i2s_tags=args.use_i2s_tags,
+            use_i2s_tags=use_i2s_tags,
             tag_shift=args.tag_shift,
             tag_mask=args.tag_mask,
             payload_bits=args.payload_bits,
             tag_idle=args.tag_idle,
             tag_bfpexp=args.tag_bfpexp,
             tag_fft=args.tag_fft,
-            require_bfpexp_before_fft=not args.allow_fft_without_bfpexp,
+            require_bfpexp_before_fft=not allow_fft_without_bfpexp,
+            bfpexp_pairs_required=bfpexp_hold_pairs,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -1056,18 +1130,23 @@ def main() -> int:
     history_size = buffers["history_mfcc"].maxlen or 0
     print("Using ALSA capture device:", device, flush=True)
     print("Reading FPGA FFT stream from I2S...", flush=True)
-    if args.use_i2s_tags:
-        print("Tagged mode: idle-tagged words are ignored while searching for frames.", flush=True)
-        if args.allow_fft_without_bfpexp:
+    if cfg.use_i2s_tags:
+        print(f"Sync preset: {sync_mode}", flush=True)
+        print(
+            "Tagged mode: idle-tagged words are ignored before a frame, "
+            f"and a new burst normally starts after {cfg.bfpexp_pairs_required} consecutive BFPEXP-tagged pairs.",
+            flush=True,
+        )
+        if allow_fft_without_bfpexp:
             print("Tagged mode sync: FFT tags may start a frame even without a BFPEXP tag.", flush=True)
         elif args.done_line is not None:
             print(
-                "Tagged mode sync: startup can bootstrap from an in-flight FFT burst because DONE is configured.",
+                "Tagged mode sync: startup can bootstrap from an in-flight FFT burst when a full BFPEXP preamble has not been seen yet, because DONE is configured.",
                 flush=True,
             )
         else:
             print(
-                "Tagged mode sync: waiting for BFPEXP before FFT frame start; "
+                f"Tagged mode sync: waiting for {cfg.bfpexp_pairs_required} BFPEXP pairs before FFT frame start; "
                 "if startup attaches mid-stream, use --done-line or --allow-fft-without-bfpexp.",
                 flush=True,
             )

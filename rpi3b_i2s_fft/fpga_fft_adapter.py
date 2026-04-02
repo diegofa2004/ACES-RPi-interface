@@ -34,6 +34,9 @@ except ImportError:  # pragma: no cover - optional dependency on target device
     gpiod = None
 
 
+DEFAULT_BFPEXP_HOLD_PAIRS = 128
+
+
 @dataclass
 class FFTAdapterConfig:
     device: str = AUTO_AUDIO_DEVICE
@@ -55,6 +58,7 @@ class FFTAdapterConfig:
     tag_bfpexp: int = 1
     tag_fft: int = 2
     require_bfpexp_before_fft: bool = True
+    bfpexp_pairs_required: int = DEFAULT_BFPEXP_HOLD_PAIRS
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -84,6 +88,8 @@ class FFTAdapterConfig:
             raise ValueError("handshake_timeout_seconds must be positive")
         if self.done_pulse_seconds < 0.0:
             raise ValueError("done_pulse_seconds must be non-negative")
+        if self.bfpexp_pairs_required <= 0:
+            raise ValueError("bfpexp_pairs_required must be positive")
 
 
 class FPGAFFTReceiver:
@@ -103,6 +109,12 @@ class FPGAFFTReceiver:
         self._gpio_api = None
         self._gpio_chip = None
         self._tagged_realigner = TaggedI2SRealigner(
+            tag_shift=self.cfg.tag_shift,
+            tag_mask=self.cfg.tag_mask,
+            payload_bits=self.cfg.payload_bits,
+            tag_idle=self.cfg.tag_idle,
+            tag_bfpexp=self.cfg.tag_bfpexp,
+            tag_fft=self.cfg.tag_fft,
             confirm_pairs=min(64, max(4, self.cfg.frame_bins)),
             validate_pairs=min(64, max(4, self.cfg.frame_bins)),
             preferred_swap_channels=True,
@@ -303,14 +315,14 @@ class FPGAFFTReceiver:
         tag_r, payload_r = self._decode_tagged_word(int(pair[1]))
 
         if tag_l != tag_r:
-            return "other", (payload_l, payload_r)
+            return "tag_mismatch", (payload_l, payload_r)
         if tag_l == self.cfg.tag_fft:
             return "fft", (payload_l, payload_r)
         if tag_l == self.cfg.tag_bfpexp:
             return "bfpexp", (payload_l, payload_r)
         if tag_l == self.cfg.tag_idle:
             return "idle", (payload_l, payload_r)
-        return "other", (payload_l, payload_r)
+        return "unknown_tag", (payload_l, payload_r)
 
     def _allow_tagged_fft_start_without_bfpexp(self) -> bool:
         if not self.cfg.require_bfpexp_before_fft:
@@ -358,7 +370,8 @@ class FPGAFFTReceiver:
         deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
         fft_pairs = []
         waiting_for_start = True
-        bfpexp_seen = False
+        bfpexp_run = 0
+        required_bfpexp_pairs = self.cfg.bfpexp_pairs_required
 
         while time.monotonic() < deadline:
             pairs = self._pop_pairs(self._poll_pairs, exact=False)
@@ -372,12 +385,17 @@ class FPGAFFTReceiver:
 
                 if waiting_for_start:
                     if kind == "idle":
+                        if bfpexp_run != 0:
+                            bfpexp_run = 0
                         continue
                     if kind == "bfpexp":
-                        bfpexp_seen = True
+                        bfpexp_run += 1
                         continue
                     if kind == "fft":
-                        if (not bfpexp_seen) and (not self._allow_tagged_fft_start_without_bfpexp()):
+                        full_bfpexp_preamble = bfpexp_run >= required_bfpexp_pairs
+                        bootstrap_from_fft = (not full_bfpexp_preamble) and self._allow_tagged_fft_start_without_bfpexp()
+                        if (not full_bfpexp_preamble) and (not bootstrap_from_fft):
+                            bfpexp_run = 0
                             continue
                         waiting_for_start = False
                         fft_pairs.append(payload)
@@ -385,6 +403,7 @@ class FPGAFFTReceiver:
                             self._push_pairs_back(pairs[idx + 1 :])
                             return np.asarray(fft_pairs, dtype=np.int32)
                         continue
+                    bfpexp_run = 0
                     continue
 
                 if kind == "fft":
@@ -399,7 +418,7 @@ class FPGAFFTReceiver:
                 # idle/null padding is ignored and a fresh BFPEXP can resync us.
                 fft_pairs.clear()
                 waiting_for_start = True
-                bfpexp_seen = (kind == "bfpexp")
+                bfpexp_run = 1 if kind == "bfpexp" else 0
 
         return None
 

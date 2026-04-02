@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -17,6 +18,54 @@ from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_wo
 
 
 class AnalyzerFromFPGAFFTTests(unittest.TestCase):
+    def test_resolve_sync_cli_defaults_prefers_strict_defaults(self):
+        args = SimpleNamespace(
+            sync_mode=None,
+            sync_preset="strict",
+            use_i2s_tags=None,
+            bfpexp_hold_pairs=None,
+            allow_fft_without_bfpexp=None,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "strict")
+        self.assertTrue(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertFalse(resolved["allow_fft_without_bfpexp"])
+
+    def test_resolve_sync_cli_defaults_prefers_tolerant_defaults(self):
+        args = SimpleNamespace(
+            sync_mode=None,
+            sync_preset="tolerant",
+            use_i2s_tags=None,
+            bfpexp_hold_pairs=None,
+            allow_fft_without_bfpexp=None,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "tolerant")
+        self.assertTrue(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertTrue(resolved["allow_fft_without_bfpexp"])
+
+    def test_resolve_sync_cli_defaults_respects_explicit_overrides(self):
+        args = SimpleNamespace(
+            sync_mode="tolerant",
+            sync_preset=None,
+            use_i2s_tags=False,
+            bfpexp_hold_pairs=64,
+            allow_fft_without_bfpexp=False,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "tolerant")
+        self.assertFalse(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], 64)
+        self.assertFalse(resolved["allow_fft_without_bfpexp"])
+
     def test_process_channel_debug_chunk_reports_kinds_and_fft_runs(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
         pairs = np.frombuffer(

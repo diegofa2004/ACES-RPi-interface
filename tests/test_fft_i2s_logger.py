@@ -27,14 +27,34 @@ class FFTI2SLoggerTests(unittest.TestCase):
     def test_write_csv_rows_increments_sequence(self):
         output = io.StringIO()
         writer = csv.writer(output)
-        stereo = np.asarray([[10, 20], [-1, 0x12345678]], dtype=np.int32)
+        stereo = np.asarray([[0x4000000A, 0x40000014], [0x8003FFFF, 0x80000008]], dtype=np.uint32).view(np.int32)
         timestamps = iter([1000, 1001])
-        next_seq = fft_i2s_logger.write_csv_rows(writer, stereo, 7, timestamp_ns_fn=lambda: next(timestamps))
+        tracker = fft_i2s_logger.create_contract_tracker(
+            frame_bins=2,
+            bfpexp_hold_pairs=1,
+            allow_fft_without_bfpexp=False,
+        )
+        next_seq = fft_i2s_logger.write_csv_rows(
+            writer,
+            stereo,
+            7,
+            tag_shift=30,
+            tag_mask=0x3,
+            payload_bits=18,
+            tag_idle=0,
+            tag_bfpexp=1,
+            tag_fft=2,
+            contract_tracker=tracker,
+            timestamp_ns_fn=lambda: next(timestamps),
+        )
 
         self.assertEqual(next_seq, 9)
         self.assertEqual(
             output.getvalue().splitlines(),
-            ["1000,7,0x0000000A,0x00000014", "1001,8,0xFFFFFFFF,0x12345678"],
+            [
+                "1000,7,0x4000000A,0x40000014,bfpexp,bfpexp_preamble,0,0,1,1,10,20,0,0,0,0",
+                "1001,8,0x8003FFFF,0x80000008,fft,fft_frame,0,0,2,2,-1,8,0,0,0,0",
+            ],
         )
 
     def test_mirrored_pair_normalizer_keeps_preferred_orientation(self):
@@ -60,6 +80,44 @@ class FFTI2SLoggerTests(unittest.TestCase):
             dtype=np.uint32,
         ).view(np.int32)
         np.testing.assert_array_equal(normalized, expected)
+
+    def test_classify_tagged_pair_reports_mismatch(self):
+        self.assertEqual(
+            fft_i2s_logger.classify_tagged_pair(2, 1, tag_idle=0, tag_bfpexp=1, tag_fft=2),
+            "tag_mismatch",
+        )
+
+    def test_contract_tracker_requires_full_bfpexp_preamble(self):
+        tracker = fft_i2s_logger.create_contract_tracker(
+            frame_bins=4,
+            bfpexp_hold_pairs=3,
+            allow_fft_without_bfpexp=False,
+        )
+
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "idle"), ("search_idle", 0, -1))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 1))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("protocol_wait_bfpexp", 0, -1))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 1))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 2))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
+
+    def test_contract_tracker_resets_when_idle_breaks_fft_frame(self):
+        tracker = fft_i2s_logger.create_contract_tracker(
+            frame_bins=4,
+            bfpexp_hold_pairs=1,
+            allow_fft_without_bfpexp=False,
+        )
+
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 1))
+        self.assertEqual(
+            fft_i2s_logger.advance_contract_tracker(tracker, "idle"),
+            ("protocol_reset_idle", 0, -1),
+        )
+        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
 
 
 if __name__ == "__main__":

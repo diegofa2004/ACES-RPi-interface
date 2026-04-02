@@ -8,11 +8,14 @@ For the repository-level rationale behind the current FPGA/host workflow, see
 For the consolidated status of the Raspberry Pi I2S debug investigation, see
 [`../docs/i2s_rpi_debug_status.md`](../docs/i2s_rpi_debug_status.md).
 
+For the ready-to-run Raspberry Pi commands and the TB-aligned execution flow,
+see [`../docs/rpi_fft_tb_contract_runbook.md`](../docs/rpi_fft_tb_contract_runbook.md).
+
 ## Files
 
 - `setup_rpi_i2s_fft.sh`: installs the official fpgafft overlay/codec plus Python dependencies.
 - `asoc/`: minimal ASoC codec stub, `simple-audio-card` overlay, build helpers, and the official installer.
-- `fft_i2s_logger.py`: logs raw I2S real/imag pairs to CSV.
+- `fft_i2s_logger.py`: logs aligned I2S words plus decoded tag/payload fields to CSV.
 - `fpga_fft_adapter.py`: converts FPGA complex FFT bins from I2S into magnitude bins + MFCC.
 - `compararEvento.py`: local comparison function used directly by the analyzer.
 - `analyzer_from_fpga_fft.py`: pyserial-style analyzer loop with circular buffers and `evento.npy`/`fft.npy` capture.
@@ -141,8 +144,12 @@ Terminal 1 (required):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -r 48828 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py --strict-sync -r 48828 --frame-bins 512 --useful-bins 256
 ```
+
+The analyzer now decodes the in-band I2S tags by default. Use `--no-use-i2s-tags`
+only for legacy raw-mode bring-up.
+Use `--tolerant-sync` only when software may attach in the middle of an active burst.
 
 What happens in Terminal 1:
 
@@ -156,22 +163,33 @@ Terminal 2 (optional, recommended when you want visualization):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python plotFFT.py --rate 48828 --frame-bins 512
+.venv/bin/python plotFFT.py --spectrogram --rate 48828 --frame-bins 512
 ```
 
 This terminal only visualizes the saved `fft.npy`. It is not required for detection.
-If `matplotlib` is missing, install the project requirements again inside `.venv`.
-When the Raspberry Pi is running without a graphical desktop, `plotFFT.py` now falls back
-to the `Agg` backend automatically and keeps writing `fft_latest.png` instead of opening a window.
+If `matplotlib` is available, `plotFFT.py` uses it directly.
+When `matplotlib` is missing but you run in headless mode, `plotFFT.py` now falls back
+to a built-in PNG renderer and still keeps writing `fft_latest.png` instead of failing.
+
+For a one-shot FFT window capture centered at `0 Hz`, use:
+
+```bash
+cd rpi3b_i2s_fft
+.venv/bin/python plotFFT.py --capture-window --rate 48828 --frame-bins 512
+```
 
 Terminal 3 (optional, only if you want a raw CSV dump of the incoming I2S stream):
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python fft_i2s_logger.py -r 48828 --csv fft_capture.csv
+.venv/bin/python fft_i2s_logger.py -r 48828 --csv fft_capture.csv \
+    --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
+    --tag-idle 0 --tag-bfpexp 1 --tag-fft 2
 ```
 
 You only need 1 terminal for the full comparison flow, 2 if you also want the FFT viewer, and 3 only if you additionally want the raw CSV logger.
+The CSV now preserves the raw 32-bit words and also records decoded `kind`, `tag`,
+`payload`, and reserved-bit fields for each channel.
 
 ## Use from another Python program
 
@@ -181,7 +199,7 @@ or otherwise make the package parent directory visible to Python.
 ```python
 from rpi3b_i2s_fft import FFTAdapterConfig, FPGAFFTReceiver
 
-cfg = FFTAdapterConfig(sample_rate=48828, frame_bins=512, useful_bins=256)
+cfg = FFTAdapterConfig(sample_rate=48828, frame_bins=512, useful_bins=256, use_i2s_tags=True)
 rx = FPGAFFTReceiver(cfg)
 rx.start()
 try:
@@ -228,7 +246,7 @@ Run the adapter example:
 
 ```bash
 cd rpi3b_i2s_fft
-.venv/bin/python analyzer_from_fpga_fft.py -r 48828 --frame-bins 512 --useful-bins 256
+.venv/bin/python analyzer_from_fpga_fft.py --strict-sync -r 48828 --frame-bins 512 --useful-bins 256
 ```
 
 This script now mirrors the `pyserial/transmissaoAudioDireto.py` flow:
@@ -362,7 +380,10 @@ Notes about framing reliability:
 
 In-band tagged stream mode (BFPEXP + FFT + idle over I2S):
 
-- Enable with `--use-i2s-tags`.
+- `analyzer_from_fpga_fft.py` enables tagged decoding by default.
+- `--strict-sync` is the recommended preset for the validated TB contract.
+- `--tolerant-sync` keeps the same tagged contract but relaxes startup attach.
+- Disable only for legacy raw-mode capture with `--no-use-i2s-tags`.
 - Each 32-bit I2S word carries a small type tag plus signed payload bits.
 - Default mapping used by the receiver:
 	- `tag_shift=30`, `tag_mask=0x3` (2 tag bits in bits 31..30)
@@ -371,26 +392,30 @@ In-band tagged stream mode (BFPEXP + FFT + idle over I2S):
 
 Frame start logic in tagged mode:
 
-- Receiver waits for BFPEXP-tagged words.
-- After BFPEXP is seen, the first FFT-tagged pair starts the FFT frame.
+- Receiver ignores leading `idle` words while searching for a frame.
+- By default, `analyzer_from_fpga_fft.py` requires `128` consecutive BFPEXP-tagged pairs before a new FFT burst is accepted.
+- After that BFPEXP preamble is seen, the first FFT-tagged pair starts the FFT frame.
 - Receiver then counts exactly 512 FFT-tagged complex pairs.
 - On completion, DONE GPIO is pulsed (if `--done-line` is configured).
 
 Example tagged mode run:
 
 ```bash
-.venv/bin/python analyzer_from_fpga_fft.py -r 48828 \
+.venv/bin/python analyzer_from_fpga_fft.py --strict-sync -r 48828 \
 	--frame-bins 512 --useful-bins 256 \
-	--use-i2s-tags --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
+	--tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
 	--tag-idle 0 --tag-bfpexp 1 --tag-fft 2 \
 	--done-line 24
 ```
 
-If your FPGA cannot guarantee BFPEXP tags before FFT tags, add:
+If your FPGA cannot guarantee BFPEXP tags before FFT tags, use:
 
 ```bash
---allow-fft-without-bfpexp
+--tolerant-sync
 ```
+
+This relaxed mode also accepts startup with only a partial BFPEXP preamble,
+which is useful if software attaches in the middle of the 128-pair BFPEXP burst.
 
 Debug matrix helper:
 
