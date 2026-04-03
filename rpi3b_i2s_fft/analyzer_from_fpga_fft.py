@@ -72,14 +72,16 @@ def create_analysis_buffers(
     *,
     prebuffer_seconds: float = PREBUFFER_SECONDS,
     history_seconds: float = HISTORY_SECONDS,
-) -> dict[str, deque]:
-    buffer_size = frames_for_seconds(sample_rate, frame_bins, prebuffer_seconds)
-    history_size = frames_for_seconds(sample_rate, frame_bins, history_seconds)
+) -> dict[str, object]:
     return {
-        "pre_mfcc": deque(maxlen=buffer_size),
-        "history_mfcc": deque(maxlen=history_size),
-        "pre_fft": deque(maxlen=buffer_size),
-        "history_fft": deque(maxlen=history_size),
+        "pre_mfcc": deque(),
+        "history_mfcc": deque(),
+        "pre_fft": deque(),
+        "history_fft": deque(),
+        "pre_times": deque(),
+        "history_times": deque(),
+        "pre_window_seconds": float(prebuffer_seconds),
+        "history_window_seconds": float(history_seconds),
     }
 
 
@@ -95,7 +97,7 @@ def create_runtime_state() -> dict[str, object]:
     }
 
 
-def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[str, deque]] = None) -> bool:
+def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[str, object]] = None) -> bool:
     if bool(state["recording"]):
         return False
 
@@ -109,7 +111,7 @@ def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[s
 
 
 def ingest_frame(
-    buffers: dict[str, deque],
+    buffers: dict[str, object],
     state: dict[str, object],
     mfcc: np.ndarray,
     fft_bins: np.ndarray,
@@ -124,6 +126,23 @@ def ingest_frame(
     buffers["history_mfcc"].append(mfcc8.copy())
     buffers["pre_fft"].append(fft_frame.copy())
     buffers["history_fft"].append(fft_frame.copy())
+    buffers["pre_times"].append(float(now))
+    buffers["history_times"].append(float(now))
+
+    _trim_timed_buffer(
+        buffers["pre_mfcc"],
+        buffers["pre_fft"],
+        buffers["pre_times"],
+        now,
+        float(buffers["pre_window_seconds"]),
+    )
+    _trim_timed_buffer(
+        buffers["history_mfcc"],
+        buffers["history_fft"],
+        buffers["history_times"],
+        now,
+        float(buffers["history_window_seconds"]),
+    )
 
     if not bool(state["recording"]):
         return None
@@ -150,6 +169,20 @@ def ingest_frame(
     state["last_event_time"] = now
     state["recording"] = False
     return evento, fft
+
+
+def _trim_timed_buffer(
+    mfcc_buffer: deque,
+    fft_buffer: deque,
+    time_buffer: deque,
+    now: float,
+    window_seconds: float,
+) -> None:
+    cutoff = float(now) - max(0.0, float(window_seconds))
+    while time_buffer and float(time_buffer[0]) < cutoff:
+        time_buffer.popleft()
+        mfcc_buffer.popleft()
+        fft_buffer.popleft()
 
 
 def _u32_hex(word: int) -> str:
@@ -960,6 +993,12 @@ def main() -> int:
     parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
     parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
     parser.add_argument(
+        "--apply-bfpexp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply the FFT block-floating exponent before computing magnitudes (default: enabled)",
+    )
+    parser.add_argument(
         "--bfpexp-hold-pairs",
         type=int,
         default=None,
@@ -1066,6 +1105,7 @@ def main() -> int:
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
     loss_tolerance_pairs = int(sync_cfg["loss_tolerance_pairs"])
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
+    apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
     sync_mode = str(sync_cfg["sync_mode"])
 
     if bfpexp_hold_pairs <= 0:
@@ -1138,6 +1178,7 @@ def main() -> int:
             tag_idle=args.tag_idle,
             tag_bfpexp=args.tag_bfpexp,
             tag_fft=args.tag_fft,
+            apply_bfpexp=apply_bfpexp,
             require_bfpexp_before_fft=not allow_fft_without_bfpexp,
             bfpexp_pairs_required=bfpexp_hold_pairs,
             loss_tolerance_pairs=loss_tolerance_pairs,
@@ -1239,8 +1280,8 @@ def main() -> int:
         daemon=True,
     ).start()
 
-    pre_size = buffers["pre_mfcc"].maxlen or 0
-    history_size = buffers["history_mfcc"].maxlen or 0
+    pre_window_seconds = float(buffers["pre_window_seconds"])
+    history_window_seconds = float(buffers["history_window_seconds"])
     print("Using ALSA capture device:", device, flush=True)
     print("Reading FPGA FFT stream from I2S...", flush=True)
     if cfg.use_i2s_tags:
@@ -1269,13 +1310,13 @@ def main() -> int:
                 flush=True,
             )
     print(
-        "Buffer sizes:",
-        f"pre_mfcc={pre_size}",
-        f"history_mfcc={history_size}",
-        f"pre_fft={buffers['pre_fft'].maxlen or 0}",
-        f"history_fft={buffers['history_fft'].maxlen or 0}",
+        "Buffer windows:",
+        f"pre={pre_window_seconds:.2f}s",
+        f"history={history_window_seconds:.2f}s",
+        "trimmed_by=wall_clock",
         flush=True,
     )
+    print(f"FFT scaling: apply_bfpexp={cfg.apply_bfpexp}", flush=True)
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)

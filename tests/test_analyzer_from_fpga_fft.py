@@ -295,6 +295,27 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         np.testing.assert_array_equal(evento[0], np.arange(8))
         np.testing.assert_array_equal(evento[-1], np.arange(8) + 30)
 
+    def test_ingest_frame_trims_buffers_by_wall_clock(self):
+        buffers = analyzer_from_fpga_fft.create_analysis_buffers(
+            sample_rate=48828,
+            frame_bins=512,
+            prebuffer_seconds=1.0,
+            history_seconds=2.0,
+        )
+        state = analyzer_from_fpga_fft.create_runtime_state()
+
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8), np.arange(4), 0.0)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 10, np.arange(4) + 10, 0.8)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 20, np.arange(4) + 20, 1.6)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 30, np.arange(4) + 30, 2.4)
+
+        self.assertEqual(len(buffers["pre_mfcc"]), 2)
+        self.assertEqual(len(buffers["pre_fft"]), 2)
+        self.assertEqual(len(buffers["history_mfcc"]), 3)
+        self.assertEqual(len(buffers["history_fft"]), 3)
+        np.testing.assert_array_equal(buffers["pre_mfcc"][0], np.arange(8) + 20)
+        np.testing.assert_array_equal(buffers["history_fft"][0], np.arange(4) + 10)
+
 
 if __name__ == "__main__":
     unittest.main()

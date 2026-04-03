@@ -1,7 +1,7 @@
 import argparse
-import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -30,11 +30,6 @@ except ImportError:
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_FILE = SCRIPT_DIR / "live_spectrogram_latest.png"
-
-
-def frames_for_seconds(sample_rate: int, frame_bins: int, seconds: float) -> int:
-    frames_per_second = float(sample_rate) / float(frame_bins)
-    return max(1, int(math.ceil(frames_per_second * seconds)))
 
 
 def _display_available() -> bool:
@@ -113,6 +108,18 @@ def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _trim_history(
+    fft_history: deque[np.ndarray],
+    history_times: deque[float],
+    now: float,
+    history_seconds: float,
+) -> None:
+    cutoff = float(now) - max(0.0, float(history_seconds))
+    while history_times and float(history_times[0]) < cutoff:
+        history_times.popleft()
+        fft_history.popleft()
+
+
 def _prepare_history_array(fft_history: deque[np.ndarray]) -> np.ndarray:
     if not fft_history:
         return np.empty((0, 0), dtype=np.float32)
@@ -179,6 +186,7 @@ def _update_live_figure(
     spectrum_line,
     spectrogram_im,
     fft_cache: np.ndarray,
+    history_times: np.ndarray,
     *,
     rate: int,
     frame_bins: int,
@@ -220,9 +228,13 @@ def _update_live_figure(
         f"Espectro ao vivo | pico {peak_freq_hz:.1f} Hz | media temporal {max(1, smoothed_frames)} frame(s)"
     )
 
-    history_duration = float(fft_cache.shape[0]) * float(frame_bins) / float(rate)
+    if history_times.size >= 2:
+        history_duration = float(history_times[-1] - history_times[0])
+    else:
+        history_duration = 0.0
+    start_time = -history_duration
     spectrogram_im.set_data(fft_db.T)
-    spectrogram_im.set_extent((-history_duration, 0.0, 0.0, freq_limit))
+    spectrogram_im.set_extent((start_time, 0.0, 0.0, freq_limit))
     spectrogram_im.set_clim(vmin=vmin, vmax=vmax)
 
     spectrogram_ax.set_xlim(-history_seconds, 0.0)
@@ -237,7 +249,7 @@ def _update_live_figure(
         spectrogram_ax.set_yticklabels([f"{int(freq)}" for freq in tick_freqs_hz])
 
     if history_duration <= 0.0:
-        history_duration = float(frame_bins) / float(rate)
+        history_duration = max(1e-3, float(frame_bins) / float(rate))
 
     xtick_count = 6
     tick_start = -history_seconds
@@ -392,6 +404,12 @@ def main() -> int:
         default=None,
         help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
     )
+    parser.add_argument(
+        "--apply-bfpexp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply the FFT block-floating exponent before plotting magnitudes (default: enabled)",
+    )
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -422,6 +440,7 @@ def main() -> int:
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
     loss_tolerance_pairs = int(sync_cfg["loss_tolerance_pairs"])
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
+    apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
     sync_mode = str(sync_cfg["sync_mode"])
 
     if bfpexp_hold_pairs <= 0:
@@ -456,6 +475,7 @@ def main() -> int:
             tag_idle=args.tag_idle,
             tag_bfpexp=args.tag_bfpexp,
             tag_fft=args.tag_fft,
+            apply_bfpexp=apply_bfpexp,
             require_bfpexp_before_fft=not allow_fft_without_bfpexp,
             bfpexp_pairs_required=bfpexp_hold_pairs,
             loss_tolerance_pairs=loss_tolerance_pairs,
@@ -477,13 +497,20 @@ def main() -> int:
     else:
         print(f"Using matplotlib backend: {backend_name} (headless mode, updating {output_path})", flush=True)
 
-    history_frames = frames_for_seconds(args.rate, args.frame_bins, args.history_seconds)
-    fft_history: deque[np.ndarray] = deque(maxlen=history_frames)
+    fft_history: deque[np.ndarray] = deque()
+    history_times: deque[float] = deque()
     smooth_history: deque[np.ndarray] = deque(maxlen=args.smooth_frames)
+    history_lock = threading.Lock()
+    capture_stop = threading.Event()
+    capture_state = {
+        "frame_counter": 0,
+        "capture_error": None,
+        "last_bfpexp": 0,
+    }
     update_interval = 1.0 / float(args.fps)
-    frames_per_second = float(args.rate) / float(args.frame_bins)
     freq_resolution_hz = float(args.rate) / float(args.frame_bins)
-    time_resolution_ms = 1000.0 / frames_per_second
+    nominal_frames_per_second = float(args.rate) / float(args.frame_bins)
+    nominal_time_resolution_ms = 1000.0 / nominal_frames_per_second
 
     rx = FPGAFFTReceiver(cfg)
     try:
@@ -506,10 +533,10 @@ def main() -> int:
                 flush=True,
             )
     print(
-        "Display resolution:",
+        "Display resolution (nominal):",
         f"freq_bin={freq_resolution_hz:.3f} Hz",
-        f"time_frame={time_resolution_ms:.3f} ms",
-        f"history_frames={history_frames}",
+        f"time_frame={nominal_time_resolution_ms:.3f} ms",
+        "history_trim=wall_clock",
         flush=True,
     )
     print(
@@ -517,47 +544,82 @@ def main() -> int:
         f"history_seconds={args.history_seconds:.2f}",
         f"smooth_frames={args.smooth_frames}",
         f"fps={args.fps:.2f}",
+        f"apply_bfpexp={cfg.apply_bfpexp}",
         flush=True,
     )
     print("Close the plot window or press Ctrl+C to stop.", flush=True)
 
-    frame_counter = 0
     render_counter = 0
-    last_render = 0.0
+    last_render = time.monotonic()
     last_status = time.monotonic()
     peak_freq_hz = 0.0
     history_duration = 0.0
+    effective_fps = 0.0
+
+    def capture_loop() -> None:
+        try:
+            while not capture_stop.is_set():
+                frame = rx.read_frame()
+                if frame is None:
+                    continue
+
+                fft_bins, _ = frame
+                fft_frame = np.asarray(fft_bins, dtype=np.float32)
+                now = time.monotonic()
+
+                with history_lock:
+                    smooth_history.append(fft_frame)
+                    if args.smooth_frames == 1:
+                        display_frame = fft_frame
+                    else:
+                        display_frame = np.mean(np.asarray(smooth_history, dtype=np.float32), axis=0, dtype=np.float32)
+
+                    fft_history.append(display_frame.copy())
+                    history_times.append(now)
+                    _trim_history(fft_history, history_times, now, args.history_seconds)
+                    capture_state["frame_counter"] = int(capture_state["frame_counter"]) + 1
+                    capture_state["last_bfpexp"] = int(rx.last_frame_bfpexp)
+        except Exception as exc:  # pragma: no cover - depends on live device state
+            capture_state["capture_error"] = str(exc)
+
+    capture_thread = threading.Thread(target=capture_loop, daemon=True)
+    capture_thread.start()
 
     try:
         while True:
             if interactive and not plt.fignum_exists(fig.number):
                 break
 
-            frame = rx.read_frame()
-            if frame is None:
-                continue
-
-            fft_bins, _ = frame
-            fft_frame = np.asarray(fft_bins, dtype=np.float32)
-            smooth_history.append(fft_frame)
-            if args.smooth_frames == 1:
-                display_frame = fft_frame
-            else:
-                display_frame = np.mean(np.asarray(smooth_history, dtype=np.float32), axis=0, dtype=np.float32)
-            fft_history.append(display_frame.copy())
-            frame_counter += 1
-
             now = time.monotonic()
+            if capture_state["capture_error"] is not None:
+                raise RuntimeError(str(capture_state["capture_error"]))
+
             if (now - last_render) < update_interval:
+                if interactive:
+                    plt.pause(0.001)
+                else:
+                    time.sleep(min(0.01, update_interval))
                 continue
 
-            fft_cache = _prepare_history_array(fft_history)
+            with history_lock:
+                fft_cache = _prepare_history_array(fft_history)
+                history_time_array = np.asarray(history_times, dtype=np.float64)
+                frame_counter = int(capture_state["frame_counter"])
+                last_bfpexp = int(capture_state["last_bfpexp"])
+
+            if history_time_array.size >= 2:
+                elapsed = float(history_time_array[-1] - history_time_array[0])
+                effective_fps = float((history_time_array.size - 1) / elapsed) if elapsed > 0.0 else 0.0
+            else:
+                effective_fps = 0.0
+
             peak_freq_hz, history_duration = _update_live_figure(
                 spectrum_ax,
                 spectrogram_ax,
                 spectrum_line,
                 spectrogram_im,
                 fft_cache,
+                history_time_array,
                 rate=args.rate,
                 frame_bins=args.frame_bins,
                 max_freq=args.max_freq,
@@ -568,7 +630,6 @@ def main() -> int:
                 max_db=args.max_db,
                 smoothed_frames=args.smooth_frames,
             )
-            fig.tight_layout()
 
             if interactive:
                 fig.canvas.draw()
@@ -586,6 +647,8 @@ def main() -> int:
                     f"frames={frame_counter}",
                     f"renders={render_counter}",
                     f"history={history_duration:.2f}s",
+                    f"effective_fps={effective_fps:.1f}",
+                    f"bfpexp={last_bfpexp}",
                     f"peak_freq_hz={peak_freq_hz:.1f}",
                     flush=True,
                 )
@@ -596,7 +659,9 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Stopping...", flush=True)
     finally:
+        capture_stop.set()
         rx.stop()
+        capture_thread.join(timeout=1.0)
 
     if not interactive:
         fig.savefig(output_path, dpi=120)

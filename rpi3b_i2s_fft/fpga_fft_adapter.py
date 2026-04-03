@@ -60,6 +60,7 @@ class FFTAdapterConfig:
     tag_idle: int = 0
     tag_bfpexp: int = 1
     tag_fft: int = 2
+    apply_bfpexp: bool = True
     require_bfpexp_before_fft: bool = True
     bfpexp_pairs_required: int = DEFAULT_BFPEXP_HOLD_PAIRS
     loss_tolerance_pairs: int = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
@@ -104,9 +105,9 @@ class FPGAFFTReceiver:
         self._proc: Optional[subprocess.Popen] = None
         self._bytes_per_pair = 8  # real(int32) + imag(int32)
         self._frame_bytes = self.cfg.frame_bins * self._bytes_per_pair
-        # Poll multiple FFT frames per read so Python/GPIO overhead stays low
-        # and ALSA has more headroom before an overrun forces a stream restart.
-        self._poll_pairs = max(2048, self.cfg.frame_bins)
+        # Keep polling granularity close to one FFT frame so live tools react
+        # promptly while still avoiding pathological tiny reads.
+        self._poll_pairs = max(512, self.cfg.frame_bins)
         self._poll_bytes = self._poll_pairs * self._bytes_per_pair
         self._byte_buffer = bytearray()
         self._line_request = None
@@ -125,11 +126,15 @@ class FPGAFFTReceiver:
             validate_pairs=min(64, max(4, self.cfg.frame_bins)),
             preferred_swap_channels=True,
         )
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
 
         payload_mask = (1 << self.cfg.payload_bits) - 1
         self._payload_mask = payload_mask
         self._payload_sign_bit = 1 << (self.cfg.payload_bits - 1)
         self._loss_placeholder_pair = (0, 0)
+        self.last_frame_bfpexp = 0
+        self.last_frame_had_explicit_bfpexp = False
+        self._captured_frame_count = 0
 
         n_fft = 2 * (self.cfg.useful_bins - 1)
         self.mel_filter = build_mel_filter(
@@ -315,7 +320,14 @@ class FPGAFFTReceiver:
     def _push_pairs_back(self, pairs: np.ndarray) -> None:
         if pairs.size == 0:
             return
-        self._byte_buffer[:0] = np.asarray(pairs, dtype=np.int32).tobytes()
+        pair_array = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        if self.cfg.use_i2s_tags:
+            if self._tagged_pair_buffer.size == 0:
+                self._tagged_pair_buffer = pair_array.copy()
+            else:
+                self._tagged_pair_buffer = np.concatenate((pair_array, self._tagged_pair_buffer), axis=0)
+            return
+        self._byte_buffer[:0] = pair_array.tobytes()
 
     def _pair_kind_and_payload(self, pair: np.ndarray) -> Tuple[str, Tuple[int, int]]:
         tag_l, payload_l = self._decode_tagged_word(int(pair[0]))
@@ -336,8 +348,10 @@ class FPGAFFTReceiver:
             return True
         # In tagged streams that wait for RPi DONE before emitting the next BFPEXP,
         # insisting on BFPEXP for the very first decoded frame can deadlock startup
-        # if software attaches while a FFT burst is already in flight.
-        return self.cfg.done_line is not None
+        # if software attaches while a FFT burst is already in flight. After the
+        # first completed frame, DONE should keep the transport aligned and BFPEXP
+        # must be required again to avoid locking onto a mid-burst FFT payload.
+        return self.cfg.done_line is not None and self._captured_frame_count == 0
 
     @staticmethod
     def _is_tolerable_loss_kind(kind: str) -> bool:
@@ -374,7 +388,7 @@ class FPGAFFTReceiver:
 
         return False
 
-    def _read_frame_from_i2s_tags(self) -> Optional[np.ndarray]:
+    def _read_frame_from_i2s_tags(self) -> Optional[Tuple[np.ndarray, int]]:
         if self._proc is None or self._proc.stdout is None:
             raise RuntimeError("Receiver not started")
 
@@ -384,16 +398,22 @@ class FPGAFFTReceiver:
         bfpexp_run = 0
         bfpexp_loss_run = 0
         fft_loss_run = 0
+        current_bfpexp = int(self.last_frame_bfpexp)
+        have_explicit_bfpexp = False
         required_bfpexp_pairs = self.cfg.bfpexp_pairs_required
         tolerated_losses = self.cfg.loss_tolerance_pairs
 
         while time.monotonic() < deadline:
-            pairs = self._pop_pairs(self._poll_pairs, exact=False)
-            if pairs is None:
-                return None
-            pairs = self._tagged_realigner.push_pairs(pairs)
-            if pairs.size == 0:
-                continue
+            if self._tagged_pair_buffer.size != 0:
+                pairs = self._tagged_pair_buffer
+                self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
+            else:
+                pairs = self._pop_pairs(self._poll_pairs, exact=False)
+                if pairs is None:
+                    return None
+                pairs = self._tagged_realigner.push_pairs(pairs)
+                if pairs.size == 0:
+                    continue
             for idx, pair in enumerate(pairs):
                 kind, payload = self._pair_kind_and_payload(pair)
 
@@ -411,6 +431,8 @@ class FPGAFFTReceiver:
                         continue
                     if kind == "bfpexp":
                         bfpexp_run += 1
+                        current_bfpexp = int(payload[0])
+                        have_explicit_bfpexp = True
                         fft_loss_run = 0
                         continue
                     if self._is_tolerable_loss_kind(kind):
@@ -420,6 +442,8 @@ class FPGAFFTReceiver:
                             continue
                         bfpexp_run = 0
                         bfpexp_loss_run = 0
+                        current_bfpexp = int(self.last_frame_bfpexp)
+                        have_explicit_bfpexp = False
                         continue
                     if kind == "fft":
                         full_bfpexp_preamble = bfpexp_run >= required_bfpexp_pairs
@@ -427,24 +451,34 @@ class FPGAFFTReceiver:
                         if (not full_bfpexp_preamble) and (not bootstrap_from_fft):
                             bfpexp_run = 0
                             bfpexp_loss_run = 0
+                            current_bfpexp = int(self.last_frame_bfpexp)
+                            have_explicit_bfpexp = False
                             continue
                         waiting_for_start = False
                         fft_pairs.append(payload)
                         fft_loss_run = 0
                         if len(fft_pairs) >= self.cfg.frame_bins:
+                            self.last_frame_bfpexp = int(current_bfpexp)
+                            self.last_frame_had_explicit_bfpexp = bool(have_explicit_bfpexp)
+                            self._captured_frame_count += 1
                             self._push_pairs_back(pairs[idx + 1 :])
-                            return np.asarray(fft_pairs, dtype=np.int32)
+                            return np.asarray(fft_pairs, dtype=np.int32), int(current_bfpexp)
                         continue
                     bfpexp_run = 0
                     bfpexp_loss_run = 0
+                    current_bfpexp = int(self.last_frame_bfpexp)
+                    have_explicit_bfpexp = False
                     continue
 
                 if kind == "fft":
                     fft_pairs.append(payload)
                     fft_loss_run = 0
                     if len(fft_pairs) >= self.cfg.frame_bins:
+                        self.last_frame_bfpexp = int(current_bfpexp)
+                        self.last_frame_had_explicit_bfpexp = bool(have_explicit_bfpexp)
+                        self._captured_frame_count += 1
                         self._push_pairs_back(pairs[idx + 1 :])
-                        return np.asarray(fft_pairs, dtype=np.int32)
+                        return np.asarray(fft_pairs, dtype=np.int32), int(current_bfpexp)
                     continue
                 if kind == "idle":
                     # The FPGA transport may insert tagged idle padding between valid
@@ -455,8 +489,11 @@ class FPGAFFTReceiver:
                     fft_pairs.append(self._loss_placeholder_pair)
                     fft_loss_run += 1
                     if len(fft_pairs) >= self.cfg.frame_bins:
+                        self.last_frame_bfpexp = int(current_bfpexp)
+                        self.last_frame_had_explicit_bfpexp = bool(have_explicit_bfpexp)
+                        self._captured_frame_count += 1
                         self._push_pairs_back(pairs[idx + 1 :])
-                        return np.asarray(fft_pairs, dtype=np.int32)
+                        return np.asarray(fft_pairs, dtype=np.int32), int(current_bfpexp)
                     continue
 
                 # Any non-FFT tag after frame start breaks the partial frame.
@@ -465,6 +502,8 @@ class FPGAFFTReceiver:
                 fft_pairs.clear()
                 waiting_for_start = True
                 bfpexp_run = 1 if kind == "bfpexp" else 0
+                current_bfpexp = int(payload[0]) if kind == "bfpexp" else int(self.last_frame_bfpexp)
+                have_explicit_bfpexp = kind == "bfpexp"
                 bfpexp_loss_run = 0
                 fft_loss_run = 0
 
@@ -481,6 +520,10 @@ class FPGAFFTReceiver:
         )
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
+        self.last_frame_bfpexp = 0
+        self.last_frame_had_explicit_bfpexp = False
+        self._captured_frame_count = 0
         try:
             self._proc = start_capture_process(
                 resolved_device,
@@ -504,13 +547,19 @@ class FPGAFFTReceiver:
             self._proc = None
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
+        self.last_frame_bfpexp = 0
+        self.last_frame_had_explicit_bfpexp = False
+        self._captured_frame_count = 0
         self._teardown_gpio()
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        frame_bfpexp = 0
         if self.cfg.use_i2s_tags:
-            pairs = self._read_frame_from_i2s_tags()
-            if pairs is None:
+            tagged_frame = self._read_frame_from_i2s_tags()
+            if tagged_frame is None:
                 return None
+            pairs, frame_bfpexp = tagged_frame
         else:
             if not self._wait_for_fft_window():
                 return None
@@ -519,8 +568,12 @@ class FPGAFFTReceiver:
             if pairs is None:
                 return None
 
-        real = pairs[:, 0].astype(np.float32)
-        imag = pairs[:, 1].astype(np.float32)
+        if self.cfg.apply_bfpexp and frame_bfpexp != 0:
+            real = np.ldexp(pairs[:, 0].astype(np.float32), frame_bfpexp)
+            imag = np.ldexp(pairs[:, 1].astype(np.float32), frame_bfpexp)
+        else:
+            real = pairs[:, 0].astype(np.float32)
+            imag = pairs[:, 1].astype(np.float32)
 
         # Magnitude spectrum from complex bins streamed by FPGA.
         fft_mag = np.sqrt(real * real + imag * imag)

@@ -26,8 +26,8 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         cfg = FFTAdapterConfig(frame_bins=512, useful_bins=256)
         rx = FPGAFFTReceiver(cfg)
 
-        self.assertEqual(rx._poll_pairs, 2048)
-        self.assertEqual(rx._poll_bytes, 16384)
+        self.assertEqual(rx._poll_pairs, 512)
+        self.assertEqual(rx._poll_bytes, 4096)
 
     def test_read_available_pairs_can_return_partial_chunk(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4)
@@ -70,6 +70,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=1,
             handshake_timeout_seconds=0.01,
         )
@@ -104,7 +105,13 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         )
 
         strict_rx = FPGAFFTReceiver(
-            FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True, handshake_timeout_seconds=0.01)
+            FFTAdapterConfig(
+                frame_bins=4,
+                useful_bins=4,
+                use_i2s_tags=True,
+                apply_bfpexp=False,
+                handshake_timeout_seconds=0.01,
+            )
         )
         strict_rx._proc = FakeProcess(stream)
         self.assertIsNone(strict_rx.read_frame())
@@ -114,6 +121,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
                 frame_bins=4,
                 useful_bins=4,
                 use_i2s_tags=True,
+                apply_bfpexp=False,
                 require_bfpexp_before_fft=False,
                 handshake_timeout_seconds=0.01,
             )
@@ -129,6 +137,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             done_line=24,
             handshake_timeout_seconds=0.01,
         )
@@ -149,11 +158,45 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         fft_bins, _ = frame
         np.testing.assert_allclose(fft_bins, np.asarray([np.sqrt(5.0), 5.0, 13.0, 17.0], dtype=np.float32))
 
+    def test_done_line_bootstrap_without_bfpexp_is_limited_to_first_frame(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            done_line=24,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (2, 1, 2),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, 8, 15),
+                    (2, 21, 28),
+                    (2, 35, 84),
+                    (2, -56, 105),
+                    (2, 49, -168),
+                ]
+            )
+        )
+
+        first_frame = rx.read_frame()
+        self.assertIsNotNone(first_frame)
+        first_fft_bins, _ = first_frame
+        np.testing.assert_allclose(first_fft_bins, np.asarray([np.sqrt(5.0), 5.0, 13.0, 17.0], dtype=np.float32))
+
+        second_frame = rx.read_frame()
+        self.assertIsNone(second_frame)
+
     def test_tagged_mode_discards_idle_pairs_while_searching_for_frame(self):
         cfg = FFTAdapterConfig(
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=1,
             handshake_timeout_seconds=0.01,
         )
@@ -182,6 +225,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=3,
             handshake_timeout_seconds=0.01,
         )
@@ -228,6 +272,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=3,
             handshake_timeout_seconds=0.01,
         )
@@ -260,6 +305,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=2,
             loss_tolerance_pairs=1,
             handshake_timeout_seconds=0.01,
@@ -290,6 +336,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=1,
             loss_tolerance_pairs=0,
             handshake_timeout_seconds=0.01,
@@ -319,6 +366,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             bfpexp_pairs_required=1,
             handshake_timeout_seconds=0.01,
         )
@@ -348,6 +396,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             require_bfpexp_before_fft=False,
             handshake_timeout_seconds=0.01,
         )
@@ -373,11 +422,61 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         fft_bins, _ = frame
         np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
 
+    def test_tagged_mode_keeps_realigner_leftovers_out_of_raw_byte_buffer(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            require_bfpexp_before_fft=False,
+            handshake_timeout_seconds=0.05,
+        )
+        rx = FPGAFFTReceiver(cfg)
+
+        entries = [
+            (1, 7, 7),
+            (2, 3, 4),
+            (2, 5, 12),
+            (2, -8, 15),
+            (2, 7, -24),
+            (1, 9, 9),
+            (2, 30, 40),
+            (2, 50, 120),
+            (2, -80, 150),
+            (2, 70, -240),
+            (1, 9, 9),
+            (2, 30, 40),
+            (2, 50, 120),
+            (2, -80, 150),
+            (2, 70, -240),
+            (1, 9, 9),
+            (2, 30, 40),
+            (2, 50, 120),
+            (2, -80, 150),
+            (2, 70, -240),
+        ]
+        stream = pack_tagged_pairs(entries)
+        words = np.frombuffer(stream, dtype=np.int32).astype(np.uint32)
+        misframed = i2s_stream._reframe_tagged_words(words, 14)
+        misframed = misframed[: (misframed.size // 2) * 2].astype(np.uint32).view(np.int32).tobytes()
+        rx._proc = FakeProcess(misframed)
+
+        frame1 = rx.read_frame()
+        self.assertIsNotNone(frame1)
+        fft_bins_1, _ = frame1
+        np.testing.assert_allclose(fft_bins_1, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+        frame2 = rx.read_frame()
+        self.assertIsNotNone(frame2)
+        fft_bins_2, _ = frame2
+        np.testing.assert_allclose(fft_bins_2, np.asarray([50.0, 130.0, 170.0, 250.0], dtype=np.float32))
+
     def test_tagged_mode_uses_configured_tag_layout_in_realigner(self):
         cfg = FFTAdapterConfig(
             frame_bins=4,
             useful_bins=4,
             use_i2s_tags=True,
+            apply_bfpexp=False,
             tag_shift=28,
             payload_bits=16,
             require_bfpexp_before_fft=False,
@@ -404,7 +503,7 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
 
     def test_pair_kind_reports_tag_mismatch_explicitly(self):
-        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True, apply_bfpexp=False)
         rx = FPGAFFTReceiver(cfg)
         pair = np.asarray(
             [
@@ -418,6 +517,33 @@ class FPGAFFTReceiverTests(unittest.TestCase):
 
         self.assertEqual(kind, "tag_mismatch")
         self.assertEqual(payload, (5, 5))
+
+    def test_read_frame_applies_bfpexp_scaling_by_default(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            bfpexp_pairs_required=1,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (1, 2, 2),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([20.0, 52.0, 68.0, 100.0], dtype=np.float32))
+        self.assertEqual(rx.last_frame_bfpexp, 2)
 
     def test_raw_mode_reads_exact_frame_without_tags(self):
         cfg = FFTAdapterConfig(frame_bins=3, useful_bins=3, use_i2s_tags=False)

@@ -18,13 +18,13 @@
 enum {
     CHANNEL_COUNT = 2,
     DEFAULT_RATE_HZ = 48828,
-    DEFAULT_READ_FRAMES = 2048,
+    DEFAULT_READ_FRAMES = 512,
     DEFAULT_PERIOD_FRAMES = 512,
-    DEFAULT_BUFFER_FRAMES = 8192,
-    DEFAULT_QUEUE_CHUNKS = 512,
+    DEFAULT_BUFFER_FRAMES = 2048,
+    DEFAULT_QUEUE_CHUNKS = 32,
     DEFAULT_FLUSH_EVERY_CHUNKS = 8,
     DEFAULT_STATS_INTERVAL_MS = 1000,
-    DEFAULT_PIPE_SIZE_BYTES = 1 << 20,
+    DEFAULT_PIPE_SIZE_BYTES = 1 << 16,
 };
 
 typedef enum {
@@ -122,10 +122,10 @@ static void print_usage(const char *prog) {
             "Opcoes:\n"
             "  -D, --device <hw:X,Y>        dispositivo ALSA (padrao: hw:2,0)\n"
             "  -r, --rate <Hz>              taxa de captura (padrao: 48828)\n"
-            "  -n, --read-frames <N>        frames por leitura ALSA (padrao: 2048)\n"
+            "  -n, --read-frames <N>        frames por leitura ALSA (padrao: 512)\n"
             "  -F, --period-frames <N>      tamanho do periodo ALSA (padrao: 512)\n"
-            "  -B, --buffer-frames <N>      tamanho do buffer ALSA (padrao: 8192)\n"
-            "  -Q, --queue-chunks <N>       chunks no buffer interno (padrao: 512)\n"
+            "  -B, --buffer-frames <N>      tamanho do buffer ALSA (padrao: 2048)\n"
+            "  -Q, --queue-chunks <N>       chunks no buffer interno (padrao: 32)\n"
             "  -m, --mode <hex|raw>         formato da saida (padrao: hex)\n"
             "  -o, --output <path|- >       arquivo de saida ou stdout (padrao: -)\n"
             "      --pipe-size-bytes <N>    tamanho pedido para o pipe de stdout\n"
