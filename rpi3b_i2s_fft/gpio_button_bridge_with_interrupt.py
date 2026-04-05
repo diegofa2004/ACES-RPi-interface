@@ -1,4 +1,5 @@
 import argparse
+import select
 import time
 from pathlib import Path
 
@@ -11,7 +12,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 DEFAULT_TRIGGER_FILE = Path(__file__).resolve().parent / "record_button.trigger"
 
 
-class GPIOButtonInput:
+class GPIOButtonInterruptInput:
     def __init__(self, chip_path: str, line_offset: int):
         if gpiod is None:
             raise RuntimeError(
@@ -35,24 +36,28 @@ class GPIOButtonInput:
             settings = {
                 self.line_offset: gpiod.LineSettings(
                     direction=line_module.Direction.INPUT,
+                    edge_detection=line_module.Edge.BOTH,
                 )
             }
             if hasattr(chip, "request_lines"):
                 self._line_request = chip.request_lines(
-                    consumer="record_button",
+                    consumer="record_button_irq",
                     config=settings,
                 )
             else:
                 self._line_request = gpiod.request_lines(
                     self.chip_path,
-                    consumer="record_button",
+                    consumer="record_button_irq",
                     config=settings,
                 )
             self._gpio_api = "v2"
             return
 
         line = chip.get_line(self.line_offset)
-        line.request(consumer="record_button", type=gpiod.LINE_REQ_DIR_IN)
+        line.request(
+            consumer="record_button_irq",
+            type=gpiod.LINE_REQ_EV_BOTH_EDGES,
+        )
         self._line = line
         self._gpio_api = "v1"
 
@@ -67,6 +72,49 @@ class GPIOButtonInput:
         line_module = getattr(gpiod, "line", gpiod)
         value = self._line_request.get_value(self.line_offset)
         return value == line_module.Value.ACTIVE
+
+    def wait_for_edge(self, timeout_seconds: float) -> bool:
+        if self._gpio_api == "v1":
+            if self._line is None:
+                return False
+            wait_fn = getattr(self._line, "event_wait", None)
+            if callable(wait_fn):
+                return bool(wait_fn(timeout_seconds))
+            return False
+
+        if self._line_request is None:
+            return False
+
+        # libgpiod v2 may expose a request fd or wait_edge_events.
+        wait_edge_events = getattr(self._line_request, "wait_edge_events", None)
+        if callable(wait_edge_events):
+            return bool(wait_edge_events(timeout=timeout_seconds))
+
+        fd = getattr(self._line_request, "fd", None)
+        if fd is None:
+            return False
+        readable, _, _ = select.select([fd], [], [], timeout_seconds)
+        return bool(readable)
+
+    def read_edge_events(self) -> int:
+        if self._gpio_api == "v1":
+            if self._line is None:
+                return 0
+            read_fn = getattr(self._line, "event_read", None)
+            if callable(read_fn):
+                event = read_fn()
+                return 1 if event is not None else 0
+            return 0
+
+        if self._line_request is None:
+            return 0
+        read_edge_events = getattr(self._line_request, "read_edge_events", None)
+        if callable(read_edge_events):
+            events = read_edge_events()
+            if events is None:
+                return 0
+            return len(events)
+        return 0
 
     def close(self) -> None:
         if self._line_request is not None:
@@ -98,7 +146,7 @@ def write_trigger(trigger_file: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Read a Raspberry Pi GPIO button and trigger event recording in analyzer_from_fpga_fft.py."
+        description="Read a Raspberry Pi GPIO button (interrupt/edge mode) and trigger event recording in analyzer_from_fpga_fft.py."
     )
     parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip path")
     parser.add_argument("--button-line", type=int, required=True, help="GPIO line offset connected to the button")
@@ -112,19 +160,24 @@ def main() -> int:
         default=str(DEFAULT_TRIGGER_FILE),
         help="File touched when the button is pressed",
     )
-    parser.add_argument("--poll-seconds", type=float, default=0.02, help="GPIO polling interval in seconds")
     parser.add_argument("--debounce-ms", type=float, default=250.0, help="Minimum time between presses")
+    parser.add_argument(
+        "--event-timeout-seconds",
+        type=float,
+        default=1.0,
+        help="Maximum wait time per edge wait cycle (allows clean Ctrl+C handling)",
+    )
     args = parser.parse_args()
 
     if args.button_line < 0:
         parser.error("--button-line must be non-negative")
-    if args.poll_seconds <= 0.0:
-        parser.error("--poll-seconds must be positive")
     if args.debounce_ms < 0.0:
         parser.error("--debounce-ms must be non-negative")
+    if args.event_timeout_seconds <= 0.0:
+        parser.error("--event-timeout-seconds must be positive")
 
     trigger_file = Path(args.trigger_file).expanduser().resolve()
-    button = GPIOButtonInput(args.gpio_chip, args.button_line)
+    button = GPIOButtonInterruptInput(args.gpio_chip, args.button_line)
     debounce_seconds = args.debounce_ms / 1000.0
 
     try:
@@ -133,18 +186,25 @@ def main() -> int:
         print(str(exc), flush=True)
         return 1
 
-    print("GPIO button bridge active.", flush=True)
+    print("GPIO button bridge active (interrupt mode).", flush=True)
     print("GPIO chip:", args.gpio_chip, flush=True)
     print("Button line:", args.button_line, flush=True)
     print("Active low:", bool(args.active_low), flush=True)
     print("Trigger file:", trigger_file, flush=True)
     print("Press Ctrl+C to stop.", flush=True)
 
-    last_pressed = False
+    last_pressed = (not button.read_active()) if args.active_low else button.read_active()
     last_trigger_time = 0.0
 
     try:
         while True:
+            has_event = button.wait_for_edge(args.event_timeout_seconds)
+            if not has_event:
+                continue
+
+            # Drain pending edge events before reading stable line state.
+            button.read_edge_events()
+
             raw_active = button.read_active()
             pressed = (not raw_active) if args.active_low else raw_active
             now = time.monotonic()
@@ -155,7 +215,6 @@ def main() -> int:
                 print("Button press detected: recording trigger sent.", flush=True)
 
             last_pressed = pressed
-            time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
         print("Stopping button bridge...", flush=True)
     finally:
