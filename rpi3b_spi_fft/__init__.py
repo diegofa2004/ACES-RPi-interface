@@ -1,4 +1,4 @@
-"""Helpers for bridging FPGA FFT data from I2S on Raspberry Pi."""
+"""Helpers for bridging FPGA FFT data from SPI on Raspberry Pi."""
 
 from .compararEvento import compararEvento
 from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver

@@ -10,14 +10,14 @@ TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
-from rpi3b_i2s_fft import analyzer_from_fpga_fft
-from rpi3b_i2s_fft.fpga_fft_adapter import FFTAdapterConfig
+from rpi3b_spi_fft import analyzer_from_fpga_fft
+from rpi3b_spi_fft.fpga_fft_adapter import FFTAdapterConfig
 from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_word
 
 
 class AnalyzerFromFPGAFFTTests(unittest.TestCase):
     def test_process_channel_debug_chunk_reports_kinds_and_fft_runs(self):
-        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_word_tags=True)
         pairs = np.frombuffer(
             pack_tagged_pairs(
                 [
@@ -58,7 +58,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(summary["flag_high_chunks"], 1)
 
     def test_process_channel_debug_chunk_counts_mismatch_and_reserved_bits(self):
-        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_word_tags=True)
         left_word = pack_tagged_word(2, 5)
         right_word = pack_tagged_word(1, 5)
         reserved_word = int(np.asarray([np.uint32((2 << 30) | (1 << 18) | 9)], dtype=np.uint32).view(np.int32)[0])
@@ -110,7 +110,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         np.testing.assert_array_equal(chunks[1], np.asarray([[5, 6]], dtype=np.int32))
 
     def test_run_channel_debug_replay_uses_saved_capture_index_metadata(self):
-        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_word_tags=True)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -134,7 +134,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
                 for payload in (
                     {
                         "type": "session_start",
-                        "device": "hw:2,0",
+                        "device": "/dev/spidev0.0",
                     },
                     {
                         "type": "chunk",
@@ -179,7 +179,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
                 payloads = [json.loads(line) for line in handle if line.strip()]
 
         self.assertEqual(payloads[0]["source"]["kind"], "raw_replay")
-        self.assertEqual(payloads[0]["device"], "hw:2,0")
+        self.assertEqual(payloads[0]["device"], "/dev/spidev0.0")
         self.assertEqual(payloads[1]["flag_active"], True)
         self.assertEqual(payloads[1]["pair_offset"], 0)
         self.assertEqual(payloads[2]["flag_active"], False)

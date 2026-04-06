@@ -9,7 +9,7 @@ TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
-from rpi3b_i2s_fft import plotFFT
+from rpi3b_spi_fft import plotFFT
 
 
 class PlotFFTTests(unittest.TestCase):

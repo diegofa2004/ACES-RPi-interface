@@ -1,15 +1,34 @@
-import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
 try:
-    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
+    from .spi_stream import (
+        AUTO_SPI_DEVICE,
+        BYTES_PER_FFT_PAIR,
+        DEFAULT_SPI_BITS_PER_WORD,
+        DEFAULT_SPI_MAX_SPEED_HZ,
+        DEFAULT_SPI_MODE,
+        close_spi_device,
+        open_spi_device,
+        resolve_spi_device,
+        transfer_exactly,
+    )
     from .spectral_features import build_dct_matrix, build_mel_filter
 except ImportError:
-    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device, start_arecord_process, stop_process
+    from spi_stream import (
+        AUTO_SPI_DEVICE,
+        BYTES_PER_FFT_PAIR,
+        DEFAULT_SPI_BITS_PER_WORD,
+        DEFAULT_SPI_MAX_SPEED_HZ,
+        DEFAULT_SPI_MODE,
+        close_spi_device,
+        open_spi_device,
+        resolve_spi_device,
+        transfer_exactly,
+    )
     from spectral_features import build_dct_matrix, build_mel_filter
 
 try:
@@ -20,18 +39,18 @@ except ImportError:  # pragma: no cover - optional dependency on target device
 
 @dataclass
 class FFTAdapterConfig:
-    device: str = AUTO_AUDIO_DEVICE
+    device: str = AUTO_SPI_DEVICE
     sample_rate: int = 48000
     frame_bins: int = 512
     useful_bins: int = 256
+    spi_max_speed_hz: int = DEFAULT_SPI_MAX_SPEED_HZ
+    spi_mode: int = DEFAULT_SPI_MODE
+    spi_bits_per_word: int = DEFAULT_SPI_BITS_PER_WORD
     gpio_chip: str = "/dev/gpiochip0"
-    bfpexp_flag_line: Optional[int] = None
-    done_line: Optional[int] = None
-    flag_active_high: bool = True
-    done_pulse_seconds: float = 0.0005
+    window_ready_line: Optional[int] = None
     handshake_timeout_seconds: float = 1.0
-    wait_for_flag_falling_edge: bool = True
-    use_i2s_tags: bool = False
+    bfpexp_hold_frames: int = 1
+    use_word_tags: bool = True
     tag_shift: int = 30
     tag_mask: int = 0x3
     payload_bits: int = 18
@@ -47,6 +66,16 @@ class FFTAdapterConfig:
             raise ValueError("frame_bins must be positive")
         if not 2 <= self.useful_bins <= self.frame_bins:
             raise ValueError("Expected 2 <= useful_bins <= frame_bins")
+        if self.spi_max_speed_hz <= 0:
+            raise ValueError("spi_max_speed_hz must be positive")
+        if not 0 <= self.spi_mode <= 3:
+            raise ValueError("spi_mode must be between 0 and 3")
+        if self.spi_bits_per_word <= 0:
+            raise ValueError("spi_bits_per_word must be positive")
+        if self.handshake_timeout_seconds <= 0.0:
+            raise ValueError("handshake_timeout_seconds must be positive")
+        if self.bfpexp_hold_frames < 1:
+            raise ValueError("bfpexp_hold_frames must be >= 1")
         if not 1 <= self.payload_bits <= 31:
             raise ValueError("payload_bits must be between 1 and 31")
         if not 0 <= self.tag_shift <= 31:
@@ -55,35 +84,27 @@ class FFTAdapterConfig:
             raise ValueError("tag_mask must be positive")
         tag_width = int(self.tag_mask).bit_length()
         if (self.tag_shift + tag_width) > 32:
-            raise ValueError("tag field must fit inside a 32-bit I2S word")
-        if self.use_i2s_tags and self.payload_bits > self.tag_shift:
-            raise ValueError("payload_bits must not overlap the tag field when use_i2s_tags is enabled")
-        if (
-            self.bfpexp_flag_line is not None
-            and self.done_line is not None
-            and self.bfpexp_flag_line == self.done_line
-        ):
-            raise ValueError("bfpexp_flag_line and done_line must be different GPIO lines")
-        if self.handshake_timeout_seconds <= 0.0:
-            raise ValueError("handshake_timeout_seconds must be positive")
-        if self.done_pulse_seconds < 0.0:
-            raise ValueError("done_pulse_seconds must be non-negative")
+            raise ValueError("tag field must fit inside a 32-bit word")
+        if self.use_word_tags and self.payload_bits > self.tag_shift:
+            raise ValueError("payload_bits must not overlap the tag field when tags are enabled")
 
 
 class FPGAFFTReceiver:
     def __init__(self, cfg: FFTAdapterConfig):
         self.cfg = cfg
-        self._proc: Optional[subprocess.Popen] = None
-        self._bytes_per_pair = 8  # real(int32) + imag(int32)
-        self._frame_bytes = self.cfg.frame_bins * self._bytes_per_pair
-        # Poll at least one full FFT frame per read so Python/GPIO overhead
-        # does not force the ALSA capture side to run near the overrun limit.
-        self._poll_pairs = max(64, self.cfg.frame_bins)
+        self._spi: Optional[Any] = None
+        self._bytes_per_pair = BYTES_PER_FFT_PAIR
+        self._transaction_pairs = (
+            self.cfg.frame_bins + self.cfg.bfpexp_hold_frames
+            if self.cfg.use_word_tags
+            else self.cfg.frame_bins
+        )
+        self._transaction_bytes = self._transaction_pairs * self._bytes_per_pair
+        self._poll_pairs = max(64, self._transaction_pairs)
         self._poll_bytes = self._poll_pairs * self._bytes_per_pair
         self._byte_buffer = bytearray()
         self._line_request = None
-        self._bfpexp_line = None
-        self._done_line = None
+        self._window_ready_line = None
         self._gpio_api = None
         self._gpio_chip = None
 
@@ -100,7 +121,7 @@ class FPGAFFTReceiver:
         self._dct_matrix = build_dct_matrix(input_size=32, output_size=13)
 
     def _setup_gpio(self) -> None:
-        if self.cfg.bfpexp_flag_line is None and self.cfg.done_line is None:
+        if self.cfg.window_ready_line is None:
             return
         if gpiod is None:
             raise RuntimeError(
@@ -118,19 +139,13 @@ class FPGAFFTReceiver:
         self._setup_gpio_v1(chip)
 
     def _setup_gpio_v2(self, chip: object) -> None:
+        assert self.cfg.window_ready_line is not None
         line_module = getattr(gpiod, "line", gpiod)
-        settings = {}
-
-        if self.cfg.bfpexp_flag_line is not None:
-            settings[self.cfg.bfpexp_flag_line] = gpiod.LineSettings(
+        settings = {
+            self.cfg.window_ready_line: gpiod.LineSettings(
                 direction=line_module.Direction.INPUT,
             )
-
-        if self.cfg.done_line is not None:
-            settings[self.cfg.done_line] = gpiod.LineSettings(
-                direction=line_module.Direction.OUTPUT,
-                output_value=line_module.Value.INACTIVE,
-            )
+        }
 
         if hasattr(chip, "request_lines"):
             self._line_request = chip.request_lines(
@@ -145,22 +160,14 @@ class FPGAFFTReceiver:
             )
 
         self._gpio_api = "v2"
-        self._bfpexp_line = self.cfg.bfpexp_flag_line
-        self._done_line = self.cfg.done_line
+        self._window_ready_line = self.cfg.window_ready_line
 
     def _setup_gpio_v1(self, chip: object) -> None:
+        assert self.cfg.window_ready_line is not None
+        line = chip.get_line(self.cfg.window_ready_line)
+        line.request(consumer="fpga_fft_receiver", type=gpiod.LINE_REQ_DIR_IN)
         self._gpio_api = "v1"
-
-        if self.cfg.bfpexp_flag_line is not None:
-            line = chip.get_line(self.cfg.bfpexp_flag_line)
-            line.request(consumer="fpga_fft_receiver", type=gpiod.LINE_REQ_DIR_IN)
-            self._bfpexp_line = line
-
-        if self.cfg.done_line is not None:
-            line = chip.get_line(self.cfg.done_line)
-            line.request(consumer="fpga_fft_receiver", type=gpiod.LINE_REQ_DIR_OUT)
-            line.set_value(0)
-            self._done_line = line
+        self._window_ready_line = line
 
     def _teardown_gpio(self) -> None:
         if self._line_request is not None:
@@ -169,67 +176,60 @@ class FPGAFFTReceiver:
                 release()
             self._line_request = None
 
-        for line in (self._bfpexp_line, self._done_line):
-            release = getattr(line, "release", None)
-            if callable(release):
-                release()
+        release = getattr(self._window_ready_line, "release", None)
+        if callable(release):
+            release()
 
         close = getattr(self._gpio_chip, "close", None)
         if callable(close):
             close()
 
-        self._bfpexp_line = None
-        self._done_line = None
+        self._window_ready_line = None
         self._gpio_api = None
         self._gpio_chip = None
 
-    def _read_flag_active(self) -> bool:
-        if self._bfpexp_line is None:
-            return False
+    def _read_window_ready(self) -> bool:
+        if self._window_ready_line is None:
+            return True
 
         if self._gpio_api == "v1":
-            value = self._bfpexp_line.get_value()
-            is_high = bool(value)
-        else:
-            if self._line_request is None:
-                return False
-            value = self._line_request.get_value(self._bfpexp_line)
-            line_module = getattr(gpiod, "line", gpiod)
-            is_high = value == line_module.Value.ACTIVE
-
-        return is_high if self.cfg.flag_active_high else (not is_high)
-
-    def _set_done(self, active: bool) -> None:
-        if self._done_line is None:
-            return
-
-        if self._gpio_api == "v1":
-            self._done_line.set_value(1 if active else 0)
-            return
+            value = self._window_ready_line.get_value()
+            return bool(value)
 
         if self._line_request is None:
-            return
+            return False
+        value = self._line_request.get_value(self._window_ready_line)
         line_module = getattr(gpiod, "line", gpiod)
-        out = line_module.Value.ACTIVE if active else line_module.Value.INACTIVE
-        self._line_request.set_value(self._done_line, out)
+        return value == line_module.Value.ACTIVE
 
-    def _pulse_done(self) -> None:
-        if self._done_line is None:
-            return
-        self._set_done(True)
-        time.sleep(max(0.0, self.cfg.done_pulse_seconds))
-        self._set_done(False)
+    def _wait_for_window_ready(self) -> bool:
+        if self.cfg.window_ready_line is None:
+            return True
+
+        deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
+        while time.monotonic() < deadline:
+            if self._read_window_ready():
+                return True
+            time.sleep(0.0005)
+        return False
+
+    def _capture_transaction(self) -> bool:
+        if self._spi is None:
+            return False
+
+        if not self._wait_for_window_ready():
+            return False
+
+        raw = transfer_exactly(self._spi, self._transaction_bytes)
+        if not raw:
+            return False
+        self._byte_buffer.extend(raw)
+        return True
 
     def _fill_buffer(self, min_bytes: int) -> bool:
-        if self._proc is None or self._proc.stdout is None:
-            raise RuntimeError("Receiver not started")
-
         while len(self._byte_buffer) < min_bytes:
-            chunk = self._proc.stdout.read(max(self._poll_bytes, min_bytes - len(self._byte_buffer)))
-            if not chunk:
+            if not self._capture_transaction():
                 break
-            self._byte_buffer.extend(chunk)
-
         return len(self._byte_buffer) >= min_bytes
 
     def _pop_pairs(self, pair_count: int, exact: bool) -> Optional[np.ndarray]:
@@ -260,9 +260,9 @@ class FPGAFFTReceiver:
         return self._pop_pairs(pair_count, exact=False)
 
     def read_flag_state(self) -> Optional[bool]:
-        if self._bfpexp_line is None:
+        if self.cfg.window_ready_line is None:
             return None
-        return self._read_flag_active()
+        return self._read_window_ready()
 
     def _decode_tagged_word(self, word: int) -> Tuple[int, int]:
         uword = int(word) & 0xFFFFFFFF
@@ -292,48 +292,9 @@ class FPGAFFTReceiver:
         return "other", (payload_l, payload_r)
 
     def _allow_tagged_fft_start_without_bfpexp(self) -> bool:
-        if not self.cfg.require_bfpexp_before_fft:
-            return True
-        # In tagged streams that wait for RPi DONE before emitting the next BFPEXP,
-        # insisting on BFPEXP for the very first decoded frame can deadlock startup
-        # if software attaches while a FFT burst is already in flight.
-        return self.cfg.done_line is not None
+        return not self.cfg.require_bfpexp_before_fft
 
-    def _wait_for_fft_window(self) -> bool:
-        if self.cfg.use_i2s_tags:
-            return True
-        if self._bfpexp_line is None:
-            return True
-        if self._gpio_api == "v2" and self._line_request is None:
-            return True
-
-        if self._proc is None or self._proc.stdout is None:
-            raise RuntimeError("Receiver not started")
-
-        deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
-        previous_active = self._read_flag_active()
-
-        # Drain audio while watching GPIO so the capture pointer stays near real time.
-        while time.monotonic() < deadline:
-            pairs = self._pop_pairs(self._poll_pairs, exact=False)
-            if pairs is None:
-                return False
-
-            current_active = self._read_flag_active()
-            if self.cfg.wait_for_flag_falling_edge:
-                if previous_active and (not current_active):
-                    return True
-            else:
-                if not current_active:
-                    return True
-            previous_active = current_active
-
-        return False
-
-    def _read_frame_from_i2s_tags(self) -> Optional[np.ndarray]:
-        if self._proc is None or self._proc.stdout is None:
-            raise RuntimeError("Receiver not started")
-
+    def _read_frame_from_word_tags(self) -> Optional[np.ndarray]:
         deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
         fft_pairs = []
         waiting_for_start = True
@@ -370,9 +331,6 @@ class FPGAFFTReceiver:
                         return np.asarray(fft_pairs, dtype=np.int32)
                     continue
 
-                # Any non-FFT tag after frame start breaks the partial frame.
-                # Discard the partial data and keep scanning the current chunk so
-                # idle/null padding is ignored and a fresh BFPEXP can resync us.
                 fft_pairs.clear()
                 waiting_for_start = True
                 bfpexp_seen = (kind == "bfpexp")
@@ -380,38 +338,45 @@ class FPGAFFTReceiver:
         return None
 
     def start(self) -> None:
-        resolved_device = resolve_audio_device(self.cfg.device)
+        resolved_device = resolve_spi_device(self.cfg.device)
         self.cfg.device = resolved_device
-        cmd = build_arecord_cmd(resolved_device, self.cfg.sample_rate)
         self._byte_buffer.clear()
         try:
-            self._proc = start_arecord_process(resolved_device, self.cfg.sample_rate)
+            self._spi = open_spi_device(
+                resolved_device,
+                max_speed_hz=self.cfg.spi_max_speed_hz,
+                mode=self.cfg.spi_mode,
+                bits_per_word=self.cfg.spi_bits_per_word,
+            )
             self._setup_gpio()
         except Exception:
-            if self._proc is not None:
-                stop_process(self._proc)
-                self._proc = None
+            if self._spi is not None:
+                close_spi_device(self._spi)
+                self._spi = None
             self._teardown_gpio()
             raise
-        print("Starting:", " ".join(cmd), flush=True)
+
+        print(
+            "Starting SPI capture:",
+            resolved_device,
+            f"mode={self.cfg.spi_mode}",
+            f"max_speed_hz={self.cfg.spi_max_speed_hz}",
+            flush=True,
+        )
 
     def stop(self) -> None:
-        self._set_done(False)
-        if self._proc is not None:
-            stop_process(self._proc)
-            self._proc = None
+        if self._spi is not None:
+            close_spi_device(self._spi)
+            self._spi = None
         self._byte_buffer.clear()
         self._teardown_gpio()
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        if self.cfg.use_i2s_tags:
-            pairs = self._read_frame_from_i2s_tags()
+        if self.cfg.use_word_tags:
+            pairs = self._read_frame_from_word_tags()
             if pairs is None:
                 return None
         else:
-            if not self._wait_for_fft_window():
-                return None
-
             pairs = self._pop_pairs(self.cfg.frame_bins, exact=True)
             if pairs is None:
                 return None
@@ -419,14 +384,11 @@ class FPGAFFTReceiver:
         real = pairs[:, 0].astype(np.float32)
         imag = pairs[:, 1].astype(np.float32)
 
-        # Magnitude spectrum from complex bins streamed by FPGA.
         fft_mag = np.sqrt(real * real + imag * imag)
         fft_useful = fft_mag[: self.cfg.useful_bins]
 
         mel = self.mel_filter @ fft_useful
         mel = np.log(mel + 1e-9)
         mfcc = self._dct_matrix @ mel
-
-        self._pulse_done()
 
         return fft_useful.astype(np.float32, copy=False), mfcc.astype(np.float32, copy=False)

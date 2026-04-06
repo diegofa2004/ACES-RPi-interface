@@ -13,14 +13,14 @@ import numpy as np
 try:
     from .compararEvento import compararEvento
     from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from .i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
+    from .spi_stream import AUTO_SPI_DEVICE, DEFAULT_SPI_MAX_SPEED_HZ, DEFAULT_SPI_MODE, resolve_spi_device
 except ImportError:
     from compararEvento import compararEvento
     from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
-    from i2s_stream import AUTO_AUDIO_DEVICE, build_arecord_cmd, resolve_audio_device
+    from spi_stream import AUTO_SPI_DEVICE, DEFAULT_SPI_MAX_SPEED_HZ, DEFAULT_SPI_MODE, resolve_spi_device
 
 
-DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
+DEFAULT_SPI_DEVICE = os.environ.get("SPI_DEVICE") or AUTO_SPI_DEVICE
 WORK_DIR = Path(__file__).resolve().parent
 EVENTO_FILENAME = WORK_DIR / "evento.npy"
 FFT_FILENAME = WORK_DIR / "fft.npy"
@@ -462,12 +462,19 @@ def _build_debug_session_start(
         "protocol_enforced": False,
         "done_pulses_emitted": False,
         "device": device,
-        "arecord_cmd": build_arecord_cmd(device, cfg.sample_rate) if device else None,
+        "spi_config": {
+            "device": device,
+            "mode": cfg.spi_mode,
+            "max_speed_hz": cfg.spi_max_speed_hz,
+            "bits_per_word": cfg.spi_bits_per_word,
+            "window_ready_line": cfg.window_ready_line,
+        },
         "config": {
             "sample_rate": cfg.sample_rate,
             "frame_bins": cfg.frame_bins,
             "useful_bins": cfg.useful_bins,
-            "use_i2s_tags": cfg.use_i2s_tags,
+            "bfpexp_hold_frames": cfg.bfpexp_hold_frames,
+            "use_word_tags": cfg.use_word_tags,
             "tag_shift": cfg.tag_shift,
             "tag_mask": cfg.tag_mask,
             "payload_bits": cfg.payload_bits,
@@ -475,8 +482,7 @@ def _build_debug_session_start(
             "tag_bfpexp": cfg.tag_bfpexp,
             "tag_fft": cfg.tag_fft,
             "require_bfpexp_before_fft": cfg.require_bfpexp_before_fft,
-            "bfpexp_flag_line": cfg.bfpexp_flag_line,
-            "done_line": cfg.done_line,
+            "window_ready_line": cfg.window_ready_line,
         },
         "capture_plan": {
             "capture_seconds": float(capture_seconds),
@@ -510,7 +516,7 @@ def capture_channel_debug_raw(
     total_pairs = 0
     chunk_index = 0
 
-    print("Channel debug raw capture active: writing the full I2S stream for offline replay.", flush=True)
+    print("Channel debug raw capture active: writing the full tagged SPI payload for offline replay.", flush=True)
     print("Raw capture:", raw_path, flush=True)
     print("Chunk index:", index_path, flush=True)
 
@@ -633,7 +639,7 @@ def run_channel_debug_capture(
                     capture_seconds=capture_seconds,
                     chunk_pairs=chunk_pairs,
                     preview_pairs=preview_pairs,
-                    source={"kind": "live_arecord"},
+                    source={"kind": "live_spi"},
                     timestamp_ns=time.time_ns(),
                 ),
             )
@@ -731,7 +737,7 @@ def run_channel_debug_replay(
 
     source_device = str(session_start.get("device") or device or "raw_replay")
     source_duration = float(summary.get("duration_seconds", 0.0)) if summary else 0.0
-    print("Channel debug replay mode active: decoding a saved raw I2S capture.", flush=True)
+    print("Channel debug replay mode active: decoding a saved raw tagged SPI capture.", flush=True)
     print("Raw capture:", raw_path, flush=True)
     if index_path is not None:
         print("Replay index:", index_path, flush=True)
@@ -793,56 +799,53 @@ def run_channel_debug_replay(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Feed circular buffers from FPGA I2S FFT stream using the same event logic as pyserial."
+        description="Feed circular buffers from the FPGA SPI FFT stream using the same event logic as pyserial."
     )
     parser.add_argument(
         "-D",
         "--device",
-        default=DEFAULT_AUDIO_DEVICE,
-        help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
+        default=DEFAULT_SPI_DEVICE,
+        help="SPI device (default: $SPI_DEVICE if set, otherwise auto-detect)",
     )
     parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
-    parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip used for handshake")
     parser.add_argument(
-        "--bfpexp-flag-line",
+        "--spi-max-speed-hz",
+        type=int,
+        default=DEFAULT_SPI_MAX_SPEED_HZ,
+        help="SPI clock rate used by the Raspberry Pi master",
+    )
+    parser.add_argument(
+        "--spi-mode",
+        type=int,
+        default=DEFAULT_SPI_MODE,
+        help="SPI mode used by the Raspberry Pi master",
+    )
+    parser.add_argument(
+        "--bfpexp-hold-frames",
+        type=int,
+        default=1,
+        help="Number of BFPEXP tagged pairs sent at the start of each SPI transaction",
+    )
+    parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip used for window_ready input")
+    parser.add_argument(
+        "--window-ready-line",
         type=int,
         default=None,
-        help="Input GPIO line number: active during BFPEXP transmission",
-    )
-    parser.add_argument(
-        "--done-line",
-        type=int,
-        default=None,
-        help="Output GPIO line number: pulsed when 512 FFT bins are consumed",
-    )
-    parser.add_argument(
-        "--flag-active-low",
-        action="store_true",
-        help="Set when BFPEXP flag signal is active-low instead of active-high",
-    )
-    parser.add_argument(
-        "--wait-low-level",
-        action="store_true",
-        help="Wait for BFPEXP flag low level instead of requiring a falling edge",
-    )
-    parser.add_argument(
-        "--done-pulse-ms",
-        type=float,
-        default=0.5,
-        help="Done pulse width in milliseconds",
+        help="Input GPIO line number: active when a full SPI FFT window is ready to be read",
     )
     parser.add_argument(
         "--handshake-timeout-ms",
         type=float,
         default=1000.0,
-        help="Timeout waiting for FFT window trigger in milliseconds",
+        help="Timeout waiting for window_ready in milliseconds",
     )
     parser.add_argument(
-        "--use-i2s-tags",
+        "--use-word-tags",
         action="store_true",
-        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream",
+        default=True,
+        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from the SPI payload",
     )
     parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
     parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
@@ -863,7 +866,7 @@ def main() -> int:
     parser.add_argument(
         "--debug-raw-capture",
         default=None,
-        help="Write the full raw S32_LE stereo capture for later offline replay",
+        help="Write the full raw tagged SPI payload for later offline replay",
     )
     parser.add_argument(
         "--debug-raw-index",
@@ -873,7 +876,7 @@ def main() -> int:
     parser.add_argument(
         "--debug-replay-raw",
         default=None,
-        help="Replay a saved raw S32_LE stereo capture instead of reading the live device",
+        help="Replay a saved raw tagged SPI payload instead of reading the live device",
     )
     parser.add_argument(
         "--debug-capture-seconds",
@@ -901,6 +904,12 @@ def main() -> int:
         parser.error("--frame-bins must be positive")
     if not 2 <= args.useful_bins <= args.frame_bins:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
+    if args.spi_max_speed_hz <= 0:
+        parser.error("--spi-max-speed-hz must be positive")
+    if args.spi_mode < 0 or args.spi_mode > 3:
+        parser.error("--spi-mode must be between 0 and 3")
+    if args.bfpexp_hold_frames <= 0:
+        parser.error("--bfpexp-hold-frames must be positive")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
     if args.debug_capture_seconds <= 0:
@@ -929,7 +938,7 @@ def main() -> int:
         device = args.device
     else:
         try:
-            device = resolve_audio_device(args.device)
+            device = resolve_spi_device(args.device)
         except RuntimeError as exc:
             parser.error(str(exc))
 
@@ -941,14 +950,13 @@ def main() -> int:
             sample_rate=args.rate,
             frame_bins=args.frame_bins,
             useful_bins=args.useful_bins,
+            spi_max_speed_hz=args.spi_max_speed_hz,
+            spi_mode=args.spi_mode,
             gpio_chip=args.gpio_chip,
-            bfpexp_flag_line=args.bfpexp_flag_line,
-            done_line=args.done_line,
-            flag_active_high=not args.flag_active_low,
-            done_pulse_seconds=max(0.0, args.done_pulse_ms / 1000.0),
+            window_ready_line=args.window_ready_line,
             handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
-            wait_for_flag_falling_edge=not args.wait_low_level,
-            use_i2s_tags=args.use_i2s_tags,
+            bfpexp_hold_frames=args.bfpexp_hold_frames,
+            use_word_tags=args.use_word_tags,
             tag_shift=args.tag_shift,
             tag_mask=args.tag_mask,
             payload_bits=args.payload_bits,
@@ -1048,21 +1056,26 @@ def main() -> int:
 
     pre_size = buffers["pre_mfcc"].maxlen or 0
     history_size = buffers["history_mfcc"].maxlen or 0
-    print("Using ALSA capture device:", device, flush=True)
-    print("Reading FPGA FFT stream from I2S...", flush=True)
-    if args.use_i2s_tags:
+    print("Using SPI device:", device, flush=True)
+    print(
+        "Reading FPGA FFT stream from SPI...",
+        f"mode={args.spi_mode}",
+        f"max_speed_hz={args.spi_max_speed_hz}",
+        flush=True,
+    )
+    if args.use_word_tags:
         print("Tagged mode: idle-tagged words are ignored while searching for frames.", flush=True)
         if args.allow_fft_without_bfpexp:
             print("Tagged mode sync: FFT tags may start a frame even without a BFPEXP tag.", flush=True)
-        elif args.done_line is not None:
+        elif args.window_ready_line is not None:
             print(
-                "Tagged mode sync: startup can bootstrap from an in-flight FFT burst because DONE is configured.",
+                "Tagged mode sync: reading is gated by window_ready, so each SPI transaction should start at BFPEXP.",
                 flush=True,
             )
         else:
             print(
                 "Tagged mode sync: waiting for BFPEXP before FFT frame start; "
-                "if startup attaches mid-stream, use --done-line or --allow-fft-without-bfpexp.",
+                "if startup attaches without window_ready wiring, use --allow-fft-without-bfpexp.",
                 flush=True,
             )
     print(
@@ -1073,6 +1086,8 @@ def main() -> int:
         f"history_fft={buffers['history_fft'].maxlen or 0}",
         flush=True,
     )
+    if args.window_ready_line is not None:
+        print(f"window_ready GPIO line: {args.window_ready_line}", flush=True)
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)

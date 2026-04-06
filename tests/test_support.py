@@ -40,6 +40,26 @@ class FakeProcess:
         self.returncode = -9
 
 
+class FakeSPI:
+    def __init__(self, data: bytes):
+        self._data = data
+        self._offset = 0
+        self.closed = False
+
+    def xfer2(self, tx_data):
+        rx = []
+        for _ in tx_data:
+            if self._offset < len(self._data):
+                rx.append(self._data[self._offset])
+                self._offset += 1
+            else:
+                rx.append(0)
+        return rx
+
+    def close(self):
+        self.closed = True
+
+
 def pack_raw_pairs(pairs):
     return np.asarray(list(pairs), dtype=np.int32).reshape(-1, 2).tobytes()
 

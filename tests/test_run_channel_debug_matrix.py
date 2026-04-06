@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = TEST_ROOT / "rpi3b_i2s_fft" / "run_channel_debug_matrix.sh"
+SCRIPT_PATH = TEST_ROOT / "rpi3b_spi_fft" / "run_channel_debug_matrix.sh"
 
 
 class RunChannelDebugMatrixScriptTests(unittest.TestCase):
