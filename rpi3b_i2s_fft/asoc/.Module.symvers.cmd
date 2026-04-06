@@ -1,0 +1,1 @@
+savedcmd_/home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/Module.symvers -T /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/modules.order -i Module.symvers -e 

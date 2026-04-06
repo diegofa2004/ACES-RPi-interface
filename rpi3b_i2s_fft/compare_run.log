@@ -1,0 +1,48 @@
+Starting: /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/alsa_logger --device hw:2,0 --rate 48828 --mode raw --read-frames 2048 --period-frames 512 --buffer-frames 8192 --queue-chunks 512 --stats-interval-ms 0 --pipe-size-bytes 1048576
+Using ALSA capture device: hw:2,0
+Reading FPGA FFT stream from I2S...
+Sync preset: strict
+Tagged mode: idle-tagged words are ignored before a frame, and a new burst normally starts after 128 consecutive BFPEXP-tagged pairs.
+Tagged mode robustness: allowing up to 3 corrupted/missing pairs inside each BFPEXP preamble and FFT frame.
+Tagged mode sync: waiting for 128 BFPEXP pairs before FFT frame start; if startup attaches mid-stream, use --done-line or --allow-fft-without-bfpexp.
+Buffer sizes: pre_mfcc=477 history_mfcc=1431 pre_fft=477 history_fft=1431
+Press ENTER to save an event like the pyserial flow.
+External record trigger file: /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/record_button.trigger
+Comparison starts after a reference event is saved and the 15 s cooldown ends.
+Press Ctrl+C to stop.
+Captura ALSA iniciada: device=hw:2,0 rate=48828 read_frames=2048 period=512 buffer=8192 queue_chunks=512 mode=raw
+evento atualizado!
+bloco usado: 10:20 tamanho=10
+score=0.000 rel=0.000 base=0.000 mfcc=0.000 fft=0.000 fluxo=0.000 env=0.000 janelas=4 proc_ms=88.8
+score=0.000 rel=0.000 base=0.000 mfcc=0.000 fft=0.000 fluxo=0.000 env=0.000 janelas=10 proc_ms=89.5
+score=0.000 rel=0.000 base=0.000 mfcc=0.000 fft=0.000 fluxo=0.000 env=0.000 janelas=14 proc_ms=107.9
+score=0.203 rel=0.203 base=0.000 mfcc=1.000 fft=0.151 fluxo=0.096 env=0.068 janelas=21 proc_ms=115.9
+score=0.347 rel=0.347 base=0.000 mfcc=1.000 fft=0.192 fluxo=0.040 env=0.790 janelas=27 proc_ms=146.3
+score=0.404 rel=0.404 base=0.000 mfcc=1.000 fft=0.308 fluxo=0.076 env=0.790 janelas=33 proc_ms=122.7
+score=0.368 rel=0.368 base=0.000 mfcc=1.000 fft=0.226 fluxo=0.066 env=0.790 janelas=39 proc_ms=153.2
+score=0.301 rel=0.301 base=0.000 mfcc=1.000 fft=0.098 fluxo=0.014 env=0.790 janelas=46 proc_ms=136.0
+score=0.284 rel=0.284 base=0.000 mfcc=1.000 fft=0.059 fluxo=0.010 env=0.790 janelas=54 proc_ms=225.6
+score=0.287 rel=0.008 base=0.285 mfcc=1.000 fft=0.055 fluxo=0.023 env=0.790 janelas=62 proc_ms=243.2
+score=0.285 rel=0.000 base=0.285 mfcc=1.000 fft=0.041 fluxo=0.035 env=0.790 janelas=71 proc_ms=278.6
+score=0.287 rel=0.011 base=0.286 mfcc=1.000 fft=0.495 fluxo=-0.003 env=-0.048 janelas=79 proc_ms=265.8
+score=0.292 rel=0.038 base=0.287 mfcc=1.000 fft=0.503 fluxo=0.000 env=-0.048 janelas=88 proc_ms=316.5
+score=0.308 rel=0.159 base=0.287 mfcc=1.000 fft=0.526 fluxo=0.024 env=-0.048 janelas=98 proc_ms=395.7
+score=0.331 rel=0.336 base=0.287 mfcc=1.000 fft=0.567 fluxo=0.046 env=-0.048 janelas=108 proc_ms=364.2
+score=0.393 rel=0.789 base=0.290 mfcc=0.999 fft=0.425 fluxo=0.009 env=0.604 janelas=121 proc_ms=395.6
+score=0.436 rel=1.076 base=0.292 mfcc=0.999 fft=0.509 fluxo=0.039 env=0.604 janelas=131 proc_ms=416.2
+score=0.424 rel=0.939 base=0.297 mfcc=0.999 fft=0.478 fluxo=0.040 env=0.604 janelas=143 proc_ms=486.0
+score=0.446 rel=1.051 base=0.301 mfcc=1.000 fft=0.535 fluxo=0.339 env=0.151 janelas=156 proc_ms=478.6
+score=0.441 rel=0.989 base=0.305 mfcc=1.000 fft=0.524 fluxo=0.339 env=0.151 janelas=168 proc_ms=492.3
+score=0.451 rel=1.027 base=0.308 mfcc=1.000 fft=0.539 fluxo=0.351 env=0.151 janelas=181 proc_ms=520.2
+score=0.469 rel=1.065 base=0.320 mfcc=1.000 fft=0.575 fluxo=0.364 env=0.151 janelas=194 proc_ms=567.8
+score=0.457 rel=0.893 base=0.331 mfcc=1.000 fft=0.550 fluxo=0.356 env=0.151 janelas=210 proc_ms=578.7
+score=0.458 rel=0.848 base=0.339 mfcc=1.000 fft=0.555 fluxo=0.354 env=0.151 janelas=225 proc_ms=596.2
+score=0.457 rel=0.783 base=0.347 mfcc=1.000 fft=0.553 fluxo=0.350 env=0.151 janelas=239 proc_ms=618.3
+score=0.466 rel=0.775 base=0.357 mfcc=1.000 fft=0.580 fluxo=0.347 env=0.151 janelas=254 proc_ms=640.3
+score=0.464 rel=0.683 base=0.368 mfcc=1.000 fft=0.577 fluxo=0.342 env=0.151 janelas=269 proc_ms=678.6
+score=0.465 rel=0.605 base=0.381 mfcc=1.000 fft=0.583 fluxo=0.340 env=0.151 janelas=280 proc_ms=735.1
+score=0.463 rel=0.500 base=0.393 mfcc=1.000 fft=0.582 fluxo=0.333 env=0.151 janelas=292 proc_ms=697.4
+score=0.463 rel=0.462 base=0.399 mfcc=1.000 fft=0.583 fluxo=0.331 env=0.151 janelas=304 proc_ms=751.8
+score=0.462 rel=0.389 base=0.414 mfcc=1.000 fft=0.581 fluxo=0.332 env=0.151 janelas=317 proc_ms=740.2
+score=0.468 rel=0.364 base=0.430 mfcc=1.000 fft=0.591 fluxo=0.338 env=0.151 janelas=329 proc_ms=735.2
+score=0.471 rel=0.406 base=0.439 mfcc=1.000 fft=0.595 fluxo=0.342 env=0.151 janelas=341 proc_ms=816.1

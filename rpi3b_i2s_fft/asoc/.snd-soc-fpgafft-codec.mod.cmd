@@ -1,0 +1,1 @@
+savedcmd_/home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/snd-soc-fpgafft-codec.mod := printf '%s\n'   snd-soc-fpgafft-codec.o | awk '!x[$$0]++ { print("/home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/"$$0) }' > /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/asoc/snd-soc-fpgafft-codec.mod

@@ -1,0 +1,15 @@
+Starting: /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/alsa_logger --device hw:2,0 --rate 48828 --mode raw --read-frames 2048 --period-frames 512 --buffer-frames 8192 --queue-chunks 512 --stats-interval-ms 0 --pipe-size-bytes 1048576
+Using ALSA capture device: hw:2,0
+Reading FPGA FFT stream from I2S...
+Sync preset: strict
+Tagged mode: idle-tagged words are ignored before a frame, and a new burst normally starts after 128 consecutive BFPEXP-tagged pairs.
+Tagged mode robustness: allowing up to 3 corrupted/missing pairs inside each BFPEXP preamble and FFT frame.
+Tagged mode sync: waiting for 128 BFPEXP pairs before FFT frame start; if startup attaches mid-stream, use --done-line or --allow-fft-without-bfpexp.
+Buffer sizes: pre_mfcc=477 history_mfcc=1431 pre_fft=477 history_fft=1431
+Press ENTER to save an event like the pyserial flow.
+External record trigger file: /home/polisat/Desktop/other/ACES-RPi-interface/rpi3b_i2s_fft/record_button.trigger
+Comparison starts after a reference event is saved and the 15 s cooldown ends.
+Press Ctrl+C to stop.
+Captura ALSA iniciada: device=hw:2,0 rate=48828 read_frames=2048 period=512 buffer=8192 queue_chunks=512 mode=raw
+Gravando evento com pre-buffer de 5 s... fonte=gpio_button
+evento de 10s salvo
