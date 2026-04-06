@@ -116,9 +116,149 @@ class FPGAFFTReceiverTests(unittest.TestCase):
                     (0, 0, 0),
                     (0, 0, 0),
                     (1, 7, 7),
-                    (0, 0, 0),
                     (2, 3, 4),
                     (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_can_require_full_bfpexp_preamble(self):
+        strict_cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            bfpexp_pairs_required=3,
+            handshake_timeout_seconds=0.01,
+        )
+        strict_rx = FPGAFFTReceiver(strict_cfg)
+        strict_rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (0, 0, 0),
+                    (1, 9, 9),
+                    (1, 9, 9),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        self.assertIsNone(strict_rx.read_frame())
+
+        valid_rx = FPGAFFTReceiver(strict_cfg)
+        valid_rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (0, 0, 0),
+                    (1, 9, 9),
+                    (1, 9, 9),
+                    (1, 9, 9),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = valid_rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_resets_partial_bfpexp_run_when_idle_breaks_preamble(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            bfpexp_pairs_required=3,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (0, 0, 0),
+                    (1, 9, 9),
+                    (1, 9, 9),
+                    (0, 0, 0),
+                    (1, 5, 5),
+                    (1, 5, 5),
+                    (1, 5, 5),
+                    (2, 3, 4),
+                    (2, 5, 12),
+                    (2, -8, 15),
+                    (2, 7, -24),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_tolerates_loss_inside_preamble_and_fft_frame(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            bfpexp_pairs_required=2,
+            loss_tolerance_pairs=1,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        mismatch_stream = np.asarray(
+            [
+                [pack_tagged_word(1, 9), pack_tagged_word(1, 9)],
+                [pack_tagged_word(0, 0), pack_tagged_word(0, 0)],  # tolerated loss inside BFPEXP preamble
+                [pack_tagged_word(2, 3), pack_tagged_word(2, 4)],
+                [pack_tagged_word(2, 0), pack_tagged_word(1, 1)],  # tolerated tag mismatch inside FFT frame
+                [pack_tagged_word(2, -8), pack_tagged_word(2, 15)],
+                [pack_tagged_word(2, 7), pack_tagged_word(2, -24)],
+                [pack_tagged_word(2, 11), pack_tagged_word(2, 5)],
+                [pack_tagged_word(2, -3), pack_tagged_word(2, 6)],
+            ],
+            dtype=np.int32,
+        ).tobytes()
+        rx._proc = FakeProcess(mismatch_stream)
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 0.0, 17.0, 25.0], dtype=np.float32))
+
+    def test_tagged_mode_ignores_idle_padding_inside_fft_frame(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            bfpexp_pairs_required=1,
+            loss_tolerance_pairs=0,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (1, 9, 9),
+                    (2, 3, 4),
+                    (0, 0, 0),
+                    (2, 5, 12),
+                    (0, 0, 0),
                     (2, -8, 15),
                     (2, 7, -24),
                 ]

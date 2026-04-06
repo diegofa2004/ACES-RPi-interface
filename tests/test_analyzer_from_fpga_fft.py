@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -16,6 +17,60 @@ from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_wo
 
 
 class AnalyzerFromFPGAFFTTests(unittest.TestCase):
+    def test_resolve_sync_cli_defaults_prefers_strict_defaults(self):
+        args = SimpleNamespace(
+            sync_mode=None,
+            sync_preset="strict",
+            use_i2s_tags=None,
+            bfpexp_hold_pairs=None,
+            loss_tolerance_pairs=None,
+            allow_fft_without_bfpexp=None,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "strict")
+        self.assertTrue(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertEqual(resolved["loss_tolerance_pairs"], analyzer_from_fpga_fft.DEFAULT_TAG_LOSS_TOLERANCE_PAIRS)
+        self.assertFalse(resolved["allow_fft_without_bfpexp"])
+
+    def test_resolve_sync_cli_defaults_prefers_tolerant_defaults(self):
+        args = SimpleNamespace(
+            sync_mode=None,
+            sync_preset="tolerant",
+            use_i2s_tags=None,
+            bfpexp_hold_pairs=None,
+            loss_tolerance_pairs=None,
+            allow_fft_without_bfpexp=None,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "tolerant")
+        self.assertTrue(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], analyzer_from_fpga_fft.DEFAULT_BFPEXP_HOLD_PAIRS)
+        self.assertEqual(resolved["loss_tolerance_pairs"], analyzer_from_fpga_fft.DEFAULT_TAG_LOSS_TOLERANCE_PAIRS)
+        self.assertTrue(resolved["allow_fft_without_bfpexp"])
+
+    def test_resolve_sync_cli_defaults_respects_explicit_overrides(self):
+        args = SimpleNamespace(
+            sync_mode="tolerant",
+            sync_preset=None,
+            use_i2s_tags=False,
+            bfpexp_hold_pairs=64,
+            loss_tolerance_pairs=5,
+            allow_fft_without_bfpexp=False,
+        )
+
+        resolved = analyzer_from_fpga_fft._resolve_sync_cli_defaults(args)
+
+        self.assertEqual(resolved["sync_mode"], "tolerant")
+        self.assertFalse(resolved["use_i2s_tags"])
+        self.assertEqual(resolved["bfpexp_hold_pairs"], 64)
+        self.assertEqual(resolved["loss_tolerance_pairs"], 5)
+        self.assertFalse(resolved["allow_fft_without_bfpexp"])
+
     def test_process_channel_debug_chunk_reports_kinds_and_fft_runs(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_word_tags=True)
         pairs = np.frombuffer(
@@ -189,7 +244,7 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(payloads[3]["top_fft_run_lengths"], [2])
 
     def test_frames_for_seconds_rounds_up(self):
-        self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(48000, 512, 5.0), 469)
+        self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(DEFAULT_CAPTURE_RATE_HZ, 512, 5.0), 477)
 
     def test_arm_recording_only_arms_once(self):
         buffers = analyzer_from_fpga_fft.create_analysis_buffers(8, 2, prebuffer_seconds=1.0, history_seconds=2.0)
@@ -238,6 +293,27 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(fft.shape, (4, 4))
         np.testing.assert_array_equal(evento[0], np.arange(8))
         np.testing.assert_array_equal(evento[-1], np.arange(8) + 30)
+
+    def test_ingest_frame_trims_buffers_by_wall_clock(self):
+        buffers = analyzer_from_fpga_fft.create_analysis_buffers(
+            sample_rate=48828,
+            frame_bins=512,
+            prebuffer_seconds=1.0,
+            history_seconds=2.0,
+        )
+        state = analyzer_from_fpga_fft.create_runtime_state()
+
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8), np.arange(4), 0.0)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 10, np.arange(4) + 10, 0.8)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 20, np.arange(4) + 20, 1.6)
+        analyzer_from_fpga_fft.ingest_frame(buffers, state, np.arange(8) + 30, np.arange(4) + 30, 2.4)
+
+        self.assertEqual(len(buffers["pre_mfcc"]), 2)
+        self.assertEqual(len(buffers["pre_fft"]), 2)
+        self.assertEqual(len(buffers["history_mfcc"]), 3)
+        self.assertEqual(len(buffers["history_fft"]), 3)
+        np.testing.assert_array_equal(buffers["pre_mfcc"][0], np.arange(8) + 20)
+        np.testing.assert_array_equal(buffers["history_fft"][0], np.arange(4) + 10)
 
 
 if __name__ == "__main__":

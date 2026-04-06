@@ -1,6 +1,6 @@
+import importlib
 import sys
 import unittest
-import importlib
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +14,21 @@ comparar_evento_module = importlib.import_module("rpi3b_spi_fft.compararEvento")
 
 class CompararEventoHelperTests(unittest.TestCase):
     @staticmethod
-    def _make_fft_event(peak_band: int, *, background: float, peak_gain: float) -> np.ndarray:
-        frames = 16
+    def _make_fft_pattern(
+        peak_band: int,
+        *,
+        total_frames: int = 40,
+        active_start: int = 10,
+        active_stop: int = 26,
+        background: float = 0.5,
+        peak_gain: float = 16.0,
+    ) -> np.ndarray:
+        fft = np.full((total_frames, 256), background, dtype=np.float32)
         bins_per_band = 8
-        fft = np.full((frames, 256), background, dtype=np.float32)
-        profile = np.asarray([0, 0, 1, 4, 8, 12, 8, 4, 1, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        envelope = np.asarray([0, 0, 1, 3, 6, 9, 12, 14, 12, 9, 6, 3, 1, 0, 0, 0], dtype=np.float32)
         start = peak_band * bins_per_band
         stop = start + bins_per_band
-        fft[:, start:stop] += (profile[:, None] * np.float32(peak_gain))
+        fft[active_start:active_stop, start:stop] += envelope[:, None] * np.float32(peak_gain)
         return fft
 
     def test_window_mean_helpers_match_naive_reference(self):
@@ -37,72 +44,76 @@ class CompararEventoHelperTests(unittest.TestCase):
             np.asarray([[1.5, 15.0], [2.5, 25.0], [3.5, 35.0]], dtype=np.float32),
         )
 
-    def test_melhor_bloco_continuo_tracks_high_energy_region(self):
-        energia = np.zeros(40, dtype=np.float32)
-        energia[12:20] = np.asarray([2, 4, 6, 8, 8, 6, 4, 2], dtype=np.float32)
-        i0, i1 = comparar_evento_module._melhor_bloco_continuo(energia, min_frac=0.2, max_frac=0.4)
-        self.assertGreaterEqual(i0, 12)
-        self.assertLessEqual(i1, 20)
-
     def test_agrupar_bandas_fft_reduces_256_bins_to_32_band_means(self):
         fft = np.tile(np.arange(256, dtype=np.float32), (2, 1))
         band_means = comparar_evento_module._agrupar_bandas_fft(fft)
 
         esperado = np.asarray(
-            [np.mean(np.arange(idx * 8, (idx + 1) * 8), dtype=np.float32) for idx in range(32)],
+            [np.mean(np.log1p(np.arange(idx * 8, (idx + 1) * 8)), dtype=np.float32) for idx in range(32)],
             dtype=np.float32,
         )
         self.assertEqual(band_means.shape, (2, 32))
         np.testing.assert_allclose(band_means[0], esperado)
 
-    def test_suprime_ruido_estacionario_highlights_distinctive_band(self):
-        bands = np.asarray(
+    def test_build_reference_template_extracts_active_slice(self):
+        cfg = comparar_evento_module.DirectComparatorConfig(
+            min_reference_frames=8,
+            max_reference_frames=24,
+            reference_padding_frames=2,
+        )
+        fft = self._make_fft_pattern(peak_band=6)
+
+        template = comparar_evento_module.build_reference_template(fft, config=cfg)
+
+        self.assertGreaterEqual(template.start_frame, 8)
+        self.assertLessEqual(template.start_frame, 12)
+        self.assertGreaterEqual(template.stop_frame, 24)
+        self.assertLessEqual(template.stop_frame, 28)
+        self.assertGreaterEqual(template.frame_count, 8)
+        self.assertLessEqual(template.frame_count, 24)
+
+    def test_score_history_against_template_prefers_matching_signal(self):
+        cfg = comparar_evento_module.DirectComparatorConfig(
+            absolute_threshold=0.70,
+            max_search_frames=64,
+            max_reference_frames=24,
+        )
+        reference_fft = self._make_fft_pattern(peak_band=6)
+        template = comparar_evento_module.build_reference_template(reference_fft, config=cfg)
+
+        history_match = np.concatenate(
             [
-                [2.0, 2.0, 2.0, 2.0],
-                [2.0, 2.0, 6.0, 2.0],
-                [2.0, 2.0, 8.0, 2.0],
-                [2.0, 2.0, 6.0, 2.0],
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(peak_band=6, total_frames=32, active_start=8, active_stop=24, peak_gain=18.0),
             ],
-            dtype=np.float32,
+            axis=0,
+        )
+        history_distractor = np.concatenate(
+            [
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(peak_band=18, total_frames=32, active_start=8, active_stop=24, peak_gain=18.0),
+            ],
+            axis=0,
         )
 
-        filtered = comparar_evento_module._suprime_ruido_estacionario(bands, percentile=40.0)
-        np.testing.assert_allclose(filtered[:, 0], 0.0)
-        np.testing.assert_allclose(filtered[:, 1], 0.0)
-        np.testing.assert_allclose(filtered[:, 3], 0.0)
-        self.assertGreater(float(np.max(filtered[:, 2])), 0.0)
+        matching = comparar_evento_module.score_history_against_template(history_match, template, config=cfg)
+        distractor = comparar_evento_module.score_history_against_template(history_distractor, template, config=cfg)
 
-    def test_noise_robust_signatures_prefer_matching_event_over_stationary_noise(self):
-        ref_fft = self._make_fft_event(peak_band=6, background=1.0, peak_gain=3.0)
-        candidate_fft = self._make_fft_event(peak_band=6, background=7.0, peak_gain=3.0)
-        distractor_fft = self._make_fft_event(peak_band=18, background=7.0, peak_gain=3.0)
+        self.assertGreater(matching.score, 0.70)
+        self.assertGreater(matching.score, distractor.score + 0.20)
+        self.assertGreater(matching.spectral_score, distractor.spectral_score)
+        self.assertGreater(matching.valid_windows, 0)
 
-        ref_prepared = comparar_evento_module._prepara_fft(ref_fft)
-        ref_fft_signature, ref_weights = comparar_evento_module._assinatura_fft(ref_prepared)
-        ref_flux_signature = comparar_evento_module._assinatura_fluxo(ref_prepared)
+    def test_score_history_against_template_rejects_low_energy_tail(self):
+        cfg = comparar_evento_module.DirectComparatorConfig(min_energy_ratio=0.50)
+        reference_fft = self._make_fft_pattern(peak_band=4, peak_gain=20.0)
+        template = comparar_evento_module.build_reference_template(reference_fft, config=cfg)
+        silence = np.full((64, 256), 0.05, dtype=np.float32)
 
-        def best_similarity(fft_frames: np.ndarray) -> float:
-            prepared = comparar_evento_module._prepara_fft(fft_frames)
-            bands = comparar_evento_module._prepara_fft_bandas(prepared)
-            fft_windows = comparar_evento_module._window_mean_2d(bands, ref_fft.shape[0], 1)
-            flux = comparar_evento_module._fluxo_espectral_bandas(bands)
-            flux_windows = comparar_evento_module._window_mean_2d(flux, ref_fft.shape[0] - 1, 1)
+        result = comparar_evento_module.score_history_against_template(silence, template, config=cfg)
 
-            s_fft = comparar_evento_module._cosine_batch_weighted(
-                comparar_evento_module._zscore_rows(fft_windows),
-                ref_fft_signature,
-                ref_weights,
-            )
-            s_flux = comparar_evento_module._cosine_batch(
-                comparar_evento_module._zscore_rows(flux_windows),
-                ref_flux_signature,
-            )
-            return float(np.max((0.6 * s_fft) + (0.4 * s_flux)))
-
-        matching_score = best_similarity(candidate_fft)
-        distractor_score = best_similarity(distractor_fft)
-
-        self.assertGreater(matching_score, distractor_score + 0.20)
+        self.assertEqual(result.valid_windows, 0)
+        self.assertLess(result.score, 0.05)
 
 
 if __name__ == "__main__":

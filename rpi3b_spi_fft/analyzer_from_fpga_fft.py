@@ -56,14 +56,16 @@ def create_analysis_buffers(
     *,
     prebuffer_seconds: float = PREBUFFER_SECONDS,
     history_seconds: float = HISTORY_SECONDS,
-) -> dict[str, deque]:
-    buffer_size = frames_for_seconds(sample_rate, frame_bins, prebuffer_seconds)
-    history_size = frames_for_seconds(sample_rate, frame_bins, history_seconds)
+) -> dict[str, object]:
     return {
-        "pre_mfcc": deque(maxlen=buffer_size),
-        "history_mfcc": deque(maxlen=history_size),
-        "pre_fft": deque(maxlen=buffer_size),
-        "history_fft": deque(maxlen=history_size),
+        "pre_mfcc": deque(),
+        "history_mfcc": deque(),
+        "pre_fft": deque(),
+        "history_fft": deque(),
+        "pre_times": deque(),
+        "history_times": deque(),
+        "pre_window_seconds": float(prebuffer_seconds),
+        "history_window_seconds": float(history_seconds),
     }
 
 
@@ -79,7 +81,7 @@ def create_runtime_state() -> dict[str, object]:
     }
 
 
-def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[str, deque]] = None) -> bool:
+def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[str, object]] = None) -> bool:
     if bool(state["recording"]):
         return False
 
@@ -93,7 +95,7 @@ def arm_recording(state: dict[str, object], now: float, buffers: Optional[dict[s
 
 
 def ingest_frame(
-    buffers: dict[str, deque],
+    buffers: dict[str, object],
     state: dict[str, object],
     mfcc: np.ndarray,
     fft_bins: np.ndarray,
@@ -108,6 +110,23 @@ def ingest_frame(
     buffers["history_mfcc"].append(mfcc8.copy())
     buffers["pre_fft"].append(fft_frame.copy())
     buffers["history_fft"].append(fft_frame.copy())
+    buffers["pre_times"].append(float(now))
+    buffers["history_times"].append(float(now))
+
+    _trim_timed_buffer(
+        buffers["pre_mfcc"],
+        buffers["pre_fft"],
+        buffers["pre_times"],
+        now,
+        float(buffers["pre_window_seconds"]),
+    )
+    _trim_timed_buffer(
+        buffers["history_mfcc"],
+        buffers["history_fft"],
+        buffers["history_times"],
+        now,
+        float(buffers["history_window_seconds"]),
+    )
 
     if not bool(state["recording"]):
         return None
@@ -134,6 +153,20 @@ def ingest_frame(
     state["last_event_time"] = now
     state["recording"] = False
     return evento, fft
+
+
+def _trim_timed_buffer(
+    mfcc_buffer: deque,
+    fft_buffer: deque,
+    time_buffer: deque,
+    now: float,
+    window_seconds: float,
+) -> None:
+    cutoff = float(now) - max(0.0, float(window_seconds))
+    while time_buffer and float(time_buffer[0]) < cutoff:
+        time_buffer.popleft()
+        mfcc_buffer.popleft()
+        fft_buffer.popleft()
 
 
 def _u32_hex(word: int) -> str:
@@ -797,6 +830,47 @@ def run_channel_debug_replay(
     return 0
 
 
+def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
+    preset = getattr(args, "sync_mode", None) or getattr(args, "sync_preset", None)
+
+    if args.use_i2s_tags is not None:
+        use_i2s_tags = args.use_i2s_tags
+    else:
+        use_i2s_tags = True
+
+    if args.bfpexp_hold_pairs is not None:
+        bfpexp_hold_pairs = args.bfpexp_hold_pairs
+    else:
+        bfpexp_hold_pairs = DEFAULT_BFPEXP_HOLD_PAIRS
+
+    if args.loss_tolerance_pairs is not None:
+        loss_tolerance_pairs = args.loss_tolerance_pairs
+    else:
+        loss_tolerance_pairs = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
+
+    if args.allow_fft_without_bfpexp is not None:
+        allow_fft_without_bfpexp = args.allow_fft_without_bfpexp
+    else:
+        allow_fft_without_bfpexp = preset == "tolerant"
+
+    if preset == "strict":
+        sync_mode = "strict"
+    elif preset == "tolerant":
+        sync_mode = "tolerant"
+    elif allow_fft_without_bfpexp:
+        sync_mode = "tolerant"
+    else:
+        sync_mode = "strict"
+
+    return {
+        "sync_mode": sync_mode,
+        "use_i2s_tags": use_i2s_tags,
+        "bfpexp_hold_pairs": bfpexp_hold_pairs,
+        "loss_tolerance_pairs": loss_tolerance_pairs,
+        "allow_fft_without_bfpexp": allow_fft_without_bfpexp,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Feed circular buffers from the FPGA SPI FFT stream using the same event logic as pyserial."
@@ -822,6 +896,8 @@ def main() -> int:
         default=DEFAULT_SPI_MODE,
         help="SPI mode used by the Raspberry Pi master",
     )
+    parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
+    parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
     parser.add_argument(
         "--bfpexp-hold-frames",
         type=int,
@@ -854,8 +930,27 @@ def main() -> int:
     parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
     parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
     parser.add_argument(
+        "--apply-bfpexp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply the FFT block-floating exponent before computing magnitudes (default: enabled)",
+    )
+    parser.add_argument(
+        "--bfpexp-hold-pairs",
+        type=int,
+        default=None,
+        help="Required consecutive BFPEXP-tagged stereo pairs before a new FFT burst is accepted",
+    )
+    parser.add_argument(
+        "--loss-tolerance-pairs",
+        type=int,
+        default=None,
+        help="Tolerated corrupted/missing tagged stereo pairs per BFPEXP preamble or FFT burst",
+    )
+    parser.add_argument(
         "--allow-fft-without-bfpexp",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
     )
     parser.add_argument(
@@ -896,6 +991,42 @@ def main() -> int:
         default=DEFAULT_DEBUG_PREVIEW_PAIRS,
         help="Number of raw pairs previewed inside each JSONL debug chunk",
     )
+    parser.add_argument(
+        "--compare-threshold",
+        type=float,
+        default=DirectComparatorConfig.absolute_threshold,
+        help="Absolute similarity threshold for the direct FFT comparator",
+    )
+    parser.add_argument(
+        "--compare-margin",
+        type=float,
+        default=DirectComparatorConfig.margin_threshold,
+        help="Minimum score margin above the recent baseline for the direct comparator",
+    )
+    parser.add_argument(
+        "--compare-poll-ms",
+        type=float,
+        default=DirectComparatorConfig.poll_interval_seconds * 1000.0,
+        help="Polling interval of the direct comparator in milliseconds",
+    )
+    parser.add_argument(
+        "--compare-min-energy-ratio",
+        type=float,
+        default=DirectComparatorConfig.min_energy_ratio,
+        help="Minimum energy ratio accepted for candidate windows",
+    )
+    parser.add_argument(
+        "--compare-max-reference-frames",
+        type=int,
+        default=DirectComparatorConfig.max_reference_frames,
+        help="Maximum number of FFT frames kept from the recorded reference event",
+    )
+    parser.add_argument(
+        "--compare-search-frames",
+        type=int,
+        default=DirectComparatorConfig.max_search_frames,
+        help="Maximum number of recent FFT frames searched for a match",
+    )
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -912,12 +1043,36 @@ def main() -> int:
         parser.error("--bfpexp-hold-frames must be positive")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    sync_cfg = _resolve_sync_cli_defaults(args)
+    use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
+    bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
+    loss_tolerance_pairs = int(sync_cfg["loss_tolerance_pairs"])
+    allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
+    apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
+    sync_mode = str(sync_cfg["sync_mode"])
+
+    if bfpexp_hold_pairs <= 0:
+        parser.error("--bfpexp-hold-pairs must be positive")
+    if loss_tolerance_pairs < 0:
+        parser.error("--loss-tolerance-pairs must be non-negative")
     if args.debug_capture_seconds <= 0:
         parser.error("--debug-capture-seconds must be positive")
     if args.debug_chunk_pairs <= 0:
         parser.error("--debug-chunk-pairs must be positive")
     if args.debug_preview_pairs < 0:
         parser.error("--debug-preview-pairs must be non-negative")
+    if not 0.0 < args.compare_threshold <= 1.0:
+        parser.error("--compare-threshold must satisfy 0 < compare-threshold <= 1")
+    if args.compare_margin < 0.0:
+        parser.error("--compare-margin must be non-negative")
+    if args.compare_poll_ms <= 0.0:
+        parser.error("--compare-poll-ms must be positive")
+    if args.compare_min_energy_ratio <= 0.0:
+        parser.error("--compare-min-energy-ratio must be positive")
+    if args.compare_max_reference_frames <= 0:
+        parser.error("--compare-max-reference-frames must be positive")
+    if args.compare_search_frames <= 0:
+        parser.error("--compare-search-frames must be positive")
     if args.debug_replay_raw and not args.debug_channel_log:
         parser.error("--debug-replay-raw requires --debug-channel-log")
     if args.debug_raw_capture and args.debug_replay_raw:
@@ -963,7 +1118,10 @@ def main() -> int:
             tag_idle=args.tag_idle,
             tag_bfpexp=args.tag_bfpexp,
             tag_fft=args.tag_fft,
-            require_bfpexp_before_fft=not args.allow_fft_without_bfpexp,
+            apply_bfpexp=apply_bfpexp,
+            require_bfpexp_before_fft=not allow_fft_without_bfpexp,
+            bfpexp_pairs_required=bfpexp_hold_pairs,
+            loss_tolerance_pairs=loss_tolerance_pairs,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -1003,6 +1161,14 @@ def main() -> int:
     buffers = create_analysis_buffers(args.rate, args.frame_bins)
     lock = threading.Lock()
     state = create_runtime_state()
+    compare_config = DirectComparatorConfig(
+        absolute_threshold=args.compare_threshold,
+        margin_threshold=args.compare_margin,
+        poll_interval_seconds=args.compare_poll_ms / 1000.0,
+        min_energy_ratio=args.compare_min_energy_ratio,
+        max_reference_frames=args.compare_max_reference_frames,
+        max_search_frames=args.compare_search_frames,
+    )
 
     def trigger_recording(source: str) -> bool:
         with lock:
@@ -1050,7 +1216,7 @@ def main() -> int:
     threading.Thread(target=watch_record_trigger, daemon=True).start()
     threading.Thread(
         target=compararEvento,
-        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"]),
+        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"], compare_config),
         daemon=True,
     ).start()
 
@@ -1079,11 +1245,10 @@ def main() -> int:
                 flush=True,
             )
     print(
-        "Buffer sizes:",
-        f"pre_mfcc={pre_size}",
-        f"history_mfcc={history_size}",
-        f"pre_fft={buffers['pre_fft'].maxlen or 0}",
-        f"history_fft={buffers['history_fft'].maxlen or 0}",
+        "Buffer windows:",
+        f"pre={pre_window_seconds:.2f}s",
+        f"history={history_window_seconds:.2f}s",
+        "trimmed_by=wall_clock",
         flush=True,
     )
     if args.window_ready_line is not None:
@@ -1091,6 +1256,14 @@ def main() -> int:
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)
+    print(
+        "Direct comparator:",
+        f"threshold={compare_config.absolute_threshold:.3f}",
+        f"margin={compare_config.margin_threshold:.3f}",
+        f"search_frames={compare_config.max_search_frames}",
+        f"ref_frames_max={compare_config.max_reference_frames}",
+        flush=True,
+    )
     print("Press Ctrl+C to stop.", flush=True)
 
     try:
