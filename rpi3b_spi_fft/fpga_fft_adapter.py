@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - optional dependency on target device
     gpiod = None
 
 
-DEFAULT_BFPEXP_HOLD_PAIRS = 128
+DEFAULT_BFPEXP_HOLD_PAIRS = 1
 DEFAULT_TAG_LOSS_TOLERANCE_PAIRS = 3
 
 
@@ -55,18 +55,21 @@ class FFTAdapterConfig:
     handshake_timeout_seconds: float = 1.0
     bfpexp_hold_frames: int = 1
     use_word_tags: bool = True
+    use_i2s_tags: Optional[bool] = None
     tag_shift: int = 30
     tag_mask: int = 0x3
     payload_bits: int = 18
     tag_idle: int = 0
     tag_bfpexp: int = 1
     tag_fft: int = 2
-    apply_bfpexp: bool = True
+    apply_bfpexp: bool = False
     require_bfpexp_before_fft: bool = True
     bfpexp_pairs_required: int = DEFAULT_BFPEXP_HOLD_PAIRS
     loss_tolerance_pairs: int = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
 
     def __post_init__(self) -> None:
+        if self.use_i2s_tags is not None:
+            self.use_word_tags = bool(self.use_i2s_tags)
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if self.frame_bins <= 0:
@@ -96,10 +99,50 @@ class FFTAdapterConfig:
             raise ValueError("payload_bits must not overlap the tag field when tags are enabled")
 
 
+class TaggedI2SRealigner:
+    """Compatibility shim for the retired tagged-I2S byte realignment step.
+
+    The SPI transport already preserves 32-bit word boundaries, so the current
+    path only needs a stable pass-through object with the same interface.
+    """
+
+    def __init__(
+        self,
+        *,
+        tag_shift: int,
+        tag_mask: int,
+        payload_bits: int,
+        tag_idle: int,
+        tag_bfpexp: int,
+        tag_fft: int,
+        confirm_pairs: int,
+        validate_pairs: int,
+        preferred_swap_channels: bool,
+    ) -> None:
+        self.tag_shift = int(tag_shift)
+        self.tag_mask = int(tag_mask)
+        self.payload_bits = int(payload_bits)
+        self.tag_idle = int(tag_idle)
+        self.tag_bfpexp = int(tag_bfpexp)
+        self.tag_fft = int(tag_fft)
+        self.confirm_pairs = int(confirm_pairs)
+        self.validate_pairs = int(validate_pairs)
+        self.preferred_swap_channels = bool(preferred_swap_channels)
+
+    def push_pairs(self, pairs: np.ndarray) -> np.ndarray:
+        if pairs.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        return np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+
+    def reset(self) -> None:
+        return
+
+
 class FPGAFFTReceiver:
     def __init__(self, cfg: FFTAdapterConfig):
         self.cfg = cfg
         self._spi: Optional[Any] = None
+        self._proc: Optional[Any] = None
         self._bytes_per_pair = BYTES_PER_FFT_PAIR
         self._transaction_pairs = (
             self.cfg.frame_bins + self.cfg.bfpexp_hold_frames
@@ -237,13 +280,19 @@ class FPGAFFTReceiver:
         return False
 
     def _capture_transaction(self) -> bool:
-        if self._spi is None:
-            return False
-
         if not self._wait_for_window_ready():
             return False
 
-        raw = transfer_exactly(self._spi, self._transaction_bytes)
+        if self._spi is not None:
+            raw = transfer_exactly(self._spi, self._transaction_bytes)
+        elif self._proc is not None:
+            read = getattr(getattr(self._proc, "stdout", None), "read", None)
+            if not callable(read):
+                return False
+            raw = read(self._transaction_bytes)
+        else:
+            return False
+
         if not raw:
             return False
         self._byte_buffer.extend(raw)
@@ -299,7 +348,7 @@ class FPGAFFTReceiver:
         if pairs.size == 0:
             return
         pair_array = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
-        if self.cfg.use_i2s_tags:
+        if self.cfg.use_word_tags:
             if self._tagged_pair_buffer.size == 0:
                 self._tagged_pair_buffer = pair_array.copy()
             else:
@@ -323,6 +372,9 @@ class FPGAFFTReceiver:
 
     def _allow_tagged_fft_start_without_bfpexp(self) -> bool:
         return not self.cfg.require_bfpexp_before_fft
+
+    def _is_tolerable_loss_kind(self, kind: str) -> bool:
+        return kind in {"tag_mismatch", "unknown_tag"}
 
     def _read_frame_from_word_tags(self) -> Optional[np.ndarray]:
         deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
@@ -470,6 +522,7 @@ class FPGAFFTReceiver:
         if self._spi is not None:
             close_spi_device(self._spi)
             self._spi = None
+        self._proc = None
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
         self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
@@ -480,14 +533,15 @@ class FPGAFFTReceiver:
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if self.cfg.use_word_tags:
-            pairs = self._read_frame_from_word_tags()
-            if pairs is None:
+            tagged_frame = self._read_frame_from_word_tags()
+            if tagged_frame is None:
                 return None
             pairs, frame_bfpexp = tagged_frame
         else:
             pairs = self._pop_pairs(self.cfg.frame_bins, exact=True)
             if pairs is None:
                 return None
+            frame_bfpexp = 0
 
         if self.cfg.apply_bfpexp and frame_bfpexp != 0:
             real = np.ldexp(pairs[:, 0].astype(np.float32), frame_bfpexp)

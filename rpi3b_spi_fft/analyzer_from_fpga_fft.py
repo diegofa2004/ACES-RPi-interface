@@ -31,6 +31,7 @@ except ImportError:
 
 
 DEFAULT_SPI_DEVICE = os.environ.get("SPI_DEVICE") or AUTO_SPI_DEVICE
+DEFAULT_CAPTURE_RATE_HZ = 48_828
 WORK_DIR = Path(__file__).resolve().parent
 EVENTO_FILENAME = WORK_DIR / "evento.npy"
 FFT_FILENAME = WORK_DIR / "fft.npy"
@@ -841,7 +842,27 @@ def run_channel_debug_replay(
 
 
 def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
+    preset = getattr(args, "sync_mode", None) or getattr(args, "sync_preset", None)
+    use_i2s_tags = getattr(args, "use_i2s_tags", None)
+    if use_i2s_tags is None:
+        use_i2s_tags = True
+
+    allow_fft_without_bfpexp = getattr(args, "allow_fft_without_bfpexp", None)
+    if allow_fft_without_bfpexp is None:
+        allow_fft_without_bfpexp = preset == "tolerant"
+
+    if preset == "strict":
+        sync_mode = "strict"
+    elif preset == "tolerant":
+        sync_mode = "tolerant"
+    elif allow_fft_without_bfpexp:
+        sync_mode = "tolerant"
+    else:
+        sync_mode = "strict"
+
     return {
+        "sync_mode": sync_mode,
+        "use_i2s_tags": bool(use_i2s_tags),
         "bfpexp_hold_pairs": (
             args.bfpexp_hold_pairs
             if args.bfpexp_hold_pairs is not None
@@ -852,11 +873,7 @@ def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
             if args.loss_tolerance_pairs is not None
             else DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
         ),
-        "allow_fft_without_bfpexp": (
-            bool(args.allow_fft_without_bfpexp)
-            if args.allow_fft_without_bfpexp is not None
-            else False
-        ),
+        "allow_fft_without_bfpexp": bool(allow_fft_without_bfpexp),
     }
 
 
@@ -870,7 +887,7 @@ def main() -> int:
         default=DEFAULT_SPI_DEVICE,
         help="SPI device (default: $SPI_DEVICE if set, otherwise auto-detect)",
     )
-    parser.add_argument("-r", "--rate", type=int, default=48000, help="Sample rate")
+    parser.add_argument("-r", "--rate", type=int, default=DEFAULT_CAPTURE_RATE_HZ, help="Sample rate")
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
     parser.add_argument(
