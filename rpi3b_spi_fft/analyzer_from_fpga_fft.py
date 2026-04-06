@@ -11,12 +11,22 @@ from typing import Iterator, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from .compararEvento import compararEvento
-    from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from .compararEvento import DirectComparatorConfig, compararEvento
+    from .fpga_fft_adapter import (
+        DEFAULT_BFPEXP_HOLD_PAIRS,
+        DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        FFTAdapterConfig,
+        FPGAFFTReceiver,
+    )
     from .spi_stream import AUTO_SPI_DEVICE, DEFAULT_SPI_MAX_SPEED_HZ, DEFAULT_SPI_MODE, resolve_spi_device
 except ImportError:
-    from compararEvento import compararEvento
-    from fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+    from compararEvento import DirectComparatorConfig, compararEvento
+    from fpga_fft_adapter import (
+        DEFAULT_BFPEXP_HOLD_PAIRS,
+        DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        FFTAdapterConfig,
+        FPGAFFTReceiver,
+    )
     from spi_stream import AUTO_SPI_DEVICE, DEFAULT_SPI_MAX_SPEED_HZ, DEFAULT_SPI_MODE, resolve_spi_device
 
 
@@ -831,43 +841,22 @@ def run_channel_debug_replay(
 
 
 def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
-    preset = getattr(args, "sync_mode", None) or getattr(args, "sync_preset", None)
-
-    if args.use_i2s_tags is not None:
-        use_i2s_tags = args.use_i2s_tags
-    else:
-        use_i2s_tags = True
-
-    if args.bfpexp_hold_pairs is not None:
-        bfpexp_hold_pairs = args.bfpexp_hold_pairs
-    else:
-        bfpexp_hold_pairs = DEFAULT_BFPEXP_HOLD_PAIRS
-
-    if args.loss_tolerance_pairs is not None:
-        loss_tolerance_pairs = args.loss_tolerance_pairs
-    else:
-        loss_tolerance_pairs = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
-
-    if args.allow_fft_without_bfpexp is not None:
-        allow_fft_without_bfpexp = args.allow_fft_without_bfpexp
-    else:
-        allow_fft_without_bfpexp = preset == "tolerant"
-
-    if preset == "strict":
-        sync_mode = "strict"
-    elif preset == "tolerant":
-        sync_mode = "tolerant"
-    elif allow_fft_without_bfpexp:
-        sync_mode = "tolerant"
-    else:
-        sync_mode = "strict"
-
     return {
-        "sync_mode": sync_mode,
-        "use_i2s_tags": use_i2s_tags,
-        "bfpexp_hold_pairs": bfpexp_hold_pairs,
-        "loss_tolerance_pairs": loss_tolerance_pairs,
-        "allow_fft_without_bfpexp": allow_fft_without_bfpexp,
+        "bfpexp_hold_pairs": (
+            args.bfpexp_hold_pairs
+            if args.bfpexp_hold_pairs is not None
+            else DEFAULT_BFPEXP_HOLD_PAIRS
+        ),
+        "loss_tolerance_pairs": (
+            args.loss_tolerance_pairs
+            if args.loss_tolerance_pairs is not None
+            else DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
+        ),
+        "allow_fft_without_bfpexp": (
+            bool(args.allow_fft_without_bfpexp)
+            if args.allow_fft_without_bfpexp is not None
+            else False
+        ),
     }
 
 
@@ -896,8 +885,6 @@ def main() -> int:
         default=DEFAULT_SPI_MODE,
         help="SPI mode used by the Raspberry Pi master",
     )
-    parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
-    parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
     parser.add_argument(
         "--bfpexp-hold-frames",
         type=int,
@@ -921,37 +908,37 @@ def main() -> int:
         "--use-word-tags",
         action="store_true",
         default=True,
-        help="Decode per-word in-band tags (idle/BFPEXP/FFT) from the SPI payload",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
-    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
-    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each word")
-    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value representing idle/no data")
-    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
-    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
+    parser.add_argument("--tag-shift", type=int, default=30, help=argparse.SUPPRESS)
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help=argparse.SUPPRESS)
+    parser.add_argument("--payload-bits", type=int, default=18, help=argparse.SUPPRESS)
+    parser.add_argument("--tag-idle", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--tag-bfpexp", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--tag-fft", type=int, default=2, help=argparse.SUPPRESS)
     parser.add_argument(
         "--apply-bfpexp",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Apply the FFT block-floating exponent before computing magnitudes (default: enabled)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bfpexp-hold-pairs",
         type=int,
         default=None,
-        help="Required consecutive BFPEXP-tagged stereo pairs before a new FFT burst is accepted",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--loss-tolerance-pairs",
         type=int,
         default=None,
-        help="Tolerated corrupted/missing tagged stereo pairs per BFPEXP preamble or FFT burst",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--allow-fft-without-bfpexp",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Accept FFT-tagged frame start even if no BFPEXP tag was observed first",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--debug-channel-log",
@@ -1044,12 +1031,10 @@ def main() -> int:
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
     sync_cfg = _resolve_sync_cli_defaults(args)
-    use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
     loss_tolerance_pairs = int(sync_cfg["loss_tolerance_pairs"])
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
     apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
-    sync_mode = str(sync_cfg["sync_mode"])
 
     if bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
