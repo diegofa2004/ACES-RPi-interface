@@ -1222,8 +1222,8 @@ def main() -> int:
         daemon=True,
     ).start()
 
-    pre_size = buffers["pre_mfcc"].maxlen or 0
-    history_size = buffers["history_mfcc"].maxlen or 0
+    pre_window_seconds = float(buffers["pre_window_seconds"])
+    history_window_seconds = float(buffers["history_window_seconds"])
     print("Using SPI device:", device, flush=True)
     print(
         "Reading FPGA FFT stream from SPI...",
