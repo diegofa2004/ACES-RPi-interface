@@ -150,7 +150,7 @@ Install complete.
 Hardware contract:
 - FPGA remains the physical I2S master.
 - Pi remains the I2S slave/capture side.
-- ALSA host open rate: ${HOST_RATE_HZ} Hz
+- Default nominal ALSA host rate used by the examples: ${HOST_RATE_HZ} Hz
 - Physical wire rate: ${WIRE_RATE_HZ} Hz
 
 Reboot the Raspberry Pi before validating:
@@ -170,6 +170,9 @@ Raw word validation:
   cd /path/to/submodules/ACES-RPi-interface/rpi3b_i2s_fft
   gcc -O2 -Wall -Wextra -pthread -o alsa_logger alsa_logger.c -lasound
   ./alsa_logger --device hw:X,Y --rate ${HOST_RATE_HZ}
+
+If your host-side analysis needs a different nominal ALSA rate, pass another
+integer via --rate. This does not change the physical FPGA-generated clocks.
 
 The next stage is to confirm stable hexadecimal 32-bit words before returning
 to the Python parser and tagged-mode semantics.

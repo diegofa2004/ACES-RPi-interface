@@ -84,7 +84,9 @@ sudo ./install_fpgafft_overlay.sh
 ## Taxa do enlace
 
 - Taxa física nominal do enlace: `48 828.125 Hz`
-- Taxa inteira exposta ao ALSA/host: `48828`
+- Taxa inteira padrão usada nos exemplos do host: `48828`
 
 Essa diferença de `0.125 Hz` é documentada porque o enlace físico vem de um
 divisor fixo na FPGA, enquanto a API ALSA trabalha com taxa inteira em Hz.
+O codec ASoC agora aceita outras taxas inteiras pedidas pelo user space, mas
+isso nao reprograma o clock fisico do enlace: a taxa real continua vindo da FPGA.

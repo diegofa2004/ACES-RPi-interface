@@ -17,7 +17,9 @@
 
 #define FPGAFFT_CODEC_DRIVER_NAME "snd-soc-fpgafft-codec"
 #define FPGAFFT_CODEC_DAI_NAME "fpgafft-codec-dai"
-#define FPGAFFT_CAPTURE_HOST_RATE_HZ 48828
+#define FPGAFFT_DEFAULT_HOST_RATE_HZ 48828
+#define FPGAFFT_CAPTURE_HOST_RATE_MIN_HZ 1
+#define FPGAFFT_CAPTURE_HOST_RATE_MAX_HZ 768000
 #define FPGAFFT_CAPTURE_RATE_NUM 390625
 #define FPGAFFT_CAPTURE_RATE_DEN 8
 #define FPGAFFT_CHANNEL_COUNT 2
@@ -84,8 +86,7 @@ static int fpgafft_codec_startup(struct snd_pcm_substream *substream,
 
 	(void)dai;
 
-	ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_RATE,
-					   FPGAFFT_CAPTURE_HOST_RATE_HZ);
+	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_RATE);
 	if (ret < 0)
 		return ret;
 
@@ -98,9 +99,6 @@ static int fpgafft_codec_hw_params(struct snd_pcm_substream *substream,
 				   struct snd_soc_dai *dai)
 {
 	(void)substream;
-
-	if (params_rate(params) != FPGAFFT_CAPTURE_HOST_RATE_HZ)
-		return -EINVAL;
 
 	if (params_channels(params) != FPGAFFT_CHANNEL_COUNT)
 		return -EINVAL;
@@ -205,8 +203,8 @@ static struct snd_soc_dai_driver fpgafft_codec_dai = {
 		.channels_min = FPGAFFT_CHANNEL_COUNT,
 		.channels_max = FPGAFFT_CHANNEL_COUNT,
 		.rates = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_KNOT,
-		.rate_min = FPGAFFT_CAPTURE_HOST_RATE_HZ,
-		.rate_max = FPGAFFT_CAPTURE_HOST_RATE_HZ,
+		.rate_min = FPGAFFT_CAPTURE_HOST_RATE_MIN_HZ,
+		.rate_max = FPGAFFT_CAPTURE_HOST_RATE_MAX_HZ,
 		.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	},
 	.ops = &fpgafft_codec_dai_ops,
@@ -219,8 +217,10 @@ static const struct snd_soc_component_driver fpgafft_codec_component = {
 static int fpgafft_codec_probe(struct platform_device *pdev)
 {
 	dev_info(&pdev->dev,
-		 "registering minimal FPGA FFT codec stub, host rate %u Hz (wire rate %u/%u Hz)\n",
-		 FPGAFFT_CAPTURE_HOST_RATE_HZ,
+		 "registering minimal FPGA FFT codec stub, default host rate %u Hz, accepted host range %u..%u Hz (wire rate %u/%u Hz)\n",
+		 FPGAFFT_DEFAULT_HOST_RATE_HZ,
+		 FPGAFFT_CAPTURE_HOST_RATE_MIN_HZ,
+		 FPGAFFT_CAPTURE_HOST_RATE_MAX_HZ,
 		 FPGAFFT_CAPTURE_RATE_NUM,
 		 FPGAFFT_CAPTURE_RATE_DEN);
 

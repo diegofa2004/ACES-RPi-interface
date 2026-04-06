@@ -76,7 +76,7 @@ For Raspberry Pi 3 Model B specifically:
 - the PCM/I2S pins are the same GPIO18/GPIO19/GPIO20 mapping documented below
 - the ALSA card index is not stable, so this project now auto-detects the capture device instead of assuming `hw:2,0`
 - if auto-detection still picks the wrong source, run `arecord -l` and pass `-D hw:X,Y`
-- the physical wire rate is `48 828.125 Hz`, and the host-side ALSA rate used by this project is `48828`
+- the physical wire rate is `48 828.125 Hz`; the project still defaults to a nominal ALSA rate of `48828`, but `-r/--rate` can now expose another integer host-side rate when you need different analysis calibration
 
 Reboot after setup:
 

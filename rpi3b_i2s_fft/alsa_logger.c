@@ -121,7 +121,7 @@ static void print_usage(const char *prog) {
             "\n"
             "Opcoes:\n"
             "  -D, --device <hw:X,Y>        dispositivo ALSA (padrao: hw:2,0)\n"
-            "  -r, --rate <Hz>              taxa de captura (padrao: 48828)\n"
+            "  -r, --rate <Hz>              taxa nominal de captura (padrao: 48828)\n"
             "  -n, --read-frames <N>        frames por leitura ALSA (padrao: 512)\n"
             "  -F, --period-frames <N>      tamanho do periodo ALSA (padrao: 512)\n"
             "  -B, --buffer-frames <N>      tamanho do buffer ALSA (padrao: 2048)\n"
@@ -133,7 +133,9 @@ static void print_usage(const char *prog) {
             "      --stats-interval-ms <N>  intervalo dos contadores em stderr (0 desliga)\n"
             "  -h, --help                   mostra esta ajuda\n"
             "\n"
-            "Modo raw escreve amostras S32_LE stereo diretamente, sem texto.\n",
+            "Modo raw escreve amostras S32_LE stereo diretamente, sem texto.\n"
+            "Em modo I2S slave, --rate ajusta a taxa nominal pedida ao ALSA; o clock\n"
+            "fisico continua vindo da FPGA.\n",
             prog,
             prog);
 }
@@ -767,6 +769,7 @@ int main(int argc, char **argv) {
     int exit_code = 1;
     int err = 0;
     uint64_t last_stats_ms = 0;
+    unsigned int requested_rate_hz = 0;
 
     memset(&queue, 0, sizeof(queue));
     memset(&stats, 0, sizeof(stats));
@@ -781,6 +784,7 @@ int main(int argc, char **argv) {
     }
 
     setup_signals();
+    requested_rate_hz = cfg.rate_hz;
 
     if (queue_init(&queue, cfg.queue_chunks, cfg.read_frames) != 0) {
         return 1;
@@ -814,6 +818,12 @@ int main(int argc, char **argv) {
     if ((err = set_hw_params(pcm, &cfg.rate_hz, &cfg.period_frames, &cfg.buffer_frames)) < 0) {
         goto cleanup;
     }
+    if (cfg.rate_hz != requested_rate_hz) {
+        fprintf(stderr,
+                "Aviso: ALSA negociou rate=%u Hz apos pedido de %u Hz\n",
+                cfg.rate_hz,
+                requested_rate_hz);
+    }
     if ((err = set_sw_params(pcm, cfg.period_frames, cfg.buffer_frames)) < 0) {
         goto cleanup;
     }
@@ -823,8 +833,9 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "Captura ALSA iniciada: device=%s rate=%u read_frames=%lu period=%lu buffer=%lu queue_chunks=%zu mode=%s\n",
+            "Captura ALSA iniciada: device=%s requested_rate=%u actual_rate=%u read_frames=%lu period=%lu buffer=%lu queue_chunks=%zu mode=%s\n",
             cfg.device,
+            requested_rate_hz,
             cfg.rate_hz,
             (unsigned long)cfg.read_frames,
             (unsigned long)cfg.period_frames,
