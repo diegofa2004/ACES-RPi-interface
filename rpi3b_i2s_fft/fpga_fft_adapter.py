@@ -1,4 +1,5 @@
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -7,7 +8,6 @@ import numpy as np
 try:
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
-        BYTES_PER_STEREO_FRAME,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
         DEFAULT_PACKET_INDEX_BITS,
@@ -18,7 +18,10 @@ try:
         DEFAULT_TAG_IDLE,
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
+        TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -27,7 +30,6 @@ try:
 except ImportError:
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
-        BYTES_PER_STEREO_FRAME,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
         DEFAULT_PACKET_INDEX_BITS,
@@ -38,92 +40,24 @@ except ImportError:
         DEFAULT_TAG_IDLE,
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
+        TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
         resolve_audio_device,
         start_capture_process,
         stop_process,
     )
     from spectral_features import build_dct_matrix, build_mel_filter
 
-
-CHANNEL_MODE_AUTO = "auto"
-CHANNEL_MODE_LEFT = "left"
-CHANNEL_MODE_RIGHT = "right"
-CHANNEL_MODE_AVERAGE = "average"
-DEFAULT_BFPEXP_HOLD_PAIRS = 1
-DEFAULT_TAG_LOSS_TOLERANCE_PAIRS = 0
+try:
+    import gpiod  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency on target device
+    gpiod = None
 
 
-def decode_stereo_frames(raw: bytes) -> np.ndarray:
-    if not raw:
-        return np.empty((0, 2), dtype=np.int32)
-    valid_size = len(raw) - (len(raw) % BYTES_PER_STEREO_FRAME)
-    if valid_size <= 0:
-        return np.empty((0, 2), dtype=np.int32)
-    return np.frombuffer(raw[:valid_size], dtype=np.int32).reshape(-1, 2)
-
-
-def select_mono_channel(
-    stereo: np.ndarray,
-    channel_mode: str = CHANNEL_MODE_AUTO,
-) -> tuple[np.ndarray, str]:
-    stereo_i32 = np.asarray(stereo, dtype=np.int32)
-    if stereo_i32.size == 0:
-        return np.empty(0, dtype=np.int32), CHANNEL_MODE_LEFT
-    if stereo_i32.ndim != 2 or stereo_i32.shape[1] != 2:
-        stereo_i32 = stereo_i32.reshape(-1, 2)
-
-    normalized_mode = (channel_mode or CHANNEL_MODE_AUTO).strip().lower()
-    left = stereo_i32[:, 0]
-    right = stereo_i32[:, 1]
-
-    if normalized_mode == CHANNEL_MODE_LEFT:
-        return left, CHANNEL_MODE_LEFT
-    if normalized_mode == CHANNEL_MODE_RIGHT:
-        return right, CHANNEL_MODE_RIGHT
-    if normalized_mode == CHANNEL_MODE_AVERAGE:
-        averaged = ((left.astype(np.int64) + right.astype(np.int64)) // 2).astype(np.int32)
-        return averaged, CHANNEL_MODE_AVERAGE
-
-    left_energy = float(np.mean(np.abs(left.astype(np.int64)), dtype=np.float64))
-    right_energy = float(np.mean(np.abs(right.astype(np.int64)), dtype=np.float64))
-    if right_energy > left_energy:
-        return right, CHANNEL_MODE_RIGHT
-    return left, CHANNEL_MODE_LEFT
-
-
-def prepare_audio_window(
-    stereo: np.ndarray,
-    *,
-    channel_mode: str = CHANNEL_MODE_AUTO,
-    sample_shift_bits: int = 0,
-    remove_dc: bool = True,
-) -> tuple[np.ndarray, str]:
-    mono, used_mode = select_mono_channel(stereo, channel_mode=channel_mode)
-    if sample_shift_bits:
-        mono = np.right_shift(mono, sample_shift_bits)
-
-    frame = mono.astype(np.float32, copy=False)
-    if remove_dc and frame.size:
-        frame = frame - np.mean(frame, dtype=np.float32)
-    return frame, used_mode
-
-
-def compute_fft_magnitude(
-    mono_frame: np.ndarray,
-    *,
-    frame_bins: int,
-    useful_bins: int,
-    window: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    frame_f32 = np.asarray(mono_frame, dtype=np.float32)
-    if window is None:
-        window_f32 = np.hanning(frame_bins).astype(np.float32)
-    else:
-        window_f32 = np.asarray(window, dtype=np.float32)
-    fft_full = np.abs(np.fft.rfft(frame_f32 * window_f32, n=frame_bins)).astype(np.float32)
-    fft_useful = fft_full[:useful_bins]
-    return fft_full, fft_useful
+DEFAULT_BFPEXP_HOLD_PAIRS = 128
+DEFAULT_TAG_LOSS_TOLERANCE_PAIRS = 3
 
 
 @dataclass
@@ -134,9 +68,6 @@ class FFTAdapterConfig:
     useful_bins: int = 256
     capture_backend: str = "auto"
     capture_binary: Optional[str] = None
-    channel_mode: str = CHANNEL_MODE_AUTO
-    sample_shift_bits: int = 0
-    remove_dc: bool = True
     gpio_chip: str = "/dev/gpiochip0"
     bfpexp_flag_line: Optional[int] = None
     done_line: Optional[int] = None
@@ -154,52 +85,227 @@ class FFTAdapterConfig:
     tag_idle: int = DEFAULT_TAG_IDLE
     tag_bfpexp: int = DEFAULT_TAG_BFPEXP
     tag_fft: int = DEFAULT_TAG_FFT
-    apply_bfpexp: bool = False
-    require_bfpexp_before_fft: bool = False
+    apply_bfpexp: bool = True
+    require_bfpexp_before_fft: bool = True
     bfpexp_pairs_required: int = DEFAULT_BFPEXP_HOLD_PAIRS
     loss_tolerance_pairs: int = DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
-        if self.frame_bins < 2:
-            raise ValueError("frame_bins must be at least 2")
-        max_useful_bins = 1 + (self.frame_bins // 2)
-        if not 2 <= self.useful_bins <= max_useful_bins:
-            raise ValueError(f"Expected 2 <= useful_bins <= {max_useful_bins}")
-        if self.sample_shift_bits < 0:
-            raise ValueError("sample_shift_bits must be non-negative")
-        normalized_channel_mode = (self.channel_mode or CHANNEL_MODE_AUTO).strip().lower()
-        if normalized_channel_mode not in (
-            CHANNEL_MODE_AUTO,
-            CHANNEL_MODE_LEFT,
-            CHANNEL_MODE_RIGHT,
-            CHANNEL_MODE_AVERAGE,
+        if self.frame_bins <= 0:
+            raise ValueError("frame_bins must be positive")
+        if self.frame_bins > self.fft_packet_index_base:
+            raise ValueError("frame_bins must fit inside the FFT packet-index range")
+        if not 2 <= self.useful_bins <= self.frame_bins:
+            raise ValueError("Expected 2 <= useful_bins <= frame_bins")
+        if not 1 <= self.payload_bits <= 31:
+            raise ValueError("payload_bits must be between 1 and 31")
+        if not 0 <= self.tag_shift <= 31:
+            raise ValueError("tag_shift must be between 0 and 31")
+        if not 0 <= self.packet_index_shift <= 31:
+            raise ValueError("packet_index_shift must be between 0 and 31")
+        if not 1 <= self.packet_index_bits <= 31:
+            raise ValueError("packet_index_bits must be between 1 and 31")
+        if self.tag_mask <= 0:
+            raise ValueError("tag_mask must be positive")
+        tag_width = int(self.tag_mask).bit_length()
+        if (self.tag_shift + tag_width) > 32:
+            raise ValueError("tag field must fit inside a 32-bit I2S word")
+        if (self.packet_index_shift + self.packet_index_bits) > 32:
+            raise ValueError("packet index field must fit inside a 32-bit I2S word")
+        if self.packet_index_shift < (self.tag_shift + tag_width):
+            raise ValueError("packet index field must not overlap the tag field")
+        if self.use_i2s_tags and self.payload_bits > self.tag_shift:
+            raise ValueError("payload_bits must not overlap the tag field when use_i2s_tags is enabled")
+        if self.fft_packet_index_base != (1 << (self.packet_index_bits - 1)):
+            raise ValueError("fft_packet_index_base must match the MSB of the packet index field")
+        if (
+            self.bfpexp_flag_line is not None
+            and self.done_line is not None
+            and self.bfpexp_flag_line == self.done_line
         ):
-            raise ValueError("channel_mode must be one of auto, left, right, average")
-        self.channel_mode = normalized_channel_mode
+            raise ValueError("bfpexp_flag_line and done_line must be different GPIO lines")
+        if self.handshake_timeout_seconds <= 0.0:
+            raise ValueError("handshake_timeout_seconds must be positive")
+        if self.done_pulse_seconds < 0.0:
+            raise ValueError("done_pulse_seconds must be non-negative")
+        if self.bfpexp_pairs_required <= 0:
+            raise ValueError("bfpexp_pairs_required must be positive")
+        if self.bfpexp_pairs_required > self.fft_packet_index_base:
+            raise ValueError("bfpexp_pairs_required must fit inside the BFPEXP packet-index range")
+        if self.loss_tolerance_pairs < 0:
+            raise ValueError("loss_tolerance_pairs must be non-negative")
 
 
 class FPGAFFTReceiver:
     def __init__(self, cfg: FFTAdapterConfig):
         self.cfg = cfg
         self._proc: Optional[subprocess.Popen] = None
-        self._frame_bytes = self.cfg.frame_bins * BYTES_PER_STEREO_FRAME
-        self._poll_frames = max(256, self.cfg.frame_bins)
-        self._poll_bytes = self._poll_frames * BYTES_PER_STEREO_FRAME
+        self._bytes_per_pair = 8  # real(int32) + imag(int32)
+        self._frame_bytes = self.cfg.frame_bins * self._bytes_per_pair
+        # Keep polling granularity close to one FFT frame so live tools react
+        # promptly while still avoiding pathological tiny reads.
+        self._poll_pairs = max(512, self.cfg.frame_bins)
+        self._poll_bytes = self._poll_pairs * self._bytes_per_pair
         self._byte_buffer = bytearray()
-        self._window = np.hanning(self.cfg.frame_bins).astype(np.float32)
-        self._mel_filter = build_mel_filter(
-            sample_rate=self.cfg.sample_rate,
-            n_fft=self.cfg.frame_bins,
-            n_mels=32,
+        self._line_request = None
+        self._bfpexp_line = None
+        self._done_line = None
+        self._gpio_api = None
+        self._gpio_chip = None
+        self._tagged_realigner = TaggedI2SRealigner(
+            packet_index_shift=self.cfg.packet_index_shift,
+            packet_index_bits=self.cfg.packet_index_bits,
+            tag_shift=self.cfg.tag_shift,
+            tag_mask=self.cfg.tag_mask,
+            payload_bits=self.cfg.payload_bits,
+            tag_idle=self.cfg.tag_idle,
+            tag_bfpexp=self.cfg.tag_bfpexp,
+            tag_fft=self.cfg.tag_fft,
+            fft_packet_index_base=self.cfg.fft_packet_index_base,
+            confirm_pairs=min(64, max(4, self.cfg.frame_bins)),
+            validate_pairs=min(64, max(4, self.cfg.frame_bins)),
+            preferred_swap_channels=True,
         )
-        self._dct_matrix = build_dct_matrix(input_size=32, output_size=13)
-        self.last_channel_used = CHANNEL_MODE_LEFT
-        self.last_audio_frame = np.zeros(self.cfg.frame_bins, dtype=np.float32)
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
+
+        payload_mask = (1 << self.cfg.payload_bits) - 1
+        self._payload_mask = payload_mask
+        self._payload_sign_bit = 1 << (self.cfg.payload_bits - 1)
         self.last_frame_bfpexp = 0
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins: tuple[int, ...] = tuple()
+        self._captured_frame_count = 0
+
+        n_fft = 2 * (self.cfg.useful_bins - 1)
+        self.mel_filter = build_mel_filter(
+            sample_rate=self.cfg.sample_rate,
+            n_fft=n_fft,
+            n_mels=32,
+        )
+        self._dct_matrix = build_dct_matrix(input_size=32, output_size=13)
+
+    def _setup_gpio(self) -> None:
+        if self.cfg.bfpexp_flag_line is None and self.cfg.done_line is None:
+            return
+        if gpiod is None:
+            raise RuntimeError(
+                "GPIO handshake requested but python gpiod is not installed. "
+                "Install python3-libgpiod on the Raspberry Pi."
+            )
+
+        chip = gpiod.Chip(self.cfg.gpio_chip)
+        self._gpio_chip = chip
+
+        if hasattr(gpiod, "LineSettings"):
+            self._setup_gpio_v2(chip)
+            return
+
+        self._setup_gpio_v1(chip)
+
+    def _setup_gpio_v2(self, chip: object) -> None:
+        line_module = getattr(gpiod, "line", gpiod)
+        settings = {}
+
+        if self.cfg.bfpexp_flag_line is not None:
+            settings[self.cfg.bfpexp_flag_line] = gpiod.LineSettings(
+                direction=line_module.Direction.INPUT,
+            )
+
+        if self.cfg.done_line is not None:
+            settings[self.cfg.done_line] = gpiod.LineSettings(
+                direction=line_module.Direction.OUTPUT,
+                output_value=line_module.Value.INACTIVE,
+            )
+
+        if hasattr(chip, "request_lines"):
+            self._line_request = chip.request_lines(
+                consumer="fpga_fft_receiver",
+                config=settings,
+            )
+        else:
+            self._line_request = gpiod.request_lines(
+                self.cfg.gpio_chip,
+                consumer="fpga_fft_receiver",
+                config=settings,
+            )
+
+        self._gpio_api = "v2"
+        self._bfpexp_line = self.cfg.bfpexp_flag_line
+        self._done_line = self.cfg.done_line
+
+    def _setup_gpio_v1(self, chip: object) -> None:
+        self._gpio_api = "v1"
+
+        if self.cfg.bfpexp_flag_line is not None:
+            line = chip.get_line(self.cfg.bfpexp_flag_line)
+            line.request(consumer="fpga_fft_receiver", type=gpiod.LINE_REQ_DIR_IN)
+            self._bfpexp_line = line
+
+        if self.cfg.done_line is not None:
+            line = chip.get_line(self.cfg.done_line)
+            line.request(consumer="fpga_fft_receiver", type=gpiod.LINE_REQ_DIR_OUT)
+            line.set_value(0)
+            self._done_line = line
+
+    def _teardown_gpio(self) -> None:
+        if self._line_request is not None:
+            release = getattr(self._line_request, "release", None)
+            if callable(release):
+                release()
+            self._line_request = None
+
+        for line in (self._bfpexp_line, self._done_line):
+            release = getattr(line, "release", None)
+            if callable(release):
+                release()
+
+        close = getattr(self._gpio_chip, "close", None)
+        if callable(close):
+            close()
+
+        self._bfpexp_line = None
+        self._done_line = None
+        self._gpio_api = None
+        self._gpio_chip = None
+
+    def _read_flag_active(self) -> bool:
+        if self._bfpexp_line is None:
+            return False
+
+        if self._gpio_api == "v1":
+            value = self._bfpexp_line.get_value()
+            is_high = bool(value)
+        else:
+            if self._line_request is None:
+                return False
+            value = self._line_request.get_value(self._bfpexp_line)
+            line_module = getattr(gpiod, "line", gpiod)
+            is_high = value == line_module.Value.ACTIVE
+
+        return is_high if self.cfg.flag_active_high else (not is_high)
+
+    def _set_done(self, active: bool) -> None:
+        if self._done_line is None:
+            return
+
+        if self._gpio_api == "v1":
+            self._done_line.set_value(1 if active else 0)
+            return
+
+        if self._line_request is None:
+            return
+        line_module = getattr(gpiod, "line", gpiod)
+        out = line_module.Value.ACTIVE if active else line_module.Value.INACTIVE
+        self._line_request.set_value(self._done_line, out)
+
+    def _pulse_done(self) -> None:
+        if self._done_line is None:
+            return
+        self._set_done(True)
+        time.sleep(max(0.0, self.cfg.done_pulse_seconds))
+        self._set_done(False)
 
     def _fill_buffer(self, min_bytes: int) -> bool:
         if self._proc is None or self._proc.stdout is None:
@@ -213,46 +319,272 @@ class FPGAFFTReceiver:
 
         return len(self._byte_buffer) >= min_bytes
 
-    def _pop_stereo_frames(self, frame_count: int, *, exact: bool) -> Optional[np.ndarray]:
-        if frame_count <= 0:
+    def _pop_pairs(self, pair_count: int, exact: bool) -> Optional[np.ndarray]:
+        if pair_count <= 0:
             return np.empty((0, 2), dtype=np.int32)
 
-        needed = frame_count * BYTES_PER_STEREO_FRAME
+        needed = pair_count * self._bytes_per_pair
         if exact:
             if not self._fill_buffer(needed):
                 return None
             raw = bytes(self._byte_buffer[:needed])
             del self._byte_buffer[:needed]
         else:
-            if not self._fill_buffer(BYTES_PER_STEREO_FRAME):
+            if not self._fill_buffer(self._bytes_per_pair):
                 return None
             available = min(len(self._byte_buffer), needed)
-            available -= available % BYTES_PER_STEREO_FRAME
+            available -= available % self._bytes_per_pair
             if available <= 0:
                 return None
             raw = bytes(self._byte_buffer[:available])
             del self._byte_buffer[:available]
 
-        return decode_stereo_frames(raw)
+        if not raw:
+            return None
+        return np.frombuffer(raw, dtype=np.int32).reshape(-1, 2)
 
     def read_available_pairs(self, pair_count: int) -> Optional[np.ndarray]:
-        return self._pop_stereo_frames(pair_count, exact=False)
+        return self._pop_pairs(pair_count, exact=False)
 
-    def _select_mono_channel(self, stereo: np.ndarray) -> np.ndarray:
-        mono, used_mode = select_mono_channel(stereo, channel_mode=self.cfg.channel_mode)
-        self.last_channel_used = used_mode
-        return mono
+    def read_flag_state(self) -> Optional[bool]:
+        if self._bfpexp_line is None:
+            return None
+        return self._read_flag_active()
 
-    def _prepare_audio_frame(self, stereo: np.ndarray) -> np.ndarray:
-        frame, used_mode = prepare_audio_window(
-            stereo,
-            channel_mode=self.cfg.channel_mode,
-            sample_shift_bits=self.cfg.sample_shift_bits,
-            remove_dc=self.cfg.remove_dc,
+    def _decode_tagged_word(self, word: int) -> Tuple[int, int, int]:
+        decoded = decode_tagged_i2s_word(
+            int(word),
+            tag_shift=self.cfg.tag_shift,
+            tag_mask=self.cfg.tag_mask,
+            payload_bits=self.cfg.payload_bits,
+            packet_index_shift=self.cfg.packet_index_shift,
+            packet_index_bits=self.cfg.packet_index_bits,
         )
-        self.last_channel_used = used_mode
-        self.last_audio_frame = frame.astype(np.float32, copy=True)
-        return frame
+        return int(decoded["tag"]), int(decoded["packet_index"]), int(decoded["payload"])
+
+    def _push_pairs_back(self, pairs: np.ndarray) -> None:
+        if pairs.size == 0:
+            return
+        pair_array = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        if self.cfg.use_i2s_tags:
+            if self._tagged_pair_buffer.size == 0:
+                self._tagged_pair_buffer = pair_array.copy()
+            else:
+                self._tagged_pair_buffer = np.concatenate((pair_array, self._tagged_pair_buffer), axis=0)
+            return
+        self._byte_buffer[:0] = pair_array.tobytes()
+
+    def _pair_kind_packet_index_and_payload(
+        self,
+        pair: np.ndarray,
+    ) -> Tuple[str, int, Tuple[int, int]]:
+        tag_l, packet_index_l, payload_l = self._decode_tagged_word(int(pair[0]))
+        tag_r, packet_index_r, payload_r = self._decode_tagged_word(int(pair[1]))
+        kind = classify_tagged_i2s_pair(
+            tag_l,
+            tag_r,
+            left_packet_index=packet_index_l,
+            right_packet_index=packet_index_r,
+            tag_idle=self.cfg.tag_idle,
+            tag_bfpexp=self.cfg.tag_bfpexp,
+            tag_fft=self.cfg.tag_fft,
+            fft_packet_index_base=self.cfg.fft_packet_index_base,
+        )
+        return kind, packet_index_l, (payload_l, payload_r)
+
+    def _allow_tagged_fft_start_without_bfpexp(self) -> bool:
+        if not self.cfg.require_bfpexp_before_fft:
+            return True
+        # In tagged streams that wait for RPi DONE before emitting the next BFPEXP,
+        # insisting on BFPEXP for the very first decoded frame can deadlock startup
+        # if software attaches while a FFT burst is already in flight. After the
+        # first completed frame, DONE should keep the transport aligned and BFPEXP
+        # must be required again to avoid locking onto a mid-burst FFT payload.
+        return self.cfg.done_line is not None and self._captured_frame_count == 0
+
+    @staticmethod
+    def _is_tolerable_loss_kind(kind: str) -> bool:
+        return kind in ("tag_mismatch", "packet_index_mismatch", "unknown_tag", "idle")
+
+    def _finalize_tagged_frame(
+        self,
+        frame_pairs: np.ndarray,
+        received_bins: np.ndarray,
+        frame_bfpexp: int,
+        have_explicit_bfpexp: bool,
+    ) -> Tuple[np.ndarray, int]:
+        missing_bins = tuple(int(idx) for idx in np.flatnonzero(~received_bins))
+        self.last_frame_bfpexp = int(frame_bfpexp)
+        self.last_frame_had_explicit_bfpexp = bool(have_explicit_bfpexp)
+        self.last_frame_missing_bins = missing_bins
+        self._captured_frame_count += 1
+        return frame_pairs.copy(), int(frame_bfpexp)
+
+    def _wait_for_fft_window(self) -> bool:
+        if self.cfg.use_i2s_tags:
+            return True
+        if self._bfpexp_line is None:
+            return True
+        if self._gpio_api == "v2" and self._line_request is None:
+            return True
+
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError("Receiver not started")
+
+        deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
+        previous_active = self._read_flag_active()
+
+        # Drain audio while watching GPIO so the capture pointer stays near real time.
+        while time.monotonic() < deadline:
+            pairs = self._pop_pairs(self._poll_pairs, exact=False)
+            if pairs is None:
+                return False
+
+            current_active = self._read_flag_active()
+            if self.cfg.wait_for_flag_falling_edge:
+                if previous_active and (not current_active):
+                    return True
+            else:
+                if not current_active:
+                    return True
+            previous_active = current_active
+
+        return False
+
+    def _read_frame_from_i2s_tags(self) -> Optional[Tuple[np.ndarray, int]]:
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError("Receiver not started")
+
+        deadline = time.monotonic() + max(0.001, self.cfg.handshake_timeout_seconds)
+        fft_pairs = np.zeros((self.cfg.frame_bins, 2), dtype=np.int32)
+        received_bins = np.zeros(self.cfg.frame_bins, dtype=bool)
+        waiting_for_start = True
+        bfpexp_seen_indices: set[int] = set()
+        bfpexp_gap_count = 0
+        highest_bin_index_seen = -1
+        current_bfpexp = int(self.last_frame_bfpexp)
+        have_explicit_bfpexp = False
+        required_bfpexp_pairs = self.cfg.bfpexp_pairs_required
+        tolerated_losses = self.cfg.loss_tolerance_pairs
+
+        while time.monotonic() < deadline:
+            if self._tagged_pair_buffer.size != 0:
+                pairs = self._tagged_pair_buffer
+                self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
+            else:
+                pairs = self._pop_pairs(self._poll_pairs, exact=False)
+                if pairs is None:
+                    break
+                pairs = self._tagged_realigner.push_pairs(pairs)
+                if pairs.size == 0:
+                    continue
+            for idx, pair in enumerate(pairs):
+                kind, packet_index, payload = self._pair_kind_packet_index_and_payload(pair)
+
+                if waiting_for_start:
+                    if kind == "idle":
+                        if bfpexp_seen_indices and bfpexp_gap_count < tolerated_losses:
+                            bfpexp_gap_count += 1
+                        continue
+                    if kind == "bfpexp":
+                        current_bfpexp = int(payload[0])
+                        have_explicit_bfpexp = True
+                        if packet_index == 0:
+                            bfpexp_seen_indices = {0}
+                            bfpexp_gap_count = 0
+                        elif 0 <= packet_index < required_bfpexp_pairs:
+                            bfpexp_seen_indices.add(packet_index)
+                        continue
+                    if self._is_tolerable_loss_kind(kind):
+                        if bfpexp_seen_indices and bfpexp_gap_count < tolerated_losses:
+                            bfpexp_gap_count += 1
+                        continue
+                    if kind == "fft":
+                        bin_index = packet_index - self.cfg.fft_packet_index_base
+                        if bin_index < 0 or bin_index >= self.cfg.frame_bins:
+                            continue
+                        full_bfpexp_preamble = (
+                            0 in bfpexp_seen_indices
+                            and (len(bfpexp_seen_indices) + bfpexp_gap_count) >= required_bfpexp_pairs
+                        )
+                        bootstrap_from_fft = (not full_bfpexp_preamble) and self._allow_tagged_fft_start_without_bfpexp()
+                        if (not full_bfpexp_preamble) and (not bootstrap_from_fft):
+                            continue
+                        waiting_for_start = False
+                        fft_pairs.fill(0)
+                        received_bins[:] = False
+                        fft_pairs[bin_index, 0] = payload[0]
+                        fft_pairs[bin_index, 1] = payload[1]
+                        received_bins[bin_index] = True
+                        highest_bin_index_seen = bin_index
+                        if bool(np.all(received_bins)):
+                            self._push_pairs_back(pairs[idx + 1 :])
+                            return self._finalize_tagged_frame(
+                                fft_pairs,
+                                received_bins,
+                                current_bfpexp,
+                                have_explicit_bfpexp,
+                            )
+                        continue
+                    continue
+
+                if kind == "bfpexp":
+                    self._push_pairs_back(pairs[idx:])
+                    return self._finalize_tagged_frame(
+                        fft_pairs,
+                        received_bins,
+                        current_bfpexp,
+                        have_explicit_bfpexp,
+                    )
+                if kind == "fft":
+                    bin_index = packet_index - self.cfg.fft_packet_index_base
+                    if bin_index < 0 or bin_index >= self.cfg.frame_bins:
+                        continue
+                    if bin_index < highest_bin_index_seen:
+                        self._push_pairs_back(pairs[idx:])
+                        return self._finalize_tagged_frame(
+                            fft_pairs,
+                            received_bins,
+                            current_bfpexp,
+                            have_explicit_bfpexp,
+                        )
+                    fft_pairs[bin_index, 0] = payload[0]
+                    fft_pairs[bin_index, 1] = payload[1]
+                    received_bins[bin_index] = True
+                    highest_bin_index_seen = bin_index
+                    if bool(np.all(received_bins)):
+                        self._push_pairs_back(pairs[idx + 1 :])
+                        return self._finalize_tagged_frame(
+                            fft_pairs,
+                            received_bins,
+                            current_bfpexp,
+                            have_explicit_bfpexp,
+                        )
+                    continue
+                if kind == "idle":
+                    # The FPGA transport may insert tagged idle padding between valid
+                    # FFT payload pairs. Those words are not payload loss and should
+                    # not break the current frame.
+                    continue
+                if self._is_tolerable_loss_kind(kind):
+                    continue
+
+                self._push_pairs_back(pairs[idx + 1 :])
+                return self._finalize_tagged_frame(
+                    fft_pairs,
+                    received_bins,
+                    current_bfpexp,
+                    have_explicit_bfpexp,
+                )
+
+        if bool(np.any(received_bins)):
+            return self._finalize_tagged_frame(
+                fft_pairs,
+                received_bins,
+                current_bfpexp,
+                have_explicit_bfpexp,
+            )
+        return None
 
     def start(self) -> None:
         resolved_device = resolve_audio_device(self.cfg.device)
@@ -264,43 +596,73 @@ class FPGAFFTReceiver:
             capture_binary=self.cfg.capture_binary,
         )
         self._byte_buffer.clear()
-        self.last_channel_used = CHANNEL_MODE_LEFT
-        self.last_audio_frame.fill(0.0)
+        self._tagged_realigner.reset()
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
         self.last_frame_bfpexp = 0
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins = tuple()
-        self._proc = start_capture_process(
-            resolved_device,
-            self.cfg.sample_rate,
-            backend=self.cfg.capture_backend,
-            capture_binary=self.cfg.capture_binary,
-        )
+        self._captured_frame_count = 0
+        try:
+            self._proc = start_capture_process(
+                resolved_device,
+                self.cfg.sample_rate,
+                backend=self.cfg.capture_backend,
+                capture_binary=self.cfg.capture_binary,
+            )
+            self._setup_gpio()
+        except Exception:
+            if self._proc is not None:
+                stop_process(self._proc)
+                self._proc = None
+            self._teardown_gpio()
+            raise
         print("Starting:", " ".join(cmd), flush=True)
 
     def stop(self) -> None:
+        self._set_done(False)
         if self._proc is not None:
             stop_process(self._proc)
             self._proc = None
         self._byte_buffer.clear()
+        self._tagged_realigner.reset()
+        self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
         self.last_frame_bfpexp = 0
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins = tuple()
+        self._captured_frame_count = 0
+        self._teardown_gpio()
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        stereo = self._pop_stereo_frames(self.cfg.frame_bins, exact=True)
-        if stereo is None:
-            return None
+        frame_bfpexp = 0
+        if self.cfg.use_i2s_tags:
+            tagged_frame = self._read_frame_from_i2s_tags()
+            if tagged_frame is None:
+                return None
+            pairs, frame_bfpexp = tagged_frame
+        else:
+            if not self._wait_for_fft_window():
+                return None
 
-        audio_frame = self._prepare_audio_frame(stereo)
-        fft_full, fft_useful = compute_fft_magnitude(
-            audio_frame,
-            frame_bins=self.cfg.frame_bins,
-            useful_bins=self.cfg.useful_bins,
-            window=self._window,
-        )
+            pairs = self._pop_pairs(self.cfg.frame_bins, exact=True)
+            if pairs is None:
+                return None
+            self.last_frame_missing_bins = tuple()
 
-        mel = self._mel_filter @ fft_full
+        if self.cfg.apply_bfpexp and frame_bfpexp != 0:
+            real = np.ldexp(pairs[:, 0].astype(np.float32), frame_bfpexp)
+            imag = np.ldexp(pairs[:, 1].astype(np.float32), frame_bfpexp)
+        else:
+            real = pairs[:, 0].astype(np.float32)
+            imag = pairs[:, 1].astype(np.float32)
+
+        # Magnitude spectrum from complex bins streamed by FPGA.
+        fft_mag = np.sqrt(real * real + imag * imag)
+        fft_useful = fft_mag[: self.cfg.useful_bins]
+
+        mel = self.mel_filter @ fft_useful
         mel = np.log(mel + 1e-9)
         mfcc = self._dct_matrix @ mel
+
+        self._pulse_done()
 
         return fft_useful.astype(np.float32, copy=False), mfcc.astype(np.float32, copy=False)

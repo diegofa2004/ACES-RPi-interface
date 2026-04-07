@@ -9,9 +9,26 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
-import numpy as np
+try:
+    from .i2s_stream import (
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        decode_tagged_i2s_word,
+    )
+except ImportError:
+    from i2s_stream import (
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        decode_tagged_i2s_word,
+    )
 
 DEFAULT_DIO_SCK = 13
 DEFAULT_DIO_WS = 14
@@ -42,7 +59,11 @@ class DecodeConfig:
     dio_sd: int
     bits_per_word: int
     ws_low_channel: str
-    sample_shift_bits: int = 0
+    packet_index_shift: int
+    packet_index_bits: int
+    tag_shift: int
+    tag_mask: int
+    payload_bits: int
 
 
 @dataclass(frozen=True)
@@ -53,8 +74,11 @@ class DecodedWord:
     ws: int
     channel: str
     word: int
-    value_signed: int
-    sample_signed: int
+    packet_index: int
+    tag: int
+    payload_unsigned: int
+    payload_signed: int
+    reserved: int
 
 
 @dataclass(frozen=True)
@@ -95,10 +119,33 @@ def _channel_for_ws(ws: int, ws_low_channel: str) -> str:
     return "right" if low == "left" else "left"
 
 
-def decode_raw_word(word: int, *, bits_per_word: int, sample_shift_bits: int = 0) -> tuple[int, int]:
-    value_signed = _sign_extend(int(word), bits_per_word)
-    sample_signed = value_signed >> int(sample_shift_bits)
-    return value_signed, sample_signed
+def decode_tagged_word(
+    word: int,
+    *,
+    packet_index_shift: int,
+    packet_index_bits: int,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+) -> tuple[int, int, int, int, int]:
+    decoded = decode_tagged_i2s_word(
+        word,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+    )
+    payload_mask = (1 << payload_bits) - 1 if payload_bits > 0 else 0
+    payload_unsigned = int(word) & payload_mask
+    payload_signed = _sign_extend(payload_unsigned, payload_bits)
+    return (
+        int(decoded["packet_index"]),
+        int(decoded["tag"]),
+        int(payload_unsigned),
+        payload_signed,
+        int(decoded["reserved"]),
+    )
 
 
 def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSummary:
@@ -151,10 +198,13 @@ def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSumm
                     if not ws_changed:
                         error_counts["ws_missing_on_last_bit"] += 1
                     else:
-                        value_signed, sample_signed = decode_raw_word(
+                        packet_index, tag, payload_unsigned, payload_signed, reserved = decode_tagged_word(
                             completed_word,
-                            bits_per_word=config.bits_per_word,
-                            sample_shift_bits=config.sample_shift_bits,
+                            packet_index_shift=config.packet_index_shift,
+                            packet_index_bits=config.packet_index_bits,
+                            tag_shift=config.tag_shift,
+                            tag_mask=config.tag_mask,
+                            payload_bits=config.payload_bits,
                         )
                         words.append(
                             DecodedWord(
@@ -164,8 +214,11 @@ def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSumm
                                 ws=slot_ws,
                                 channel=_channel_for_ws(slot_ws, config.ws_low_channel),
                                 word=completed_word,
-                                value_signed=value_signed,
-                                sample_signed=sample_signed,
+                                packet_index=packet_index,
+                                tag=tag,
+                                payload_unsigned=payload_unsigned,
+                                payload_signed=payload_signed,
+                                reserved=reserved,
                             )
                         )
                     slot_count = 0
@@ -343,7 +396,7 @@ def write_samples_csv(
     ws_name = f"dio{config.dio_ws}_ws"
     sd_name = f"dio{config.dio_sd}_sd"
 
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
@@ -356,8 +409,10 @@ def write_samples_csv(
                 "sck_rising",
                 "decoded_word_hex",
                 "decoded_channel",
-                "decoded_value_signed",
-                "decoded_sample_signed",
+                "decoded_packet_index",
+                "decoded_tag",
+                "decoded_payload_signed",
+                "decoded_reserved_hex",
             ]
         )
 
@@ -379,15 +434,17 @@ def write_samples_csv(
                     rising,
                     "" if decoded is None else f"0x{decoded.word & 0xFFFFFFFF:08X}",
                     "" if decoded is None else decoded.channel,
-                    "" if decoded is None else decoded.value_signed,
-                    "" if decoded is None else decoded.sample_signed,
+                    "" if decoded is None else decoded.packet_index,
+                    "" if decoded is None else decoded.tag,
+                    "" if decoded is None else decoded.payload_signed,
+                    "" if decoded is None else f"0x{decoded.reserved:X}",
                 ]
             )
             prev_sck = sck
 
 
 def write_words_csv(path: Path, words: Sequence[DecodedWord]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
@@ -397,8 +454,11 @@ def write_words_csv(path: Path, words: Sequence[DecodedWord]) -> None:
                 "ws",
                 "channel",
                 "word_hex",
-                "value_signed",
-                "sample_signed",
+                "packet_index",
+                "tag",
+                "payload_unsigned",
+                "payload_signed",
+                "reserved_hex",
             ]
         )
         for word in words:
@@ -410,25 +470,30 @@ def write_words_csv(path: Path, words: Sequence[DecodedWord]) -> None:
                     word.ws,
                     word.channel,
                     f"0x{word.word & 0xFFFFFFFF:08X}",
-                    word.value_signed,
-                    word.sample_signed,
+                    word.packet_index,
+                    word.tag,
+                    word.payload_unsigned,
+                    word.payload_signed,
+                    f"0x{word.reserved:X}",
                 ]
             )
 
 
 def write_frames_csv(path: Path, frames: Sequence[StereoFrame]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "frame_index",
                 "left_word_hex",
-                "left_value_signed",
-                "left_sample_signed",
+                "left_packet_index",
+                "left_tag",
+                "left_payload_signed",
                 "left_sample_index",
                 "right_word_hex",
-                "right_value_signed",
-                "right_sample_signed",
+                "right_packet_index",
+                "right_tag",
+                "right_payload_signed",
                 "right_sample_index",
             ]
         )
@@ -437,26 +502,17 @@ def write_frames_csv(path: Path, frames: Sequence[StereoFrame]) -> None:
                 [
                     frame.frame_index,
                     f"0x{frame.left.word & 0xFFFFFFFF:08X}",
-                    frame.left.value_signed,
-                    frame.left.sample_signed,
+                    frame.left.packet_index,
+                    frame.left.tag,
+                    frame.left.payload_signed,
                     frame.left.sample_index,
                     f"0x{frame.right.word & 0xFFFFFFFF:08X}",
-                    frame.right.value_signed,
-                    frame.right.sample_signed,
+                    frame.right.packet_index,
+                    frame.right.tag,
+                    frame.right.payload_signed,
                     frame.right.sample_index,
                 ]
             )
-
-
-def write_frames_raw(path: Path, frames: Sequence[StereoFrame]) -> None:
-    if not frames:
-        path.write_bytes(b"")
-        return
-    stereo = np.asarray(
-        [(frame.left.sample_signed, frame.right.sample_signed) for frame in frames],
-        dtype=np.int32,
-    )
-    path.write_bytes(stereo.tobytes())
 
 
 def _default_output_prefix() -> Path:
@@ -466,7 +522,7 @@ def _default_output_prefix() -> Path:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture the raw mirrored microphone I2S bus with Analog Discovery and export decoded stereo files."
+        description="Capture I2S from Digilent Analog Discovery and export raw + decoded CSV files."
     )
     parser.add_argument("--sample-rate-hz", type=float, default=DEFAULT_SAMPLE_RATE_HZ, help="Digital capture sample rate")
     parser.add_argument(
@@ -486,12 +542,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="left",
         help="Channel represented when WS is low",
     )
-    parser.add_argument(
-        "--sample-shift-bits",
-        type=int,
-        default=0,
-        help="Arithmetic right shift applied to each decoded word before exporting the stereo raw file",
-    )
+    parser.add_argument("--packet-index-shift", type=lambda value: int(value, 0), default=DEFAULT_PACKET_INDEX_SHIFT, help="Packet-index field LSB position")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
+    parser.add_argument("--tag-shift", type=lambda value: int(value, 0), default=DEFAULT_TAG_SHIFT, help="Tag field LSB position")
+    parser.add_argument("--tag-mask", type=lambda value: int(value, 0), default=DEFAULT_TAG_MASK, help="Tag field mask")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width in bits")
     parser.add_argument(
         "--output-prefix",
         type=Path,
@@ -507,10 +562,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--sample-rate-hz deve ser positivo")
     if args.capture_seconds <= 0:
         raise SystemExit("--capture-seconds deve ser positivo")
-    if not 1 <= args.bits_per_word <= 32:
-        raise SystemExit("--bits-per-word deve ficar entre 1 e 32")
-    if args.sample_shift_bits < 0:
-        raise SystemExit("--sample-shift-bits deve ser nao negativo")
+    if args.bits_per_word <= 0:
+        raise SystemExit("--bits-per-word deve ser positivo")
+    if args.packet_index_bits <= 0:
+        raise SystemExit("--packet-index-bits deve ser positivo")
 
     output_prefix = args.output_prefix or _default_output_prefix()
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -537,37 +592,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         dio_sd=args.dio_sd,
         bits_per_word=args.bits_per_word,
         ws_low_channel=args.ws_low_channel,
-        sample_shift_bits=args.sample_shift_bits,
+        packet_index_shift=args.packet_index_shift,
+        packet_index_bits=args.packet_index_bits,
+        tag_shift=args.tag_shift,
+        tag_mask=args.tag_mask,
+        payload_bits=args.payload_bits,
     )
     summary = decode_i2s_words(samples, decode_config)
 
     samples_csv = output_prefix.with_name(output_prefix.name + "_samples.csv")
     words_csv = output_prefix.with_name(output_prefix.name + "_words.csv")
     frames_csv = output_prefix.with_name(output_prefix.name + "_frames.csv")
-    frames_raw = output_prefix.with_name(output_prefix.name + "_frames.raw")
     summary_txt = output_prefix.with_name(output_prefix.name + "_summary.txt")
 
     write_samples_csv(samples_csv, samples, summary, decode_config)
     write_words_csv(words_csv, summary.words)
     write_frames_csv(frames_csv, summary.frames)
-    write_frames_raw(frames_raw, summary.frames)
 
-    left_mean_abs = (
-        float(np.mean(np.abs([frame.left.sample_signed for frame in summary.frames]), dtype=np.float64))
-        if summary.frames
-        else 0.0
-    )
-    right_mean_abs = (
-        float(np.mean(np.abs([frame.right.sample_signed for frame in summary.frames]), dtype=np.float64))
-        if summary.frames
-        else 0.0
-    )
-
-    with summary_txt.open("w", newline="", encoding="utf-8") as handle:
+    with summary_txt.open("w", newline="") as handle:
         handle.write(f"requested_sample_rate_hz={args.sample_rate_hz}\n")
         handle.write(f"actual_sample_rate_hz={actual_sample_rate_hz}\n")
         handle.write(f"capture_seconds={args.capture_seconds}\n")
-        handle.write(f"sample_shift_bits={args.sample_shift_bits}\n")
         handle.write(f"captured_samples={capture_meta['captured_samples']}\n")
         handle.write(f"lost_samples={capture_meta['lost_samples']}\n")
         handle.write(f"corrupted_samples={capture_meta['corrupted_samples']}\n")
@@ -575,15 +620,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         handle.write(f"ws_toggles={summary.ws_toggles}\n")
         handle.write(f"decoded_words={len(summary.words)}\n")
         handle.write(f"decoded_frames={len(summary.frames)}\n")
-        handle.write(f"left_mean_abs={left_mean_abs}\n")
-        handle.write(f"right_mean_abs={right_mean_abs}\n")
         for key, value in sorted(summary.error_counts.items()):
             handle.write(f"error_{key}={value}\n")
 
     print(f"Captura salva em: {samples_csv}")
     print(f"Palavras decodificadas em: {words_csv}")
     print(f"Frames estereo em: {frames_csv}")
-    print(f"Raw estereo em: {frames_raw}")
     print(f"Resumo em: {summary_txt}")
     print(
         "Amostras="

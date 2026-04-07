@@ -82,10 +82,9 @@ Next steps:
 4. Optional second terminal for FFT visualization:
    cd ${PROJECT_DIR}
    .venv/bin/python plotFFT.py --rate ${HOST_RATE_HZ} --frame-bins 512
-5. Optional raw logging and verification:
+5. Optional third terminal for raw CSV logging:
    cd ${PROJECT_DIR}
-   .venv/bin/python fft_i2s_logger.py -r ${HOST_RATE_HZ} --csv mirror_capture.csv --raw-out mirror_capture.raw --capture-backend alsa-c
-   .venv/bin/python verify_transport_stream.py --raw mirror_capture.raw --rate ${HOST_RATE_HZ} --frame-bins 512 --useful-bins 256 --json-out mirror_capture.json
+   .venv/bin/python fft_i2s_logger.py -r ${HOST_RATE_HZ} --csv fft_capture.csv --capture-backend alsa-c
 
 If auto-detection chooses the wrong input, set AUDIO_DEVICE or pass -D hw:X,Y explicitly.
 The official overlay installed above keeps FPGA as I2S master and Pi as slave/capture side.

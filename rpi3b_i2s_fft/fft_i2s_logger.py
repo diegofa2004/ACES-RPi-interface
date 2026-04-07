@@ -1,46 +1,59 @@
 import argparse
+import collections
 import csv
 import os
 import signal
+import sys
 import time
-from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import numpy as np
 
 try:
-    from .fpga_fft_adapter import (
-        CHANNEL_MODE_AUTO,
-        CHANNEL_MODE_AVERAGE,
-        CHANNEL_MODE_LEFT,
-        CHANNEL_MODE_RIGHT,
-        decode_stereo_frames,
-        select_mono_channel,
-    )
+    from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
+        read_exactly,
         resolve_audio_device,
         start_capture_process,
         stop_process,
         trim_incomplete_frames,
     )
 except ImportError:
-    from fpga_fft_adapter import (
-        CHANNEL_MODE_AUTO,
-        CHANNEL_MODE_AVERAGE,
-        CHANNEL_MODE_LEFT,
-        CHANNEL_MODE_RIGHT,
-        decode_stereo_frames,
-        select_mono_channel,
-    )
+    from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
+        read_exactly,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -57,162 +70,438 @@ def format_i32_hex(value: int) -> str:
     return f"0x{int(value) & 0xFFFFFFFF:08X}"
 
 
-def select_logged_channel(
-    stereo: np.ndarray,
+def decode_tagged_word(
+    value: int,
     *,
-    channel_mode: str = CHANNEL_MODE_AUTO,
-    sample_shift_bits: int = 0,
-) -> tuple[np.ndarray, str]:
-    mono, used_mode = select_mono_channel(stereo, channel_mode=channel_mode)
-    if sample_shift_bits:
-        mono = np.right_shift(mono, sample_shift_bits)
-    return mono.astype(np.int32, copy=False), used_mode
-
-
-def write_csv_header(writer: csv.writer) -> None:
-    writer.writerow(
-        [
-            "timestamp_ns",
-            "sequence",
-            "left_i32",
-            "right_i32",
-            "left_hex",
-            "right_hex",
-            "mono_i32",
-            "channel_used",
-            "abs_left",
-            "abs_right",
-            "abs_mono",
-        ]
+    packet_index_shift: int,
+    packet_index_bits: int,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+) -> dict[str, object]:
+    return decode_tagged_i2s_word(
+        value,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
     )
+
+
+def classify_tagged_pair(
+    left_tag: int,
+    right_tag: int,
+    *,
+    left_packet_index: int,
+    right_packet_index: int,
+    tag_idle: int,
+    tag_bfpexp: int,
+    tag_fft: int,
+    fft_packet_index_base: int,
+) -> str:
+    return classify_tagged_i2s_pair(
+        left_tag,
+        right_tag,
+        left_packet_index=left_packet_index,
+        right_packet_index=right_packet_index,
+        tag_idle=tag_idle,
+        tag_bfpexp=tag_bfpexp,
+        tag_fft=tag_fft,
+        fft_packet_index_base=fft_packet_index_base,
+    )
+
+
+def is_tolerable_loss_kind(kind: str) -> bool:
+    return kind in ("tag_mismatch", "packet_index_mismatch", "unknown_tag", "idle")
+
+
+def create_contract_tracker(
+    *,
+    frame_bins: int,
+    bfpexp_hold_pairs: int,
+    allow_fft_without_bfpexp: bool,
+    loss_tolerance_pairs: int,
+) -> dict[str, object]:
+    return {
+        "frame_bins": int(frame_bins),
+        "bfpexp_hold_pairs": int(bfpexp_hold_pairs),
+        "allow_fft_without_bfpexp": bool(allow_fft_without_bfpexp),
+        "loss_tolerance_pairs": int(loss_tolerance_pairs),
+        "frame_number": 0,
+        "bfpexp_run": 0,
+        "bfpexp_loss_run": 0,
+        "fft_index": 0,
+        "fft_loss_run": 0,
+        "inside_fft": False,
+        "bootstrapped": False,
+    }
+
+
+def advance_contract_tracker(
+    tracker: dict[str, object],
+    kind: str,
+) -> tuple[str, int, int]:
+    frame_number = int(tracker["frame_number"])
+
+    if bool(tracker["inside_fft"]):
+        if kind == "fft":
+            fft_index = int(tracker["fft_index"])
+            tracker["fft_index"] = fft_index + 1
+            phase = "fft_frame_bootstrap" if bool(tracker["bootstrapped"]) else "fft_frame"
+            if int(tracker["fft_index"]) >= int(tracker["frame_bins"]):
+                tracker["inside_fft"] = False
+                tracker["fft_index"] = 0
+                tracker["bfpexp_run"] = 0
+                tracker["bfpexp_loss_run"] = 0
+                tracker["fft_loss_run"] = 0
+                tracker["bootstrapped"] = False
+                tracker["frame_number"] = frame_number + 1
+            return phase, frame_number, fft_index
+        if is_tolerable_loss_kind(kind) and int(tracker["fft_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            fft_index = int(tracker["fft_index"])
+            tracker["fft_index"] = fft_index + 1
+            tracker["fft_loss_run"] = int(tracker["fft_loss_run"]) + 1
+            phase = "fft_frame_gap_bootstrap" if bool(tracker["bootstrapped"]) else "fft_frame_gap"
+            if int(tracker["fft_index"]) >= int(tracker["frame_bins"]):
+                tracker["inside_fft"] = False
+                tracker["fft_index"] = 0
+                tracker["bfpexp_run"] = 0
+                tracker["bfpexp_loss_run"] = 0
+                tracker["fft_loss_run"] = 0
+                tracker["bootstrapped"] = False
+                tracker["frame_number"] = frame_number + 1
+            return phase, frame_number, fft_index
+
+        tracker["inside_fft"] = False
+        tracker["fft_index"] = 0
+        tracker["fft_loss_run"] = 0
+        tracker["bootstrapped"] = False
+        if kind == "bfpexp":
+            tracker["bfpexp_run"] = 1
+            tracker["bfpexp_loss_run"] = 0
+            return "protocol_reset_bfpexp", frame_number, 0
+        tracker["bfpexp_run"] = 0
+        tracker["bfpexp_loss_run"] = 0
+        return f"protocol_reset_{kind}", frame_number, -1
+
+    if kind == "idle":
+        if int(tracker["bfpexp_run"]) == 0:
+            return "search_idle", frame_number, -1
+        if int(tracker["bfpexp_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            bfpexp_index = int(tracker["bfpexp_run"])
+            tracker["bfpexp_run"] = bfpexp_index + 1
+            tracker["bfpexp_loss_run"] = int(tracker["bfpexp_loss_run"]) + 1
+            return "bfpexp_preamble_gap", frame_number, bfpexp_index
+        if int(tracker["bfpexp_run"]) != 0:
+            tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
+        return "search_idle", frame_number, -1
+
+    if kind == "bfpexp":
+        bfpexp_index = int(tracker["bfpexp_run"])
+        tracker["bfpexp_run"] = bfpexp_index + 1
+        return "bfpexp_preamble", frame_number, bfpexp_index
+
+    if is_tolerable_loss_kind(kind):
+        if int(tracker["bfpexp_run"]) > 0 and int(tracker["bfpexp_loss_run"]) < int(tracker["loss_tolerance_pairs"]):
+            bfpexp_index = int(tracker["bfpexp_run"])
+            tracker["bfpexp_run"] = bfpexp_index + 1
+            tracker["bfpexp_loss_run"] = int(tracker["bfpexp_loss_run"]) + 1
+            return "bfpexp_preamble_gap", frame_number, bfpexp_index
+        tracker["bfpexp_run"] = 0
+        tracker["bfpexp_loss_run"] = 0
+        return f"protocol_reset_{kind}", frame_number, -1
+
+    if kind == "fft":
+        bfpexp_run = int(tracker["bfpexp_run"])
+        bootstrap = bfpexp_run == 0 and bool(tracker["allow_fft_without_bfpexp"])
+        if (not bootstrap) and (bfpexp_run < int(tracker["bfpexp_hold_pairs"])):
+            tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
+            return "protocol_wait_bfpexp", frame_number, -1
+
+        tracker["inside_fft"] = True
+        tracker["bootstrapped"] = bootstrap
+        tracker["fft_index"] = 1
+        tracker["fft_loss_run"] = 0
+        phase = "fft_frame_bootstrap" if bootstrap else "fft_frame"
+        if int(tracker["frame_bins"]) == 1:
+            tracker["inside_fft"] = False
+            tracker["fft_index"] = 0
+            tracker["bfpexp_run"] = 0
+            tracker["bfpexp_loss_run"] = 0
+            tracker["fft_loss_run"] = 0
+            tracker["bootstrapped"] = False
+            tracker["frame_number"] = frame_number + 1
+        return phase, frame_number, 0
+
+    tracker["bfpexp_run"] = 0
+    tracker["bfpexp_loss_run"] = 0
+    return f"protocol_reset_{kind}", frame_number, -1
+
+
+class MirroredPairNormalizer:
+    def __init__(self):
+        self._preferred_by_signature: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def normalize(self, stereo: np.ndarray) -> np.ndarray:
+        stereo_i32 = np.asarray(stereo, dtype=np.int32)
+        if stereo_i32.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        if stereo_i32.ndim != 2 or stereo_i32.shape[1] != 2:
+            stereo_i32 = stereo_i32.reshape(-1, 2)
+
+        stereo_u32 = stereo_i32.astype(np.uint32, copy=False)
+        counts = collections.Counter((int(left), int(right)) for left, right in stereo_u32)
+        chunk_preference: dict[tuple[int, int], tuple[int, int]] = {}
+
+        for (left, right), count in counts.items():
+            if left == right:
+                continue
+
+            reversed_pair = (right, left)
+            key = (left, right) if left < right else (right, left)
+            preferred = self._preferred_by_signature.get(key)
+            if preferred is None:
+                reversed_count = counts.get(reversed_pair, 0)
+                if reversed_count > count:
+                    preferred = reversed_pair
+                else:
+                    preferred = (left, right)
+                self._preferred_by_signature[key] = preferred
+            chunk_preference[key] = preferred
+
+        if not chunk_preference:
+            return stereo_i32.copy()
+
+        normalized = stereo_u32.copy()
+        for row in normalized:
+            left = int(row[0])
+            right = int(row[1])
+            if left == right:
+                continue
+            key = (left, right) if left < right else (right, left)
+            preferred = chunk_preference.get(key)
+            if preferred is None:
+                continue
+            if (left, right) != preferred:
+                row[0], row[1] = row[1], row[0]
+
+        return normalized.view(np.int32)
+
+
+def decode_stereo_frames(raw: bytes) -> np.ndarray:
+    data = np.frombuffer(raw, dtype=np.int32)
+    if data.size < 2 or (data.size % 2) != 0:
+        return np.empty((0, 2), dtype=np.int32)
+    return data.reshape(-1, 2)
 
 
 def write_csv_rows(
     writer: csv.writer,
     stereo: np.ndarray,
-    mono: np.ndarray,
-    channel_used: str,
-    next_sequence: int,
+    seq_start: int,
     *,
-    timestamp_ns_fn: Callable[[], int] = time.time_ns,
+    packet_index_shift: int,
+    packet_index_bits: int,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+    tag_idle: int,
+    tag_bfpexp: int,
+    tag_fft: int,
+    fft_packet_index_base: int,
+    contract_tracker: Optional[dict[str, object]] = None,
+    timestamp_ns_fn=time.time_ns,
 ) -> int:
-    stereo_i32 = np.asarray(stereo, dtype=np.int32)
-    mono_i32 = np.asarray(mono, dtype=np.int32).reshape(-1)
-    if stereo_i32.ndim != 2 or stereo_i32.shape[1] != 2:
-        stereo_i32 = stereo_i32.reshape(-1, 2)
-    if mono_i32.shape[0] != stereo_i32.shape[0]:
-        raise ValueError("mono sample count must match stereo frame count")
-
-    for idx, pair in enumerate(stereo_i32):
-        left = int(pair[0])
-        right = int(pair[1])
-        mono_value = int(mono_i32[idx])
-        writer.writerow(
+    seq = seq_start
+    rows = []
+    for row in stereo:
+        left = decode_tagged_word(
+            int(row[0]),
+            packet_index_shift=packet_index_shift,
+            packet_index_bits=packet_index_bits,
+            tag_shift=tag_shift,
+            tag_mask=tag_mask,
+            payload_bits=payload_bits,
+        )
+        right = decode_tagged_word(
+            int(row[1]),
+            packet_index_shift=packet_index_shift,
+            packet_index_bits=packet_index_bits,
+            tag_shift=tag_shift,
+            tag_mask=tag_mask,
+            payload_bits=payload_bits,
+        )
+        kind = classify_tagged_pair(
+            int(left["tag"]),
+            int(right["tag"]),
+            left_packet_index=int(left["packet_index"]),
+            right_packet_index=int(right["packet_index"]),
+            tag_idle=tag_idle,
+            tag_bfpexp=tag_bfpexp,
+            tag_fft=tag_fft,
+            fft_packet_index_base=fft_packet_index_base,
+        )
+        contract_phase = ""
+        contract_frame = -1
+        contract_index = -1
+        if contract_tracker is not None:
+            contract_phase, contract_frame, contract_index = advance_contract_tracker(contract_tracker, kind)
+        rows.append(
             [
-                int(timestamp_ns_fn()),
-                int(next_sequence),
-                left,
-                right,
-                format_i32_hex(left),
-                format_i32_hex(right),
-                mono_value,
-                str(channel_used),
-                abs(left),
-                abs(right),
-                abs(mono_value),
+                timestamp_ns_fn(),
+                seq,
+                format_i32_hex(row[0]),
+                format_i32_hex(row[1]),
+                kind,
+                contract_phase,
+                contract_frame,
+                contract_index,
+                left["packet_index"],
+                right["packet_index"],
+                left["tag"],
+                right["tag"],
+                left["payload"],
+                right["payload"],
+                left["reserved"],
+                right["reserved"],
+                int(bool(left["reserved_nonzero"])),
+                int(bool(right["reserved_nonzero"])),
             ]
         )
-        next_sequence += 1
+        seq = (seq + 1) & 0xFFFFFFFF
+    writer.writerows(rows)
+    return seq
 
-    return next_sequence
 
-
-def build_arg_parser() -> argparse.ArgumentParser:
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture the mirrored microphone I2S stream from ALSA and log raw stereo samples."
+        description="Capture I2S FFT stream and log raw real/imag pairs to CSV."
     )
-    parser.add_argument("-D", "--device", default=DEFAULT_AUDIO_DEVICE, help="ALSA device, ex.: hw:2,0")
+    parser.add_argument(
+        "-D",
+        "--device",
+        default=DEFAULT_AUDIO_DEVICE,
+        help="ALSA capture device (default: $AUDIO_DEVICE if set, otherwise auto-detect)",
+    )
     parser.add_argument(
         "--capture-backend",
         choices=("auto", "arecord", "alsa-c"),
         default=DEFAULT_CAPTURE_BACKEND,
-        help="Backend used to capture the ALSA stream",
+        help="Capture backend used to read the ALSA stream",
     )
     parser.add_argument(
         "--capture-binary",
         default=None,
-        help="Path to the compiled native C capture helper",
+        help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
     )
     parser.add_argument(
         "-r",
         "--rate",
         type=int,
         default=DEFAULT_CAPTURE_RATE_HZ,
-        help="Host-side ALSA sample rate in Hz",
+        help="Host-side ALSA sample rate in Hz (nominal wire rate is 48828.125 Hz)",
     )
+    parser.add_argument("--frame-bins", type=int, default=512, help="Expected FFT-tagged pairs per burst")
     parser.add_argument(
         "--chunk-frames",
         type=int,
         default=DEFAULT_LOGGER_CHUNK_FRAMES,
-        help="Stereo frames read per chunk",
+        help="Frames read per chunk",
     )
+    parser.add_argument("--csv", default="fft_capture.csv", help="Output CSV path")
     parser.add_argument(
-        "--channel-mode",
-        choices=(CHANNEL_MODE_AUTO, CHANNEL_MODE_LEFT, CHANNEL_MODE_RIGHT, CHANNEL_MODE_AVERAGE),
-        default=CHANNEL_MODE_AUTO,
-        help="Channel used to derive the logged mono column",
-    )
-    parser.add_argument(
-        "--sample-shift-bits",
-        type=int,
-        default=0,
-        help="Arithmetic right shift applied to the derived mono column",
-    )
-    parser.add_argument("--csv", type=Path, default=None, help="CSV destination path")
-    parser.add_argument("--raw-out", type=Path, default=None, help="Raw S32_LE stereo dump path")
-    parser.add_argument(
-        "--seconds",
-        type=float,
-        default=0.0,
-        help="Capture duration in seconds; 0 runs until Ctrl+C",
-    )
-    parser.add_argument(
-        "--csv-flush-every-chunks",
+        "--flush-every-chunks",
         type=int,
         default=DEFAULT_CSV_FLUSH_EVERY_CHUNKS,
-        help="Flush the CSV file every N chunks",
+        help="Flush CSV data every N chunks instead of every chunk",
     )
-    return parser
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    parser.add_argument("--packet-index-shift", type=int, default=DEFAULT_PACKET_INDEX_SHIFT, help="Bit shift of the packet-index field")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
+    parser.add_argument("--fft-packet-index-base", type=int, default=DEFAULT_FFT_PACKET_INDEX_BASE, help="First packet index used by FFT payload words")
+    parser.add_argument("--tag-shift", type=int, default=DEFAULT_TAG_SHIFT, help="Bit shift of type tag in each 32-bit word")
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=DEFAULT_TAG_MASK, help="Bitmask for type tag")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width inside each word")
+    parser.add_argument("--tag-idle", type=int, default=DEFAULT_TAG_IDLE, help="Tag value representing idle/no data")
+    parser.add_argument("--tag-bfpexp", type=int, default=DEFAULT_TAG_BFPEXP, help="Tag value representing BFPEXP data")
+    parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value representing FFT complex bins")
+    parser.add_argument(
+        "--bfpexp-hold-pairs",
+        type=int,
+        default=DEFAULT_BFPEXP_HOLD_PAIRS,
+        help="Expected consecutive BFPEXP-tagged stereo pairs before each FFT burst",
+    )
+    parser.add_argument(
+        "--loss-tolerance-pairs",
+        type=int,
+        default=DEFAULT_TAG_LOSS_TOLERANCE_PAIRS,
+        help="Tolerated corrupted/missing tagged stereo pairs per BFPEXP preamble or FFT burst",
+    )
+    parser.add_argument(
+        "--allow-fft-without-bfpexp",
+        action="store_true",
+        help="Annotate FFT bursts as valid even if they start without a BFPEXP preamble",
+    )
+    args = parser.parse_args()
 
     if args.rate <= 0:
         parser.error("--rate must be positive")
+    if args.frame_bins <= 0:
+        parser.error("--frame-bins must be positive")
+    if args.frame_bins > args.fft_packet_index_base:
+        parser.error("--frame-bins must fit inside the FFT packet-index range")
     if args.chunk_frames <= 0:
         parser.error("--chunk-frames must be positive")
-    if args.sample_shift_bits < 0:
-        parser.error("--sample-shift-bits must be non-negative")
-    if args.seconds < 0:
-        parser.error("--seconds must be non-negative")
-    if args.csv is None and args.raw_out is None:
-        parser.error("at least one of --csv or --raw-out must be provided")
-    if args.csv_flush_every_chunks <= 0:
-        parser.error("--csv-flush-every-chunks must be positive")
+    if args.flush_every_chunks <= 0:
+        parser.error("--flush-every-chunks must be positive")
+    if args.payload_bits <= 0:
+        parser.error("--payload-bits must be positive")
+    if args.packet_index_bits <= 0:
+        parser.error("--packet-index-bits must be positive")
+    if args.bfpexp_hold_pairs <= 0:
+        parser.error("--bfpexp-hold-pairs must be positive")
+    if args.loss_tolerance_pairs < 0:
+        parser.error("--loss-tolerance-pairs must be non-negative")
 
     try:
         device = resolve_audio_device(args.device)
     except RuntimeError as exc:
         parser.error(str(exc))
 
-    csv_path = args.csv.resolve() if args.csv is not None else None
-    raw_path = args.raw_out.resolve() if args.raw_out is not None else None
-    if csv_path is not None:
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-    if raw_path is not None:
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
+    bytes_per_frame = 8  # 2 channels x int32
+    chunk_bytes = args.chunk_frames * bytes_per_frame
+
+    seq = 0
+    chunk_index = 0
+    stop = False
+    realigner = TaggedI2SRealigner(
+        packet_index_shift=args.packet_index_shift,
+        packet_index_bits=args.packet_index_bits,
+        tag_shift=args.tag_shift,
+        tag_mask=args.tag_mask,
+        payload_bits=args.payload_bits,
+        tag_idle=args.tag_idle,
+        tag_bfpexp=args.tag_bfpexp,
+        tag_fft=args.tag_fft,
+        fft_packet_index_base=args.fft_packet_index_base,
+        preferred_swap_channels=True,
+    )
+    normalizer = MirroredPairNormalizer()
+    contract_tracker = create_contract_tracker(
+        frame_bins=args.frame_bins,
+        bfpexp_hold_pairs=args.bfpexp_hold_pairs,
+        allow_fft_without_bfpexp=args.allow_fft_without_bfpexp,
+        loss_tolerance_pairs=args.loss_tolerance_pairs,
+    )
+
+    def handle_stop(_sig: int, _frame: Optional[object]) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGTERM, handle_stop)
 
     cmd = build_capture_cmd(
         device,
@@ -220,112 +509,92 @@ def main(argv: Optional[list[str]] = None) -> int:
         backend=args.capture_backend,
         capture_binary=args.capture_binary,
     )
-    proc = start_capture_process(
-        device,
-        args.rate,
-        backend=args.capture_backend,
-        capture_binary=args.capture_binary,
-    )
+    print("Using ALSA capture device:", device, flush=True)
     print("Starting:", " ".join(cmd), flush=True)
-
-    stop_requested = False
-
-    def _request_stop(_signum, _frame) -> None:
-        nonlocal stop_requested
-        stop_requested = True
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, _request_stop)
-
-    chunk_bytes = args.chunk_frames * 8
-    chunk_index = 0
-    next_sequence = 0
-    total_frames = 0
-    channel_counts = {
-        CHANNEL_MODE_LEFT: 0,
-        CHANNEL_MODE_RIGHT: 0,
-        CHANNEL_MODE_AVERAGE: 0,
-    }
-    start_time = time.monotonic()
-    csv_handle = None
-    raw_handle = None
+    print("Logging CSV to:", args.csv, flush=True)
 
     try:
-        if csv_path is not None:
-            csv_handle = csv_path.open("w", newline="", encoding="utf-8")
-            writer = csv.writer(csv_handle)
-            write_csv_header(writer)
-        else:
-            writer = None
+        proc = start_capture_process(
+            device,
+            args.rate,
+            backend=args.capture_backend,
+            capture_binary=args.capture_binary,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
-        if raw_path is not None:
-            raw_handle = raw_path.open("wb")
-
-        while not stop_requested:
-            if args.seconds > 0.0 and (time.monotonic() - start_time) >= args.seconds:
-                break
-
-            if proc.stdout is None:
-                raise RuntimeError("capture process stdout is not available")
-            chunk = proc.stdout.read(chunk_bytes)
-            if not chunk:
-                if proc.poll() is not None:
-                    break
-                continue
-
-            trimmed = trim_incomplete_frames(chunk, bytes_per_frame=8)
-            if not trimmed:
-                continue
-
-            stereo = decode_stereo_frames(trimmed)
-            if stereo.size == 0:
-                continue
-
-            if raw_handle is not None:
-                raw_handle.write(trimmed)
-
-            mono, channel_used = select_logged_channel(
-                stereo,
-                channel_mode=args.channel_mode,
-                sample_shift_bits=args.sample_shift_bits,
+    try:
+        with open(args.csv, "w", newline="", encoding="ascii", buffering=1024 * 1024) as f_csv:
+            writer = csv.writer(f_csv)
+            writer.writerow(
+                [
+                    "timestamp_ns",
+                    "seq",
+                    "left_hex",
+                    "right_hex",
+                    "kind",
+                    "contract_phase",
+                    "contract_frame",
+                    "contract_index",
+                    "left_packet_index",
+                    "right_packet_index",
+                    "left_tag",
+                    "right_tag",
+                    "left_payload",
+                    "right_payload",
+                    "left_reserved",
+                    "right_reserved",
+                    "left_reserved_nonzero",
+                    "right_reserved_nonzero",
+                ]
             )
-            channel_counts[channel_used] = int(channel_counts.get(channel_used, 0)) + int(stereo.shape[0])
 
-            if writer is not None:
-                next_sequence = write_csv_rows(
+            while not stop:
+                if proc.stdout is None:
+                    raise RuntimeError("arecord stdout pipe is unavailable")
+
+                raw = trim_incomplete_frames(read_exactly(proc.stdout, chunk_bytes), bytes_per_frame)
+                if not raw:
+                    if proc.poll() is not None:
+                        print(f"arecord exited with code {proc.returncode}", file=sys.stderr)
+                        return 1
+
+                    continue
+
+                stereo = decode_stereo_frames(raw)
+                if stereo.size == 0:
+                    continue
+
+                stereo = realigner.push_pairs(stereo)
+                if stereo.size == 0:
+                    continue
+                stereo = normalizer.normalize(stereo)
+
+                seq = write_csv_rows(
                     writer,
                     stereo,
-                    mono,
-                    channel_used,
-                    next_sequence,
+                    seq,
+                    packet_index_shift=args.packet_index_shift,
+                    packet_index_bits=args.packet_index_bits,
+                    tag_shift=args.tag_shift,
+                    tag_mask=args.tag_mask,
+                    payload_bits=args.payload_bits,
+                    tag_idle=args.tag_idle,
+                    tag_bfpexp=args.tag_bfpexp,
+                    tag_fft=args.tag_fft,
+                    fft_packet_index_base=args.fft_packet_index_base,
+                    contract_tracker=contract_tracker,
                 )
                 chunk_index += 1
-                if chunk_index % args.csv_flush_every_chunks == 0:
-                    csv_handle.flush()
+                if (chunk_index % args.flush_every_chunks) == 0:
+                    f_csv.flush()
 
-            total_frames += int(stereo.shape[0])
+            f_csv.flush()
+
     finally:
         stop_process(proc)
-        if csv_handle is not None:
-            csv_handle.flush()
-            csv_handle.close()
-        if raw_handle is not None:
-            raw_handle.flush()
-            raw_handle.close()
 
-    elapsed = max(1e-9, time.monotonic() - start_time)
-    print(
-        "Capture completed:",
-        f"frames={total_frames}",
-        f"seconds={elapsed:.3f}",
-        f"effective_rate={total_frames / elapsed:.1f} fps",
-        f"channel_counts={channel_counts}",
-        flush=True,
-    )
-    if csv_path is not None:
-        print("CSV:", csv_path, flush=True)
-    if raw_path is not None:
-        print("Raw:", raw_path, flush=True)
     return 0
 
 

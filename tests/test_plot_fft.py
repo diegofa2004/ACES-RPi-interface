@@ -151,8 +151,6 @@ class PlotFFTTests(unittest.TestCase):
 
     def test_render_plot_can_write_png_in_headless_mode(self):
         plt, _, _ = plotFFT._load_pyplot("Agg")
-        if plt is None:
-            self.skipTest("matplotlib nao esta disponivel neste ambiente")
         fig, axes = plt.subplots(2, 1, figsize=(6, 6))
         spectrum_ax, spectrogram_ax = axes
         fft_cache = np.abs(np.arange(1, 41, dtype=np.float32).reshape(5, 8))
@@ -180,8 +178,6 @@ class PlotFFTTests(unittest.TestCase):
 
     def test_render_single_window_plot_supports_zero_center_and_mock_overlay(self):
         plt, _, _ = plotFFT._load_pyplot("Agg")
-        if plt is None:
-            self.skipTest("matplotlib nao esta disponivel neste ambiente")
         fig, spectrum_ax = plt.subplots(1, 1, figsize=(6, 4))
         fft_frame = np.asarray([1.0, 2.0, 8.0, 2.0], dtype=np.float32)
         mock_frame = np.asarray([1.0, 3.0, 7.0, 3.0], dtype=np.float32)
