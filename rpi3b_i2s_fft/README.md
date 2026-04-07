@@ -207,13 +207,14 @@ Terminal 3 (optional, only if you want a raw CSV dump of the incoming I2S stream
 cd rpi3b_i2s_fft
 .venv/bin/python fft_i2s_logger.py -r 48828 --csv fft_capture.csv --capture-backend alsa-c \
     --loss-tolerance-pairs 3 \
-    --tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
+    --packet-index-shift 22 --packet-index-bits 10 --fft-packet-index-base 512 \
+    --tag-shift 20 --tag-mask 0x3 --payload-bits 18 \
     --tag-idle 0 --tag-bfpexp 1 --tag-fft 2
 ```
 
 You only need 1 terminal for the full comparison flow, 2 if you also want the FFT viewer, and 3 only if you additionally want the raw CSV logger.
 The CSV now preserves the raw 32-bit words and also records decoded `kind`, `tag`,
-`payload`, and reserved-bit fields for each channel.
+`packet_index`, `payload`, and reserved-bit fields for each channel.
 
 ## Use from another Python program
 
@@ -246,7 +247,7 @@ Raw mode (no in-band tags):
 
 Tagged mode (with in-band BFPEXP/FFT/idle tags):
 
-- Upper bits carry tag metadata, so payload is not full 32-bit signed anymore.
+- Upper bits carry packet index plus tag metadata, so payload is not full 32-bit signed anymore.
 - Default payload is signed 18-bit (documented below in the tagged section).
 
 ## Migrating your friend's analyzer from serial audio to FPGA FFT bins
@@ -353,6 +354,8 @@ What the offline tests cover:
 Robustness improvements added together with the tests:
 
 - `FPGAFFTReceiver` now preserves unread tagged pairs from the same chunk when a frame ends or breaks early, instead of dropping them
+- tagged-mode frame reconstruction now uses the packet index, so isolated lost words zero-fill only the missing bins instead of desynchronizing the whole frame
+- `FPGAFFTReceiver.last_frame_missing_bins` exposes which FFT bins had to be synthesized as zeros on the last returned frame
 - tagged-mode configuration now rejects `payload_bits` that overlap the tag field
 - event recording now freezes the pre-buffer at the exact moment `Enter` is pressed, avoiding duplication of frames from the future window
 - logger and plot scripts expose smaller helper functions so behavior can be validated directly in unit tests
@@ -399,7 +402,7 @@ Example (line numbers are GPIO chip offsets):
 Notes about framing reliability:
 
 - GPIO-only framing works, but ALSA buffering means trigger timing and sample boundaries are not perfectly phase-locked.
-- For best robustness, keep streaming all the time and include in-band framing (start marker or bin index + valid bit).
+- For best robustness, keep streaming all the time and include in-band framing with packet index and tag.
 - Zero-fill by itself is not enough to mark frame boundaries because true FFT bins can also be zero.
 
 In-band tagged stream mode (BFPEXP + FFT + idle over I2S):
@@ -408,9 +411,10 @@ In-band tagged stream mode (BFPEXP + FFT + idle over I2S):
 - `--strict-sync` is the recommended preset for the validated TB contract.
 - `--tolerant-sync` keeps the same tagged contract but relaxes startup attach.
 - Disable only for legacy raw-mode capture with `--no-use-i2s-tags`.
-- Each 32-bit I2S word carries a small type tag plus signed payload bits.
+- Each 32-bit I2S word carries packet index, type tag, reserved bits, and signed payload bits.
 - Default mapping used by the receiver:
-	- `tag_shift=30`, `tag_mask=0x3` (2 tag bits in bits 31..30)
+	- `packet_index_shift=22`, `packet_index_bits=10`, `fft_packet_index_base=512`
+	- `tag_shift=20`, `tag_mask=0x3` (2 tag bits in bits 21..20)
 	- `payload_bits=18` (signed payload in bits 17..0)
 	- tags: `0=idle`, `1=BFPEXP`, `2=FFT`
 
@@ -418,10 +422,11 @@ Frame start logic in tagged mode:
 
 - Receiver ignores leading `idle` words while searching for a frame.
 - By default, `analyzer_from_fpga_fft.py` requires `128` consecutive BFPEXP-tagged pairs before a new FFT burst is accepted.
+- In strict mode, those BFPEXP pairs are expected to carry packet indices `0 .. bfpexp_hold_pairs-1`.
 - By default, up to `3` corrupted/missing tagged pairs per burst are tolerated while tracking BFPEXP and FFT.
-- After that BFPEXP preamble is seen, the first FFT-tagged pair starts the FFT frame.
-- Receiver then counts exactly 512 FFT-tagged complex pairs.
-- Tolerated losses inside the FFT window are zero-filled so a single link glitch does not discard the whole frame.
+- After that BFPEXP preamble is seen, FFT-tagged pairs are placed into the frame by `packet_index - fft_packet_index_base`.
+- Receiver therefore reconstructs the 512-bin frame even if a few tagged pairs are lost in the middle.
+- Tolerated losses inside the FFT window are zero-filled only for the missing packet indices, so a single link glitch does not discard the whole frame or shift subsequent bins.
 - On completion, DONE GPIO is pulsed (if `--done-line` is configured).
 
 Example tagged mode run:
@@ -429,7 +434,9 @@ Example tagged mode run:
 ```bash
 .venv/bin/python analyzer_from_fpga_fft.py --strict-sync -r 48828 \
 	--frame-bins 512 --useful-bins 256 \
-	--tag-shift 30 --tag-mask 0x3 --payload-bits 18 \
+	--bfpexp-hold-pairs 128 \
+	--packet-index-shift 22 --packet-index-bits 10 --fft-packet-index-base 512 \
+	--tag-shift 20 --tag-mask 0x3 --payload-bits 18 \
 	--tag-idle 0 --tag-bfpexp 1 --tag-fft 2 \
 	--done-line 24
 ```
@@ -454,13 +461,17 @@ Debug matrix helper:
 Example:
 
 ```bash
-./run_channel_debug_matrix.sh --seconds 8
+./run_channel_debug_matrix.sh --seconds 8 \
+	--packet-index-shift 22 --packet-index-bits 10 --fft-packet-index-base 512 \
+	--tag-shift 20 --tag-mask 0x3 --payload-bits 18
 ```
 
 Useful option when a BFPEXP GPIO exists:
 
 ```bash
-./run_channel_debug_matrix.sh --bfpexp-flag-line 23
+./run_channel_debug_matrix.sh --bfpexp-flag-line 23 \
+	--packet-index-shift 22 --packet-index-bits 10 --fft-packet-index-base 512 \
+	--tag-shift 20 --tag-mask 0x3 --payload-bits 18
 ```
 
 FPGA transmit reference (example RTL behavior):
@@ -474,8 +485,9 @@ FPGA transmit reference (example RTL behavior):
 
 Suggested 32-bit packing (matches default Python decoder):
 
-- bits `[31:30]` = `tag`
-- bits `[29:18]` = reserved (`0`)
+- bits `[31:22]` = `packet_index`
+- bits `[21:20]` = `tag`
+- bits `[19:18]` = reserved (`0`)
 - bits `[17:0]` = signed payload (2's complement)
 
 Timing note for the FPGA serializer:
@@ -488,10 +500,11 @@ Verilog-style helper:
 
 ```verilog
 function automatic [31:0] pack_word;
+	input [9:0]  packet_index;
 	input [1:0]  tag;
 	input signed [17:0] payload;
 	begin
-		pack_word = {tag, 12'd0, payload[17:0]};
+		pack_word = {packet_index, tag, 2'd0, payload[17:0]};
 	end
 endfunction
 ```
@@ -500,9 +513,9 @@ Per-I2S-frame mapping example:
 
 ```verilog
 // LRCLK left slot then right slot
-// Use the same tag on both channels for a given semantic type.
-left_word  <= pack_word(tag_kind, left_payload);
-right_word <= pack_word(tag_kind, right_payload);
+// Use the same tag and packet index on both channels for a given semantic type.
+left_word  <= pack_word(packet_index, tag_kind, left_payload);
+right_word <= pack_word(packet_index, tag_kind, right_payload);
 ```
 
 State-machine sketch:
@@ -511,12 +524,14 @@ State-machine sketch:
 case (state)
 	ST_BFPEXP: begin
 		tag_kind <= 2'd1;
+		packet_index <= bfpexp_repeat_idx[9:0];
 		// emit BFPEXP payload stream
 		if (bfpexp_last) state <= ST_FFT;
 	end
 
 	ST_FFT: begin
 		tag_kind <= 2'd2;
+		packet_index <= 10'd512 + fft_bin_idx[9:0];
 		// emit FFT bins as complex pairs
 		// left/right order must match the RPi decode assumption
 		if (fft_bin_idx == 9'd511 && sample_accepted) state <= ST_WAIT_DONE;
@@ -524,6 +539,7 @@ case (state)
 
 	ST_WAIT_DONE: begin
 		tag_kind <= 2'd0; // idle while waiting
+		packet_index <= 10'd0;
 		if (done_from_rpi_sync) state <= ST_BFPEXP;
 	end
 endcase
@@ -534,6 +550,7 @@ Important hardware notes:
 - Synchronize `done_from_rpi` into FPGA clock domain with 2 flip-flops.
 - If possible, hold each I2S word stable until shifted out (no combinational change mid-word).
 - Do not put the first `MSB` on `SD` in the same bit time as a `WS` transition; that shifts tags/payload on the Raspberry Pi side.
+- Keep the packet index equal on left/right words of the same complex sample.
 - If your left/right are swapped (imag/real), adjust either FPGA mapping or Python decoding consistently.
 
 Integration note:

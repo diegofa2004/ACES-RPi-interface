@@ -20,6 +20,10 @@ class FFTAdapterConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FFTAdapterConfig(use_i2s_tags=True, tag_shift=10, payload_bits=18)
 
+    def test_rejects_frame_bins_larger_than_fft_packet_index_range(self):
+        with self.assertRaises(ValueError):
+            FFTAdapterConfig(frame_bins=513)
+
 
 class FPGAFFTReceiverTests(unittest.TestCase):
     def test_receiver_polls_at_least_one_frame_per_read(self):
@@ -313,14 +317,14 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         rx = FPGAFFTReceiver(cfg)
         mismatch_stream = np.asarray(
             [
-                [pack_tagged_word(1, 9), pack_tagged_word(1, 9)],
-                [pack_tagged_word(0, 0), pack_tagged_word(0, 0)],  # tolerated loss inside BFPEXP preamble
-                [pack_tagged_word(2, 3), pack_tagged_word(2, 4)],
-                [pack_tagged_word(2, 0), pack_tagged_word(1, 1)],  # tolerated tag mismatch inside FFT frame
-                [pack_tagged_word(2, -8), pack_tagged_word(2, 15)],
-                [pack_tagged_word(2, 7), pack_tagged_word(2, -24)],
-                [pack_tagged_word(2, 11), pack_tagged_word(2, 5)],
-                [pack_tagged_word(2, -3), pack_tagged_word(2, 6)],
+                [pack_tagged_word(1, 9, packet_index=0), pack_tagged_word(1, 9, packet_index=0)],
+                [pack_tagged_word(0, 0, packet_index=0), pack_tagged_word(0, 0, packet_index=0)],  # tolerated loss inside BFPEXP preamble
+                [pack_tagged_word(2, 3, packet_index=512), pack_tagged_word(2, 4, packet_index=512)],
+                [pack_tagged_word(2, 0, packet_index=513), pack_tagged_word(1, 1, packet_index=513)],  # tolerated tag mismatch inside FFT frame
+                [pack_tagged_word(2, -8, packet_index=514), pack_tagged_word(2, 15, packet_index=514)],
+                [pack_tagged_word(2, 7, packet_index=515), pack_tagged_word(2, -24, packet_index=515)],
+                [pack_tagged_word(2, 11, packet_index=516), pack_tagged_word(2, 5, packet_index=516)],
+                [pack_tagged_word(2, -3, packet_index=517), pack_tagged_word(2, 6, packet_index=517)],
             ],
             dtype=np.int32,
         ).tobytes()
@@ -361,6 +365,34 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         fft_bins, _ = frame
         np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
 
+    def test_tagged_mode_zero_fills_missing_bin_by_packet_index(self):
+        cfg = FFTAdapterConfig(
+            frame_bins=4,
+            useful_bins=4,
+            use_i2s_tags=True,
+            apply_bfpexp=False,
+            bfpexp_pairs_required=1,
+            handshake_timeout_seconds=0.01,
+        )
+        rx = FPGAFFTReceiver(cfg)
+        rx._proc = FakeProcess(
+            pack_tagged_pairs(
+                [
+                    (0, 1, 9, 9),
+                    (512, 2, 3, 4),
+                    (514, 2, -8, 15),
+                    (515, 2, 7, -24),
+                    (0, 1, 9, 9),
+                ]
+            )
+        )
+
+        frame = rx.read_frame()
+        self.assertIsNotNone(frame)
+        fft_bins, _ = frame
+        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 0.0, 17.0, 25.0], dtype=np.float32))
+        self.assertEqual(rx.last_frame_missing_bins, (1,))
+
     def test_tagged_mode_resynchronizes_after_broken_frame(self):
         cfg = FFTAdapterConfig(
             frame_bins=4,
@@ -386,10 +418,16 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         )
         rx._proc = FakeProcess(stream)
 
-        frame = rx.read_frame()
-        self.assertIsNotNone(frame)
-        fft_bins, _ = frame
-        np.testing.assert_allclose(fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
+        first_frame = rx.read_frame()
+        self.assertIsNotNone(first_frame)
+        first_fft_bins, _ = first_frame
+        np.testing.assert_allclose(first_fft_bins, np.asarray([np.sqrt(5.0), 5.0, 0.0, 0.0], dtype=np.float32))
+        self.assertEqual(rx.last_frame_missing_bins, (2, 3))
+
+        second_frame = rx.read_frame()
+        self.assertIsNotNone(second_frame)
+        second_fft_bins, _ = second_frame
+        np.testing.assert_allclose(second_fft_bins, np.asarray([5.0, 13.0, 17.0, 25.0], dtype=np.float32))
 
     def test_tagged_mode_realigns_bit_shifted_stream(self):
         cfg = FFTAdapterConfig(
@@ -477,7 +515,10 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             useful_bins=4,
             use_i2s_tags=True,
             apply_bfpexp=False,
-            tag_shift=28,
+            packet_index_shift=24,
+            packet_index_bits=8,
+            fft_packet_index_base=1 << 7,
+            tag_shift=22,
             payload_bits=16,
             require_bfpexp_before_fft=False,
             handshake_timeout_seconds=0.01,
@@ -492,8 +533,11 @@ class FPGAFFTReceiverTests(unittest.TestCase):
                     (2, -8, 15),
                     (2, 7, -24),
                 ],
+                packet_index_shift=24,
+                packet_index_bits=8,
+                fft_packet_index_base=1 << 7,
                 payload_bits=16,
-                tag_shift=28,
+                tag_shift=22,
             )
         )
 
@@ -513,9 +557,10 @@ class FPGAFFTReceiverTests(unittest.TestCase):
             dtype=np.int32,
         )
 
-        kind, payload = rx._pair_kind_and_payload(pair)
+        kind, packet_index, payload = rx._pair_kind_packet_index_and_payload(pair)
 
         self.assertEqual(kind, "tag_mismatch")
+        self.assertEqual(packet_index, 0)
         self.assertEqual(payload, (5, 5))
 
     def test_read_frame_applies_bfpexp_scaling_by_default(self):

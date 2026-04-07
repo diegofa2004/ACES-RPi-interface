@@ -115,9 +115,9 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
 
     def test_process_channel_debug_chunk_counts_mismatch_and_reserved_bits(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
-        left_word = pack_tagged_word(2, 5)
-        right_word = pack_tagged_word(1, 5)
-        reserved_word = int(np.asarray([np.uint32((2 << 30) | (1 << 18) | 9)], dtype=np.uint32).view(np.int32)[0])
+        left_word = pack_tagged_word(2, 5, packet_index=512)
+        right_word = pack_tagged_word(1, 5, packet_index=0)
+        reserved_word = int(np.asarray([np.uint32((512 << 22) | (2 << 20) | (1 << 18) | 9)], dtype=np.uint32).view(np.int32)[0])
         pairs = np.asarray(
             [
                 [left_word, right_word],

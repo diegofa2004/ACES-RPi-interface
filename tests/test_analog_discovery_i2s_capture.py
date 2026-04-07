@@ -66,15 +66,17 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
             dio_sd=15,
             bits_per_word=32,
             ws_low_channel="left",
-            tag_shift=30,
+            packet_index_shift=22,
+            packet_index_bits=10,
+            tag_shift=20,
             tag_mask=0x3,
             payload_bits=18,
         )
 
         preamble_word = 0x00000000
-        bfpexp_word = pack_tagged_word(1, -18)
-        fft_left_word = pack_tagged_word(2, 87381)
-        fft_right_word = pack_tagged_word(2, -43691)
+        bfpexp_word = pack_tagged_word(1, -18, packet_index=0)
+        fft_left_word = pack_tagged_word(2, 87381, packet_index=512)
+        fft_right_word = pack_tagged_word(2, -43691, packet_index=512)
         tail_word = 0x00000000
 
         slots = [
@@ -98,6 +100,7 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(summary.words), 4)
         self.assertEqual([word.tag for word in summary.words], [1, 1, 2, 2])
+        self.assertEqual([word.packet_index for word in summary.words], [0, 0, 512, 512])
         self.assertEqual([word.channel for word in summary.words], ["right", "left", "right", "left"])
         self.assertEqual([word.payload_signed for word in summary.words], [-18, -18, -43691, 87381])
         self.assertEqual(len(summary.frames), 2)
@@ -115,15 +118,17 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
             dio_sd=15,
             bits_per_word=32,
             ws_low_channel="left",
-            tag_shift=30,
+            packet_index_shift=22,
+            packet_index_bits=10,
+            tag_shift=20,
             tag_mask=0x3,
             payload_bits=18,
         )
 
         slots = [
             ("left", 0),
-            ("right", pack_tagged_word(1, -18)),
-            ("left", pack_tagged_word(1, -18)),
+            ("right", pack_tagged_word(1, -18, packet_index=0)),
+            ("left", pack_tagged_word(1, -18, packet_index=0)),
             ("right", 0),
         ]
         samples = _synthesize_i2s_samples(
@@ -150,11 +155,13 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(sample_rows), len(samples))
         self.assertEqual(len(word_rows), len(summary.words))
-        self.assertEqual(word_rows[0]["word_hex"], "0x4003FFEE")
-        self.assertEqual(word_rows[1]["word_hex"], "0x4003FFEE")
+        self.assertEqual(word_rows[0]["word_hex"], "0x0013FFEE")
+        self.assertEqual(word_rows[1]["word_hex"], "0x0013FFEE")
+        self.assertEqual(word_rows[0]["packet_index"], "0")
         decoded_rows = [row for row in sample_rows if row["decoded_word_hex"]]
         self.assertEqual(len(decoded_rows), 2)
         self.assertEqual(decoded_rows[0]["decoded_channel"], "right")
+        self.assertEqual(decoded_rows[0]["decoded_packet_index"], "0")
         self.assertEqual(decoded_rows[0]["decoded_payload_signed"], "-18")
 
 

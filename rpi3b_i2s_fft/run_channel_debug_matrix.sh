@@ -14,9 +14,9 @@ The script stores:
 - a session info file you can commit alongside the logs.
 
 Default scenarios:
-1. strict_tags_shift30
-2. relaxed_tags_shift30
-3. relaxed_tags_shift29
+1. strict_tags_shift20
+2. relaxed_tags_shift20
+3. relaxed_tags_shift21
 
 Usage:
   ./run_channel_debug_matrix.sh [options]
@@ -32,14 +32,19 @@ Options:
       --bfpexp-flag-line N     Optional GPIO input line captured in debug logs
       --flag-active-low        Mark BFPEXP flag as active-low
       --wait-low-level         Use low-level wait semantics in analyzer config
-      --tag-shift N            Nominal tag shift (default: 30)
+      --bfpexp-hold-pairs N    Required BFPEXP tagged pairs before FFT (default: 128)
+      --packet-index-shift N   Packet-index field shift (default: 22)
+      --packet-index-bits N    Packet-index field width (default: 10)
+      --fft-packet-index-base N
+                               First packet index used by FFT payloads (default: 512)
+      --tag-shift N            Nominal tag shift (default: 20)
       --tag-mask N             Tag mask, accepts 0x... (default: 0x3)
       --payload-bits N         Signed payload width (default: 18)
       --tag-idle N             Idle tag value (default: 0)
       --tag-bfpexp N           BFPEXP tag value (default: 1)
       --tag-fft N              FFT tag value (default: 2)
       --extra-tag-shifts LIST  Extra relaxed probe shifts, space or comma separated
-                               (default: 29)
+                               (default: 21)
       --chunk-pairs N          Raw stereo pairs captured/replayed per chunk (default: 1024)
       --preview-pairs N        Preview pairs stored per chunk (default: 12)
       --python BIN             Python interpreter to use
@@ -66,13 +71,17 @@ GPIO_CHIP="/dev/gpiochip0"
 BFPEXP_FLAG_LINE=""
 FLAG_ACTIVE_LOW=0
 WAIT_LOW_LEVEL=0
-TAG_SHIFT=30
+BFPEXP_HOLD_PAIRS=128
+PACKET_INDEX_SHIFT=22
+PACKET_INDEX_BITS=10
+FFT_PACKET_INDEX_BASE=512
+TAG_SHIFT=20
 TAG_MASK="0x3"
 PAYLOAD_BITS=18
 TAG_IDLE=0
 TAG_BFPEXP=1
 TAG_FFT=2
-EXTRA_TAG_SHIFTS_RAW="29"
+EXTRA_TAG_SHIFTS_RAW="21"
 CHUNK_PAIRS=1024
 PREVIEW_PAIRS=12
 PYTHON_BIN="${DEFAULT_PYTHON}"
@@ -119,6 +128,22 @@ while [[ $# -gt 0 ]]; do
     --wait-low-level)
       WAIT_LOW_LEVEL=1
       shift
+      ;;
+    --bfpexp-hold-pairs)
+      BFPEXP_HOLD_PAIRS="$2"
+      shift 2
+      ;;
+    --packet-index-shift)
+      PACKET_INDEX_SHIFT="$2"
+      shift 2
+      ;;
+    --packet-index-bits)
+      PACKET_INDEX_BITS="$2"
+      shift 2
+      ;;
+    --fft-packet-index-base)
+      FFT_PACKET_INDEX_BASE="$2"
+      shift 2
       ;;
     --tag-shift)
       TAG_SHIFT="$2"
@@ -238,6 +263,10 @@ chmod +x "${COMMANDS_PATH}"
   echo "bfpexp_flag_line=${BFPEXP_FLAG_LINE:-none}"
   echo "flag_active_low=${FLAG_ACTIVE_LOW}"
   echo "wait_low_level=${WAIT_LOW_LEVEL}"
+  echo "bfpexp_hold_pairs=${BFPEXP_HOLD_PAIRS}"
+  echo "packet_index_shift=${PACKET_INDEX_SHIFT}"
+  echo "packet_index_bits=${PACKET_INDEX_BITS}"
+  echo "fft_packet_index_base=${FFT_PACKET_INDEX_BASE}"
   echo "tag_shift=${TAG_SHIFT}"
   echo "tag_mask=${TAG_MASK}"
   echo "payload_bits=${PAYLOAD_BITS}"
@@ -282,7 +311,7 @@ Recommended commit:
 EOF
 
 printf '%s\n' \
-  "scenario	status	log_file	duration_seconds	total_pairs	idle	bfpexp	fft	tag_mismatch	other	max_fft_run	reserved_nonzero_words	flag_high_chunks	flag_low_chunks	flag_unknown_chunks	interrupted" \
+  "scenario	status	log_file	duration_seconds	total_pairs	idle	bfpexp	fft	tag_mismatch	packet_index_mismatch	other	max_fft_run	reserved_nonzero_words	flag_high_chunks	flag_low_chunks	flag_unknown_chunks	interrupted" \
   > "${SUMMARY_PATH}"
 
 COMMON_ARGS=(
@@ -294,6 +323,10 @@ COMMON_ARGS=(
   "--debug-capture-seconds" "${CAPTURE_SECONDS}"
   "--debug-chunk-pairs" "${CHUNK_PAIRS}"
   "--debug-preview-pairs" "${PREVIEW_PAIRS}"
+  "--bfpexp-hold-pairs" "${BFPEXP_HOLD_PAIRS}"
+  "--packet-index-shift" "${PACKET_INDEX_SHIFT}"
+  "--packet-index-bits" "${PACKET_INDEX_BITS}"
+  "--fft-packet-index-base" "${FFT_PACKET_INDEX_BASE}"
   "--tag-mask" "${TAG_MASK}"
   "--payload-bits" "${PAYLOAD_BITS}"
   "--tag-idle" "${TAG_IDLE}"
@@ -348,6 +381,7 @@ row = [
     str(kind_counts.get("bfpexp", "")),
     str(kind_counts.get("fft", "")),
     str(kind_counts.get("tag_mismatch", "")),
+    str(kind_counts.get("packet_index_mismatch", "")),
     str(kind_counts.get("other", "")),
     str(max_run.get("fft", "")),
     str(summary.get("reserved_nonzero_words", "")),

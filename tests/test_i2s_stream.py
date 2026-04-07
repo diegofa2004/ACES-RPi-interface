@@ -12,6 +12,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from rpi3b_i2s_fft import i2s_stream
+from tests.test_support import pack_tagged_word
 
 
 class I2SStreamTests(unittest.TestCase):
@@ -28,15 +29,35 @@ class I2SStreamTests(unittest.TestCase):
             return True
         metrics = i2s_stream._collect_tagged_alignment_metrics(
             np.asarray(pairs, dtype=np.int32).reshape(-1).astype(np.uint32),
-            tag_shift=30,
-            tag_mask=0x3,
-            payload_bits=18,
-            tag_idle=0,
-            tag_bfpexp=1,
-            tag_fft=2,
+            packet_index_shift=i2s_stream.DEFAULT_PACKET_INDEX_SHIFT,
+            packet_index_bits=i2s_stream.DEFAULT_PACKET_INDEX_BITS,
+            tag_shift=i2s_stream.DEFAULT_TAG_SHIFT,
+            tag_mask=i2s_stream.DEFAULT_TAG_MASK,
+            payload_bits=i2s_stream.DEFAULT_PAYLOAD_BITS,
+            tag_idle=i2s_stream.DEFAULT_TAG_IDLE,
+            tag_bfpexp=i2s_stream.DEFAULT_TAG_BFPEXP,
+            tag_fft=i2s_stream.DEFAULT_TAG_FFT,
+            fft_packet_index_base=i2s_stream.DEFAULT_FFT_PACKET_INDEX_BASE,
             search_pair_limit=max(4, len(pairs)),
         )
         return metrics.pair_count > 0 and metrics.invalid_pairs == 0 and metrics.good_pairs == metrics.pair_count
+
+    @staticmethod
+    def _make_reference_pairs() -> np.ndarray:
+        bfpexp_word = pack_tagged_word(1, 0x12, packet_index=0)
+        fft_word = pack_tagged_word(2, 0x15555, packet_index=i2s_stream.DEFAULT_FFT_PACKET_INDEX_BASE)
+        fft_word_1 = pack_tagged_word(2, 0x15555, packet_index=i2s_stream.DEFAULT_FFT_PACKET_INDEX_BASE + 1)
+        return np.asarray(
+            [
+                [bfpexp_word, bfpexp_word],
+                [fft_word, fft_word],
+                [fft_word_1, fft_word_1],
+                [bfpexp_word, bfpexp_word],
+                [fft_word, fft_word],
+                [fft_word_1, fft_word_1],
+            ],
+            dtype=np.int32,
+        )
 
     def test_build_arecord_cmd_uses_expected_format(self):
         cmd = i2s_stream.build_arecord_cmd("hw:1,0", i2s_stream.DEFAULT_CAPTURE_RATE_HZ)
@@ -118,17 +139,7 @@ class I2SStreamTests(unittest.TestCase):
         self.assertIn("Multiple ALSA capture devices were found", str(ctx.exception))
 
     def test_detect_tagged_alignment_recovers_expected_words_from_bit_shifted_stream(self):
-        true_pairs = np.asarray(
-            [
-                [0x40000012, 0x40000012],
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-                [0x40000012, 0x40000012],
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-            ],
-            dtype=np.uint32,
-        ).view(np.int32)
+        true_pairs = self._make_reference_pairs()
         observed = self._misframe_pairs(true_pairs, 14)
 
         alignment = i2s_stream.detect_tagged_i2s_alignment(observed)
@@ -149,17 +160,7 @@ class I2SStreamTests(unittest.TestCase):
         self.assertTrue(found_match)
 
     def test_tagged_realigner_survives_chunk_boundaries(self):
-        true_pairs = np.asarray(
-            [
-                [0x40000012, 0x40000012],
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-                [0x40000012, 0x40000012],
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-            ],
-            dtype=np.uint32,
-        ).view(np.int32)
+        true_pairs = self._make_reference_pairs()
         observed = self._misframe_pairs(true_pairs, 18)
 
         realigner = i2s_stream.TaggedI2SRealigner(confirm_pairs=4, validate_pairs=4)
@@ -173,14 +174,16 @@ class I2SStreamTests(unittest.TestCase):
         )
 
     def test_tagged_realigner_relocks_after_midstream_phase_jump(self):
+        bfpexp_word = pack_tagged_word(1, 0x12, packet_index=0)
+        fft_word = pack_tagged_word(2, 0x15555, packet_index=i2s_stream.DEFAULT_FFT_PACKET_INDEX_BASE)
         segment_a = np.asarray(
-            [[0x40000012, 0x40000012]] + [[0x80015555, 0x8000AAAB]] * 8,
-            dtype=np.uint32,
-        ).view(np.int32)
+            [[bfpexp_word, bfpexp_word]] + [[fft_word, fft_word]] * 8,
+            dtype=np.int32,
+        )
         segment_b = np.asarray(
-            [[0x40000012, 0x40000012]] + [[0x80015555, 0x8000AAAB]] * 8,
-            dtype=np.uint32,
-        ).view(np.int32)
+            [[bfpexp_word, bfpexp_word]] + [[fft_word, fft_word]] * 8,
+            dtype=np.int32,
+        )
         observed_a = self._misframe_pairs(segment_a, 9)
         observed_b = self._misframe_pairs(segment_b, 23)
         observed = np.concatenate((observed_a, observed_b), axis=0)

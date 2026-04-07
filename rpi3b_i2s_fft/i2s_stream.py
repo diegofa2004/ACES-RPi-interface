@@ -67,7 +67,10 @@ _PREFERRED_CAPTURE_KEYWORDS = (
     "sndrpi",
 )
 
-_DEFAULT_TAG_SHIFT = 30
+_DEFAULT_PACKET_INDEX_BITS = 10
+_DEFAULT_PACKET_INDEX_SHIFT = 22
+_DEFAULT_FFT_PACKET_INDEX_BASE = 1 << (_DEFAULT_PACKET_INDEX_BITS - 1)
+_DEFAULT_TAG_SHIFT = 20
 _DEFAULT_TAG_MASK = 0x3
 _DEFAULT_PAYLOAD_BITS = 18
 _DEFAULT_TAG_IDLE = 0
@@ -81,6 +84,16 @@ _DEFAULT_ALIGNMENT_LOCK_MIN_MARGIN = 140
 _DEFAULT_ALIGNMENT_MIN_GOOD_RATIO = 0.80
 _DEFAULT_ALIGNMENT_MIN_RESERVED_RATIO = 0.95
 _DEFAULT_ALIGNMENT_MAX_RAW_WORDS = 4096
+
+DEFAULT_PACKET_INDEX_BITS = _DEFAULT_PACKET_INDEX_BITS
+DEFAULT_PACKET_INDEX_SHIFT = _DEFAULT_PACKET_INDEX_SHIFT
+DEFAULT_FFT_PACKET_INDEX_BASE = _DEFAULT_FFT_PACKET_INDEX_BASE
+DEFAULT_TAG_SHIFT = _DEFAULT_TAG_SHIFT
+DEFAULT_TAG_MASK = _DEFAULT_TAG_MASK
+DEFAULT_PAYLOAD_BITS = _DEFAULT_PAYLOAD_BITS
+DEFAULT_TAG_IDLE = _DEFAULT_TAG_IDLE
+DEFAULT_TAG_BFPEXP = _DEFAULT_TAG_BFPEXP
+DEFAULT_TAG_FFT = _DEFAULT_TAG_FFT
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,67 @@ class TaggedI2SAlignmentMetrics:
     bfpexp_to_fft_transitions: int
 
 
+def decode_tagged_i2s_word(
+    word: int,
+    *,
+    tag_shift: int = _DEFAULT_TAG_SHIFT,
+    tag_mask: int = _DEFAULT_TAG_MASK,
+    payload_bits: int = _DEFAULT_PAYLOAD_BITS,
+    packet_index_shift: int = _DEFAULT_PACKET_INDEX_SHIFT,
+    packet_index_bits: int = _DEFAULT_PACKET_INDEX_BITS,
+) -> dict[str, object]:
+    uword = int(word) & 0xFFFFFFFF
+    tag = int((uword >> tag_shift) & tag_mask)
+
+    payload_mask = (1 << payload_bits) - 1
+    payload = int(uword & payload_mask)
+    sign_bit = 1 << (payload_bits - 1)
+    if payload & sign_bit:
+        payload -= 1 << payload_bits
+
+    packet_index_mask = (1 << packet_index_bits) - 1
+    packet_index = int((uword >> packet_index_shift) & packet_index_mask)
+
+    reserved_width = max(0, tag_shift - payload_bits)
+    reserved = 0
+    if reserved_width > 0:
+        reserved = int((uword >> payload_bits) & ((1 << reserved_width) - 1))
+
+    return {
+        "hex_value": f"0x{uword:08X}",
+        "tag": tag,
+        "packet_index": packet_index,
+        "payload": payload,
+        "reserved": reserved,
+        "reserved_nonzero": bool(reserved),
+    }
+
+
+def classify_tagged_i2s_pair(
+    left_tag: int,
+    right_tag: int,
+    *,
+    left_packet_index: int,
+    right_packet_index: int,
+    tag_idle: int = _DEFAULT_TAG_IDLE,
+    tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
+    tag_fft: int = _DEFAULT_TAG_FFT,
+    fft_packet_index_base: int = _DEFAULT_FFT_PACKET_INDEX_BASE,
+) -> str:
+    if left_tag != right_tag:
+        return "tag_mismatch"
+    if left_packet_index != right_packet_index:
+        return "packet_index_mismatch"
+
+    if left_tag == tag_idle:
+        return "idle" if left_packet_index == 0 else "packet_index_mismatch"
+    if left_tag == tag_bfpexp:
+        return "bfpexp" if left_packet_index < fft_packet_index_base else "packet_index_mismatch"
+    if left_tag == tag_fft:
+        return "fft" if left_packet_index >= fft_packet_index_base else "packet_index_mismatch"
+    return "unknown_tag"
+
+
 def _reframe_tagged_words(words_u32: np.ndarray, bit_offset: int) -> np.ndarray:
     if words_u32.size == 0:
         return np.empty(0, dtype=np.uint32)
@@ -121,12 +195,15 @@ def _reframe_tagged_words(words_u32: np.ndarray, bit_offset: int) -> np.ndarray:
 def _collect_tagged_alignment_metrics(
     words_u32: np.ndarray,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
     search_pair_limit: int,
 ) -> TaggedI2SAlignmentMetrics:
     if words_u32.size < 2:
@@ -149,12 +226,24 @@ def _collect_tagged_alignment_metrics(
     left = pairs[:, 0]
     right = pairs[:, 1]
 
+    packet_index_mask = np.uint32((1 << packet_index_bits) - 1)
+    packet_index_l = (left >> np.uint32(packet_index_shift)) & packet_index_mask
+    packet_index_r = (right >> np.uint32(packet_index_shift)) & packet_index_mask
     tags_l = (left >> np.uint32(tag_shift)) & np.uint32(tag_mask)
     tags_r = (right >> np.uint32(tag_shift)) & np.uint32(tag_mask)
     known_l = np.isin(tags_l, (tag_idle, tag_bfpexp, tag_fft))
     known_r = np.isin(tags_r, (tag_idle, tag_bfpexp, tag_fft))
     tag_match = tags_l == tags_r
-    good_pairs = known_l & known_r & tag_match
+    packet_index_match = packet_index_l == packet_index_r
+    idle_index_valid = packet_index_l == 0
+    bfpexp_index_valid = packet_index_l < fft_packet_index_base
+    fft_index_valid = packet_index_l >= fft_packet_index_base
+    semantic_index_valid = (
+        ((tags_l == tag_idle) & idle_index_valid) |
+        ((tags_l == tag_bfpexp) & bfpexp_index_valid) |
+        ((tags_l == tag_fft) & fft_index_valid)
+    )
+    good_pairs = known_l & known_r & tag_match & packet_index_match & semantic_index_valid
 
     reserved_width = max(0, tag_shift - payload_bits)
     reserved_mask = (
@@ -211,22 +300,28 @@ def _collect_tagged_alignment_metrics(
 def _score_tagged_alignment_candidate(
     words_u32: np.ndarray,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
     search_pair_limit: int,
 ) -> int:
     metrics = _collect_tagged_alignment_metrics(
         words_u32,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
         tag_shift=tag_shift,
         tag_mask=tag_mask,
         payload_bits=payload_bits,
         tag_idle=tag_idle,
         tag_bfpexp=tag_bfpexp,
         tag_fft=tag_fft,
+        fft_packet_index_base=fft_packet_index_base,
         search_pair_limit=search_pair_limit,
     )
     if metrics.pair_count < 4:
@@ -254,12 +349,15 @@ def _score_tagged_alignment_candidate(
 def _rank_tagged_alignment_candidates(
     stereo: np.ndarray,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
     search_pair_limit: int,
 ) -> list[TaggedI2SAlignment]:
     stereo_i32 = np.asarray(stereo, dtype=np.int32)
@@ -284,12 +382,15 @@ def _rank_tagged_alignment_candidates(
 
                 score = _score_tagged_alignment_candidate(
                     candidate,
+                    packet_index_shift=packet_index_shift,
+                    packet_index_bits=packet_index_bits,
                     tag_shift=tag_shift,
                     tag_mask=tag_mask,
                     payload_bits=payload_bits,
                     tag_idle=tag_idle,
                     tag_bfpexp=tag_bfpexp,
                     tag_fft=tag_fft,
+                    fft_packet_index_base=fft_packet_index_base,
                     search_pair_limit=search_pair_limit,
                 )
 
@@ -309,22 +410,28 @@ def _rank_tagged_alignment_candidates(
 def _detect_best_alignment_candidates(
     stereo: np.ndarray,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
     search_pair_limit: int,
 ) -> tuple[Optional[TaggedI2SAlignment], Optional[TaggedI2SAlignment]]:
     candidates = _rank_tagged_alignment_candidates(
         stereo,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
         tag_shift=tag_shift,
         tag_mask=tag_mask,
         payload_bits=payload_bits,
         tag_idle=tag_idle,
         tag_bfpexp=tag_bfpexp,
         tag_fft=tag_fft,
+        fft_packet_index_base=fft_packet_index_base,
         search_pair_limit=search_pair_limit,
     )
     if not candidates:
@@ -337,22 +444,28 @@ def _detect_best_alignment_candidates(
 def detect_tagged_i2s_alignment(
     stereo: np.ndarray,
     *,
+    packet_index_shift: int = _DEFAULT_PACKET_INDEX_SHIFT,
+    packet_index_bits: int = _DEFAULT_PACKET_INDEX_BITS,
     tag_shift: int = _DEFAULT_TAG_SHIFT,
     tag_mask: int = _DEFAULT_TAG_MASK,
     payload_bits: int = _DEFAULT_PAYLOAD_BITS,
     tag_idle: int = _DEFAULT_TAG_IDLE,
     tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
     tag_fft: int = _DEFAULT_TAG_FFT,
+    fft_packet_index_base: int = _DEFAULT_FFT_PACKET_INDEX_BASE,
     search_pair_limit: int = _DEFAULT_ALIGNMENT_SEARCH_PAIR_LIMIT,
 ) -> Optional[TaggedI2SAlignment]:
     best, _runner_up = _detect_best_alignment_candidates(
         stereo,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
         tag_shift=tag_shift,
         tag_mask=tag_mask,
         payload_bits=payload_bits,
         tag_idle=tag_idle,
         tag_bfpexp=tag_bfpexp,
         tag_fft=tag_fft,
+        fft_packet_index_base=fft_packet_index_base,
         search_pair_limit=search_pair_limit,
     )
     if best is None or best.score < 120:
@@ -365,12 +478,15 @@ class TaggedI2SRealigner:
     def __init__(
         self,
         *,
+        packet_index_shift: int = _DEFAULT_PACKET_INDEX_SHIFT,
+        packet_index_bits: int = _DEFAULT_PACKET_INDEX_BITS,
         tag_shift: int = _DEFAULT_TAG_SHIFT,
         tag_mask: int = _DEFAULT_TAG_MASK,
         payload_bits: int = _DEFAULT_PAYLOAD_BITS,
         tag_idle: int = _DEFAULT_TAG_IDLE,
         tag_bfpexp: int = _DEFAULT_TAG_BFPEXP,
         tag_fft: int = _DEFAULT_TAG_FFT,
+        fft_packet_index_base: int = _DEFAULT_FFT_PACKET_INDEX_BASE,
         search_pair_limit: int = _DEFAULT_ALIGNMENT_SEARCH_PAIR_LIMIT,
         confirm_pairs: int = _DEFAULT_ALIGNMENT_CONFIRM_PAIRS,
         validate_pairs: int = _DEFAULT_ALIGNMENT_VALIDATE_PAIRS,
@@ -381,12 +497,15 @@ class TaggedI2SRealigner:
         max_raw_words: int = _DEFAULT_ALIGNMENT_MAX_RAW_WORDS,
         preferred_swap_channels: Optional[bool] = None,
     ):
+        self._packet_index_shift = packet_index_shift
+        self._packet_index_bits = packet_index_bits
         self._tag_shift = tag_shift
         self._tag_mask = tag_mask
         self._payload_bits = payload_bits
         self._tag_idle = tag_idle
         self._tag_bfpexp = tag_bfpexp
         self._tag_fft = tag_fft
+        self._fft_packet_index_base = fft_packet_index_base
         self._search_pair_limit = max(8, int(search_pair_limit))
         self._confirm_pairs = max(1, int(confirm_pairs))
         self._validate_pairs = max(4, int(validate_pairs))
@@ -426,12 +545,15 @@ class TaggedI2SRealigner:
 
         candidates = _rank_tagged_alignment_candidates(
             search_words.view(np.int32).reshape(-1, 2),
+            packet_index_shift=self._packet_index_shift,
+            packet_index_bits=self._packet_index_bits,
             tag_shift=self._tag_shift,
             tag_mask=self._tag_mask,
             payload_bits=self._payload_bits,
             tag_idle=self._tag_idle,
             tag_bfpexp=self._tag_bfpexp,
             tag_fft=self._tag_fft,
+            fft_packet_index_base=self._fft_packet_index_base,
             search_pair_limit=self._search_pair_limit,
         )
         if not candidates:
@@ -510,12 +632,15 @@ class TaggedI2SRealigner:
         window = window[-min(window.shape[0], self._validate_pairs) :]
         metrics = _collect_tagged_alignment_metrics(
             window.reshape(-1).astype(np.uint32, copy=False),
+            packet_index_shift=self._packet_index_shift,
+            packet_index_bits=self._packet_index_bits,
             tag_shift=self._tag_shift,
             tag_mask=self._tag_mask,
             payload_bits=self._payload_bits,
             tag_idle=self._tag_idle,
             tag_bfpexp=self._tag_bfpexp,
             tag_fft=self._tag_fft,
+            fft_packet_index_base=self._fft_packet_index_base,
             search_pair_limit=window.shape[0],
         )
         if metrics.pair_count == 0:
@@ -534,12 +659,15 @@ class TaggedI2SRealigner:
 
         metrics = _collect_tagged_alignment_metrics(
             pair.reshape(-1).astype(np.uint32, copy=False),
+            packet_index_shift=self._packet_index_shift,
+            packet_index_bits=self._packet_index_bits,
             tag_shift=self._tag_shift,
             tag_mask=self._tag_mask,
             payload_bits=self._payload_bits,
             tag_idle=self._tag_idle,
             tag_bfpexp=self._tag_bfpexp,
             tag_fft=self._tag_fft,
+            fft_packet_index_base=self._fft_packet_index_base,
             search_pair_limit=1,
         )
         return metrics.pair_count == 1 and metrics.good_pairs == 1 and metrics.reserved_zero_good_pairs == 1

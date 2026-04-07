@@ -22,7 +22,18 @@ try:
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
         resolve_audio_device,
     )
 except ImportError:
@@ -33,7 +44,24 @@ except ImportError:
         FFTAdapterConfig,
         FPGAFFTReceiver,
     )
-    from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_BACKEND, DEFAULT_CAPTURE_RATE_HZ, build_capture_cmd, resolve_audio_device
+    from i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
+        DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
+        resolve_audio_device,
+    )
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -190,40 +218,46 @@ def _u32_hex(word: int) -> str:
 
 
 def _decode_debug_word(word: int, cfg: FFTAdapterConfig) -> dict[str, object]:
-    uword = int(word) & 0xFFFFFFFF
-    tag = int((uword >> cfg.tag_shift) & cfg.tag_mask)
-
-    payload_mask = (1 << cfg.payload_bits) - 1
-    payload = int(uword & payload_mask)
-    sign_bit = 1 << (cfg.payload_bits - 1)
-    if payload & sign_bit:
-        payload -= 1 << cfg.payload_bits
-
-    reserved_width = max(0, cfg.tag_shift - cfg.payload_bits)
-    reserved = 0
-    if reserved_width > 0:
-        reserved = int((uword >> cfg.payload_bits) & ((1 << reserved_width) - 1))
+    decoded = decode_tagged_i2s_word(
+        word,
+        packet_index_shift=cfg.packet_index_shift,
+        packet_index_bits=cfg.packet_index_bits,
+        tag_shift=cfg.tag_shift,
+        tag_mask=cfg.tag_mask,
+        payload_bits=cfg.payload_bits,
+    )
 
     return {
         "hex": _u32_hex(word),
         "i32": int(word),
-        "tag": tag,
-        "payload": payload,
-        "reserved": reserved,
-        "reserved_nonzero": bool(reserved),
+        "tag": int(decoded["tag"]),
+        "packet_index": int(decoded["packet_index"]),
+        "payload": int(decoded["payload"]),
+        "reserved": int(decoded["reserved"]),
+        "reserved_nonzero": bool(decoded["reserved_nonzero"]),
     }
 
 
-def _classify_debug_pair(left_tag: int, right_tag: int, cfg: FFTAdapterConfig) -> str:
-    if left_tag != right_tag:
-        return "tag_mismatch"
-    if left_tag == cfg.tag_idle:
-        return "idle"
-    if left_tag == cfg.tag_bfpexp:
-        return "bfpexp"
-    if left_tag == cfg.tag_fft:
-        return "fft"
-    return "other"
+def _classify_debug_pair(
+    left_tag: int,
+    right_tag: int,
+    left_packet_index: int,
+    right_packet_index: int,
+    cfg: FFTAdapterConfig,
+) -> str:
+    kind = classify_tagged_i2s_pair(
+        left_tag,
+        right_tag,
+        left_packet_index=left_packet_index,
+        right_packet_index=right_packet_index,
+        tag_idle=cfg.tag_idle,
+        tag_bfpexp=cfg.tag_bfpexp,
+        tag_fft=cfg.tag_fft,
+        fft_packet_index_base=cfg.fft_packet_index_base,
+    )
+    if kind == "unknown_tag":
+        return "other"
+    return kind
 
 
 def create_channel_debug_state() -> dict[str, object]:
@@ -285,7 +319,13 @@ def process_channel_debug_chunk(
     for pair_index, pair in enumerate(np.asarray(pairs, dtype=np.int32)):
         left = _decode_debug_word(int(pair[0]), cfg)
         right = _decode_debug_word(int(pair[1]), cfg)
-        kind = _classify_debug_pair(int(left["tag"]), int(right["tag"]), cfg)
+        kind = _classify_debug_pair(
+            int(left["tag"]),
+            int(right["tag"]),
+            int(left["packet_index"]),
+            int(right["packet_index"]),
+            cfg,
+        )
 
         kind_counts[kind] += 1
         raw_tag_counts_left[int(left["tag"])] += 1
@@ -986,12 +1026,15 @@ def main() -> int:
         default=None,
         help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream (default: enabled)",
     )
-    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
-    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
-    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each word")
-    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value representing idle/no data")
-    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
-    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
+    parser.add_argument("--packet-index-shift", type=int, default=DEFAULT_PACKET_INDEX_SHIFT, help="Bit shift of the packet-index field in each 32-bit word")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
+    parser.add_argument("--fft-packet-index-base", type=int, default=DEFAULT_FFT_PACKET_INDEX_BASE, help="First packet index used by FFT payload words")
+    parser.add_argument("--tag-shift", type=int, default=DEFAULT_TAG_SHIFT, help="Bit shift of type tag in each 32-bit word")
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=DEFAULT_TAG_MASK, help="Bitmask for type tag")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width inside each word")
+    parser.add_argument("--tag-idle", type=int, default=DEFAULT_TAG_IDLE, help="Tag value representing idle/no data")
+    parser.add_argument("--tag-bfpexp", type=int, default=DEFAULT_TAG_BFPEXP, help="Tag value representing BFPEXP data")
+    parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value representing FFT complex bins")
     parser.add_argument(
         "--apply-bfpexp",
         action=argparse.BooleanOptionalAction,
@@ -1096,10 +1139,14 @@ def main() -> int:
         parser.error("--rate must be positive")
     if args.frame_bins <= 0:
         parser.error("--frame-bins must be positive")
+    if args.frame_bins > args.fft_packet_index_base:
+        parser.error("--frame-bins must fit inside the FFT packet-index range")
     if not 2 <= args.useful_bins <= args.frame_bins:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    if args.packet_index_bits <= 0:
+        parser.error("--packet-index-bits must be positive")
     sync_cfg = _resolve_sync_cli_defaults(args)
     use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
@@ -1172,6 +1219,9 @@ def main() -> int:
             handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
             wait_for_flag_falling_edge=not args.wait_low_level,
             use_i2s_tags=use_i2s_tags,
+            packet_index_shift=args.packet_index_shift,
+            packet_index_bits=args.packet_index_bits,
+            fft_packet_index_base=args.fft_packet_index_base,
             tag_shift=args.tag_shift,
             tag_mask=args.tag_mask,
             payload_bits=args.payload_bits,

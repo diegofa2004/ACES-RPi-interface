@@ -15,8 +15,19 @@ try:
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
         read_exactly,
         resolve_audio_device,
         start_capture_process,
@@ -29,8 +40,19 @@ except ImportError:
         AUTO_AUDIO_DEVICE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
         build_capture_cmd,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
         read_exactly,
         resolve_audio_device,
         start_capture_process,
@@ -51,53 +73,47 @@ def format_i32_hex(value: int) -> str:
 def decode_tagged_word(
     value: int,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
 ) -> dict[str, object]:
-    uword = int(value) & 0xFFFFFFFF
-    tag = (uword >> tag_shift) & tag_mask
-
-    payload_mask = (1 << payload_bits) - 1
-    payload = uword & payload_mask
-    sign_bit = 1 << (payload_bits - 1)
-    if payload & sign_bit:
-        payload -= 1 << payload_bits
-
-    reserved_width = max(0, tag_shift - payload_bits)
-    reserved = 0
-    if reserved_width > 0:
-        reserved = (uword >> payload_bits) & ((1 << reserved_width) - 1)
-
-    return {
-        "tag": int(tag),
-        "payload": int(payload),
-        "reserved": int(reserved),
-        "reserved_nonzero": bool(reserved),
-    }
+    return decode_tagged_i2s_word(
+        value,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+    )
 
 
 def classify_tagged_pair(
     left_tag: int,
     right_tag: int,
     *,
+    left_packet_index: int,
+    right_packet_index: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
 ) -> str:
-    if left_tag != right_tag:
-        return "tag_mismatch"
-    if left_tag == tag_idle:
-        return "idle"
-    if left_tag == tag_bfpexp:
-        return "bfpexp"
-    if left_tag == tag_fft:
-        return "fft"
-    return "unknown_tag"
+    return classify_tagged_i2s_pair(
+        left_tag,
+        right_tag,
+        left_packet_index=left_packet_index,
+        right_packet_index=right_packet_index,
+        tag_idle=tag_idle,
+        tag_bfpexp=tag_bfpexp,
+        tag_fft=tag_fft,
+        fft_packet_index_base=fft_packet_index_base,
+    )
 
 
 def is_tolerable_loss_kind(kind: str) -> bool:
-    return kind in ("tag_mismatch", "unknown_tag", "idle")
+    return kind in ("tag_mismatch", "packet_index_mismatch", "unknown_tag", "idle")
 
 
 def create_contract_tracker(
@@ -287,12 +303,15 @@ def write_csv_rows(
     stereo: np.ndarray,
     seq_start: int,
     *,
+    packet_index_shift: int,
+    packet_index_bits: int,
     tag_shift: int,
     tag_mask: int,
     payload_bits: int,
     tag_idle: int,
     tag_bfpexp: int,
     tag_fft: int,
+    fft_packet_index_base: int,
     contract_tracker: Optional[dict[str, object]] = None,
     timestamp_ns_fn=time.time_ns,
 ) -> int:
@@ -301,12 +320,16 @@ def write_csv_rows(
     for row in stereo:
         left = decode_tagged_word(
             int(row[0]),
+            packet_index_shift=packet_index_shift,
+            packet_index_bits=packet_index_bits,
             tag_shift=tag_shift,
             tag_mask=tag_mask,
             payload_bits=payload_bits,
         )
         right = decode_tagged_word(
             int(row[1]),
+            packet_index_shift=packet_index_shift,
+            packet_index_bits=packet_index_bits,
             tag_shift=tag_shift,
             tag_mask=tag_mask,
             payload_bits=payload_bits,
@@ -314,9 +337,12 @@ def write_csv_rows(
         kind = classify_tagged_pair(
             int(left["tag"]),
             int(right["tag"]),
+            left_packet_index=int(left["packet_index"]),
+            right_packet_index=int(right["packet_index"]),
             tag_idle=tag_idle,
             tag_bfpexp=tag_bfpexp,
             tag_fft=tag_fft,
+            fft_packet_index_base=fft_packet_index_base,
         )
         contract_phase = ""
         contract_frame = -1
@@ -333,6 +359,8 @@ def write_csv_rows(
                 contract_phase,
                 contract_frame,
                 contract_index,
+                left["packet_index"],
+                right["packet_index"],
                 left["tag"],
                 right["tag"],
                 left["payload"],
@@ -390,12 +418,15 @@ def main() -> int:
         default=DEFAULT_CSV_FLUSH_EVERY_CHUNKS,
         help="Flush CSV data every N chunks instead of every chunk",
     )
-    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
-    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
-    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each word")
-    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value representing idle/no data")
-    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
-    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
+    parser.add_argument("--packet-index-shift", type=int, default=DEFAULT_PACKET_INDEX_SHIFT, help="Bit shift of the packet-index field")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
+    parser.add_argument("--fft-packet-index-base", type=int, default=DEFAULT_FFT_PACKET_INDEX_BASE, help="First packet index used by FFT payload words")
+    parser.add_argument("--tag-shift", type=int, default=DEFAULT_TAG_SHIFT, help="Bit shift of type tag in each 32-bit word")
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=DEFAULT_TAG_MASK, help="Bitmask for type tag")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width inside each word")
+    parser.add_argument("--tag-idle", type=int, default=DEFAULT_TAG_IDLE, help="Tag value representing idle/no data")
+    parser.add_argument("--tag-bfpexp", type=int, default=DEFAULT_TAG_BFPEXP, help="Tag value representing BFPEXP data")
+    parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value representing FFT complex bins")
     parser.add_argument(
         "--bfpexp-hold-pairs",
         type=int,
@@ -419,12 +450,16 @@ def main() -> int:
         parser.error("--rate must be positive")
     if args.frame_bins <= 0:
         parser.error("--frame-bins must be positive")
+    if args.frame_bins > args.fft_packet_index_base:
+        parser.error("--frame-bins must fit inside the FFT packet-index range")
     if args.chunk_frames <= 0:
         parser.error("--chunk-frames must be positive")
     if args.flush_every_chunks <= 0:
         parser.error("--flush-every-chunks must be positive")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    if args.packet_index_bits <= 0:
+        parser.error("--packet-index-bits must be positive")
     if args.bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
     if args.loss_tolerance_pairs < 0:
@@ -442,12 +477,15 @@ def main() -> int:
     chunk_index = 0
     stop = False
     realigner = TaggedI2SRealigner(
+        packet_index_shift=args.packet_index_shift,
+        packet_index_bits=args.packet_index_bits,
         tag_shift=args.tag_shift,
         tag_mask=args.tag_mask,
         payload_bits=args.payload_bits,
         tag_idle=args.tag_idle,
         tag_bfpexp=args.tag_bfpexp,
         tag_fft=args.tag_fft,
+        fft_packet_index_base=args.fft_packet_index_base,
         preferred_swap_channels=True,
     )
     normalizer = MirroredPairNormalizer()
@@ -499,6 +537,8 @@ def main() -> int:
                     "contract_phase",
                     "contract_frame",
                     "contract_index",
+                    "left_packet_index",
+                    "right_packet_index",
                     "left_tag",
                     "right_tag",
                     "left_payload",
@@ -535,12 +575,15 @@ def main() -> int:
                     writer,
                     stereo,
                     seq,
+                    packet_index_shift=args.packet_index_shift,
+                    packet_index_bits=args.packet_index_bits,
                     tag_shift=args.tag_shift,
                     tag_mask=args.tag_mask,
                     payload_bits=args.payload_bits,
                     tag_idle=args.tag_idle,
                     tag_bfpexp=args.tag_bfpexp,
                     tag_fft=args.tag_fft,
+                    fft_packet_index_base=args.fft_packet_index_base,
                     contract_tracker=contract_tracker,
                 )
                 chunk_index += 1

@@ -16,7 +16,21 @@ try:
         FFTAdapterConfig,
         FPGAFFTReceiver,
     )
-    from .i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_BACKEND, DEFAULT_CAPTURE_RATE_HZ, resolve_audio_device
+    from .i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
+        DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        resolve_audio_device,
+    )
 except ImportError:
     from fpga_fft_adapter import (
         DEFAULT_BFPEXP_HOLD_PAIRS,
@@ -24,7 +38,21 @@ except ImportError:
         FFTAdapterConfig,
         FPGAFFTReceiver,
     )
-    from i2s_stream import AUTO_AUDIO_DEVICE, DEFAULT_CAPTURE_BACKEND, DEFAULT_CAPTURE_RATE_HZ, resolve_audio_device
+    from i2s_stream import (
+        AUTO_AUDIO_DEVICE,
+        DEFAULT_CAPTURE_BACKEND,
+        DEFAULT_CAPTURE_RATE_HZ,
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        resolve_audio_device,
+    )
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -380,12 +408,15 @@ def main() -> int:
         default=None,
         help="Decode per-word in-band tags (idle/BFPEXP/FFT) from I2S stream (default: enabled)",
     )
-    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of type tag in each 32-bit word")
-    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=0x3, help="Bitmask for type tag")
-    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each word")
-    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value representing idle/no data")
-    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value representing BFPEXP data")
-    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value representing FFT complex bins")
+    parser.add_argument("--packet-index-shift", type=int, default=DEFAULT_PACKET_INDEX_SHIFT, help="Bit shift of the packet-index field")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
+    parser.add_argument("--fft-packet-index-base", type=int, default=DEFAULT_FFT_PACKET_INDEX_BASE, help="First packet index used by FFT payload words")
+    parser.add_argument("--tag-shift", type=int, default=DEFAULT_TAG_SHIFT, help="Bit shift of type tag in each 32-bit word")
+    parser.add_argument("--tag-mask", type=lambda v: int(v, 0), default=DEFAULT_TAG_MASK, help="Bitmask for type tag")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width inside each word")
+    parser.add_argument("--tag-idle", type=int, default=DEFAULT_TAG_IDLE, help="Tag value representing idle/no data")
+    parser.add_argument("--tag-bfpexp", type=int, default=DEFAULT_TAG_BFPEXP, help="Tag value representing BFPEXP data")
+    parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value representing FFT complex bins")
     parser.add_argument(
         "--bfpexp-hold-pairs",
         type=int,
@@ -416,6 +447,8 @@ def main() -> int:
         parser.error("--rate must be positive")
     if args.frame_bins <= 0:
         parser.error("--frame-bins must be positive")
+    if args.frame_bins > args.fft_packet_index_base:
+        parser.error("--frame-bins must fit inside the FFT packet-index range")
     if not 2 <= args.useful_bins <= args.frame_bins:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
     if args.max_freq <= 0:
@@ -432,6 +465,8 @@ def main() -> int:
         parser.error("--dynamic-range-db must be positive")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
+    if args.packet_index_bits <= 0:
+        parser.error("--packet-index-bits must be positive")
     if args.min_db is not None and args.max_db is not None and args.min_db >= args.max_db:
         parser.error("--min-db must be smaller than --max-db")
 
@@ -469,6 +504,9 @@ def main() -> int:
             handshake_timeout_seconds=max(0.001, args.handshake_timeout_ms / 1000.0),
             wait_for_flag_falling_edge=not args.wait_low_level,
             use_i2s_tags=use_i2s_tags,
+            packet_index_shift=args.packet_index_shift,
+            packet_index_bits=args.packet_index_bits,
+            fft_packet_index_base=args.fft_packet_index_base,
             tag_shift=args.tag_shift,
             tag_mask=args.tag_mask,
             payload_bits=args.payload_bits,

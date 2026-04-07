@@ -11,6 +11,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from rpi3b_i2s_fft import fft_i2s_logger
+from tests.test_support import pack_tagged_word
 
 
 class FFTI2SLoggerTests(unittest.TestCase):
@@ -27,7 +28,13 @@ class FFTI2SLoggerTests(unittest.TestCase):
     def test_write_csv_rows_increments_sequence(self):
         output = io.StringIO()
         writer = csv.writer(output)
-        stereo = np.asarray([[0x4000000A, 0x40000014], [0x8003FFFF, 0x80000008]], dtype=np.uint32).view(np.int32)
+        stereo = np.asarray(
+            [
+                [pack_tagged_word(1, 10, packet_index=0), pack_tagged_word(1, 20, packet_index=0)],
+                [pack_tagged_word(2, -1, packet_index=512), pack_tagged_word(2, 8, packet_index=512)],
+            ],
+            dtype=np.int32,
+        )
         timestamps = iter([1000, 1001])
         tracker = fft_i2s_logger.create_contract_tracker(
             frame_bins=2,
@@ -39,12 +46,15 @@ class FFTI2SLoggerTests(unittest.TestCase):
             writer,
             stereo,
             7,
-            tag_shift=30,
+            packet_index_shift=22,
+            packet_index_bits=10,
+            tag_shift=20,
             tag_mask=0x3,
             payload_bits=18,
             tag_idle=0,
             tag_bfpexp=1,
             tag_fft=2,
+            fft_packet_index_base=512,
             contract_tracker=tracker,
             timestamp_ns_fn=lambda: next(timestamps),
         )
@@ -53,8 +63,8 @@ class FFTI2SLoggerTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "1000,7,0x4000000A,0x40000014,bfpexp,bfpexp_preamble,0,0,1,1,10,20,0,0,0,0",
-                "1001,8,0x8003FFFF,0x80000008,fft,fft_frame,0,0,2,2,-1,8,0,0,0,0",
+                "1000,7,0x0010000A,0x00100014,bfpexp,bfpexp_preamble,0,0,0,0,1,1,10,20,0,0,0,0",
+                "1001,8,0x8023FFFF,0x80200008,fft,fft_frame,0,0,512,512,2,2,-1,8,0,0,0,0",
             ],
         )
 
@@ -62,29 +72,38 @@ class FFTI2SLoggerTests(unittest.TestCase):
         normalizer = fft_i2s_logger.MirroredPairNormalizer()
         stereo = np.asarray(
             [
-                [0x80015555, 0x8000AAAB],
-                [0x8000AAAB, 0x80015555],
-                [0x80015555, 0x8000AAAB],
-                [0x40000012, 0x40000012],
+                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
+                [pack_tagged_word(2, -0x15555, packet_index=512), pack_tagged_word(2, 0x15555, packet_index=512)],
+                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
+                [pack_tagged_word(1, 0x12, packet_index=0), pack_tagged_word(1, 0x12, packet_index=0)],
             ],
-            dtype=np.uint32,
-        ).view(np.int32)
+            dtype=np.int32,
+        )
 
         normalized = normalizer.normalize(stereo)
         expected = np.asarray(
             [
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-                [0x80015555, 0x8000AAAB],
-                [0x40000012, 0x40000012],
+                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
+                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
+                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
+                [pack_tagged_word(1, 0x12, packet_index=0), pack_tagged_word(1, 0x12, packet_index=0)],
             ],
-            dtype=np.uint32,
-        ).view(np.int32)
+            dtype=np.int32,
+        )
         np.testing.assert_array_equal(normalized, expected)
 
     def test_classify_tagged_pair_reports_mismatch(self):
         self.assertEqual(
-            fft_i2s_logger.classify_tagged_pair(2, 1, tag_idle=0, tag_bfpexp=1, tag_fft=2),
+            fft_i2s_logger.classify_tagged_pair(
+                2,
+                1,
+                left_packet_index=512,
+                right_packet_index=0,
+                tag_idle=0,
+                tag_bfpexp=1,
+                tag_fft=2,
+                fft_packet_index_base=512,
+            ),
             "tag_mismatch",
         )
 

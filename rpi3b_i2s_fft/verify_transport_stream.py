@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
 import os
 import select
@@ -14,6 +15,35 @@ from typing import Callable, Optional, Sequence, TextIO
 
 import numpy as np
 
+try:
+    from .i2s_stream import (
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
+    )
+except ImportError:
+    from i2s_stream import (
+        DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_BFPEXP,
+        DEFAULT_TAG_FFT,
+        DEFAULT_TAG_IDLE,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        classify_tagged_i2s_pair,
+        decode_tagged_i2s_word,
+    )
+
 
 DEFAULT_CAPTURE_BINARY = str(Path("~/Desktop/alsa_log").expanduser())
 DEFAULT_CAPTURE_DEVICE = "hw:2,0"
@@ -25,12 +55,15 @@ DEFAULT_CAPTURE_READ_FRAMES = 512
 class TaggedTransportConfig:
     frame_bins: int = 512
     useful_bins: int = 256
-    tag_shift: int = 30
-    tag_mask: int = 0x3
-    payload_bits: int = 18
-    tag_idle: int = 0
-    tag_bfpexp: int = 1
-    tag_fft: int = 2
+    packet_index_shift: int = DEFAULT_PACKET_INDEX_SHIFT
+    packet_index_bits: int = DEFAULT_PACKET_INDEX_BITS
+    fft_packet_index_base: int = DEFAULT_FFT_PACKET_INDEX_BASE
+    tag_shift: int = DEFAULT_TAG_SHIFT
+    tag_mask: int = DEFAULT_TAG_MASK
+    payload_bits: int = DEFAULT_PAYLOAD_BITS
+    tag_idle: int = DEFAULT_TAG_IDLE
+    tag_bfpexp: int = DEFAULT_TAG_BFPEXP
+    tag_fft: int = DEFAULT_TAG_FFT
     bfpexp_pairs_required: int = 128
     allow_fft_without_bfpexp: bool = False
     loss_tolerance_pairs: int = 0
@@ -40,6 +73,7 @@ class TaggedTransportConfig:
 class DecodedWord:
     hex_value: str
     tag: int
+    packet_index: int
     payload: int
     reserved: int
     reserved_nonzero: bool
@@ -63,6 +97,7 @@ class TransportSummary:
     transition_counts: dict[str, int]
     run_hist_by_kind: dict[str, dict[int, int]]
     mismatch_count: int
+    packet_index_mismatch_count: int
     unknown_count: int
     reserved_nonzero_words: int
     bfpexp_to_fft_examples: tuple[tuple[int, int], ...]
@@ -74,43 +109,57 @@ def _u32_hex(word: int) -> str:
 
 
 def decode_tagged_word(word: int, cfg: TaggedTransportConfig) -> DecodedWord:
-    uword = int(word) & 0xFFFFFFFF
-    tag = int((uword >> cfg.tag_shift) & cfg.tag_mask)
-
-    payload_mask = (1 << cfg.payload_bits) - 1
-    payload = int(uword & payload_mask)
-    sign_bit = 1 << (cfg.payload_bits - 1)
-    if payload & sign_bit:
-        payload -= 1 << cfg.payload_bits
-
-    reserved_width = max(0, cfg.tag_shift - cfg.payload_bits)
-    reserved = 0
-    if reserved_width > 0:
-        reserved = int((uword >> cfg.payload_bits) & ((1 << reserved_width) - 1))
+    decoded = decode_tagged_i2s_word(
+        word,
+        packet_index_shift=cfg.packet_index_shift,
+        packet_index_bits=cfg.packet_index_bits,
+        tag_shift=cfg.tag_shift,
+        tag_mask=cfg.tag_mask,
+        payload_bits=cfg.payload_bits,
+    )
 
     return DecodedWord(
         hex_value=_u32_hex(word),
-        tag=tag,
-        payload=payload,
-        reserved=reserved,
-        reserved_nonzero=bool(reserved),
+        tag=int(decoded["tag"]),
+        packet_index=int(decoded["packet_index"]),
+        payload=int(decoded["payload"]),
+        reserved=int(decoded["reserved"]),
+        reserved_nonzero=bool(decoded["reserved_nonzero"]),
     )
 
 
-def classify_tagged_pair(left_tag: int, right_tag: int, cfg: TaggedTransportConfig) -> str:
-    if left_tag != right_tag:
-        return "tag_mismatch"
-    if left_tag == cfg.tag_idle:
-        return "idle"
-    if left_tag == cfg.tag_bfpexp:
-        return "bfpexp"
-    if left_tag == cfg.tag_fft:
-        return "fft"
-    return "unknown_tag"
+def classify_tagged_pair(
+    left_tag: int,
+    right_tag: int,
+    cfg: TaggedTransportConfig,
+    *,
+    left_packet_index: int,
+    right_packet_index: int,
+) -> str:
+    return classify_tagged_i2s_pair(
+        left_tag,
+        right_tag,
+        left_packet_index=left_packet_index,
+        right_packet_index=right_packet_index,
+        tag_idle=cfg.tag_idle,
+        tag_bfpexp=cfg.tag_bfpexp,
+        tag_fft=cfg.tag_fft,
+        fft_packet_index_base=cfg.fft_packet_index_base,
+    )
+
+
+def classify_tagged_pair_words(left: DecodedWord, right: DecodedWord, cfg: TaggedTransportConfig) -> str:
+    return classify_tagged_pair(
+        left.tag,
+        right.tag,
+        cfg,
+        left_packet_index=left.packet_index,
+        right_packet_index=right.packet_index,
+    )
 
 
 def is_tolerable_loss_kind(kind: str) -> bool:
-    return kind in ("tag_mismatch", "unknown_tag", "idle")
+    return kind in ("tag_mismatch", "packet_index_mismatch", "unknown_tag", "idle")
 
 
 def create_contract_tracker(cfg: TaggedTransportConfig) -> dict[str, object]:
@@ -240,7 +289,7 @@ def parse_hex_pair_line(line: str, cfg: TaggedTransportConfig) -> Optional[tuple
         return None
     left = decode_tagged_word(int(parts[0], 16), cfg)
     right = decode_tagged_word(int(parts[1], 16), cfg)
-    kind = classify_tagged_pair(left.tag, right.tag, cfg)
+    kind = classify_tagged_pair_words(left, right, cfg)
     return left, right, kind
 
 
@@ -292,9 +341,11 @@ class TransportMonitor:
             "bfpexp": Counter(),
             "fft": Counter(),
             "tag_mismatch": Counter(),
+            "packet_index_mismatch": Counter(),
             "unknown_tag": Counter(),
         }
         self.mismatch_count = 0
+        self.packet_index_mismatch_count = 0
         self.unknown_count = 0
         self.reserved_nonzero_words = 0
         self.bfpexp_to_fft_examples: list[tuple[int, int]] = []
@@ -325,6 +376,7 @@ class TransportMonitor:
             f"{left.hex_value} {right.hex_value} "
             f"kind={kind:<12} phase={phase:<24} "
             f"frame={frame_number:03d} idx={phase_index:03d} "
+            f"pkt={left.packet_index:03d}/{right.packet_index:03d} "
             f"real={left.payload:8d} imag={right.payload:8d}"
         )
         if left.reserved_nonzero or right.reserved_nonzero:
@@ -404,6 +456,8 @@ class TransportMonitor:
         self.kind_counts[kind] += 1
         if kind == "tag_mismatch":
             self.mismatch_count += 1
+        if kind == "packet_index_mismatch":
+            self.packet_index_mismatch_count += 1
         if kind == "unknown_tag":
             self.unknown_count += 1
         self.reserved_nonzero_words += int(left.reserved_nonzero) + int(right.reserved_nonzero)
@@ -433,6 +487,7 @@ class TransportMonitor:
             transition_counts=dict(self.transition_counts.most_common()),
             run_hist_by_kind=run_hist,
             mismatch_count=self.mismatch_count,
+            packet_index_mismatch_count=self.packet_index_mismatch_count,
             unknown_count=self.unknown_count,
             reserved_nonzero_words=self.reserved_nonzero_words,
             bfpexp_to_fft_examples=tuple(self.bfpexp_to_fft_examples[:32]),
@@ -528,7 +583,13 @@ def _run_live_capture(
 def _print_summary(summary: TransportSummary, printer: Callable[[str], None]) -> None:
     printer("")
     printer("Summary")
-    printer(f"pairs={summary.pair_count} mismatches={summary.mismatch_count} unknown={summary.unknown_count} reserved_nonzero_words={summary.reserved_nonzero_words}")
+    printer(
+        f"pairs={summary.pair_count} "
+        f"tag_mismatches={summary.mismatch_count} "
+        f"packet_index_mismatches={summary.packet_index_mismatch_count} "
+        f"unknown={summary.unknown_count} "
+        f"reserved_nonzero_words={summary.reserved_nonzero_words}"
+    )
     printer(f"kind_counts={summary.kind_counts}")
     printer(f"transition_counts={summary.transition_counts}")
     printer(f"run_hist_by_kind={summary.run_hist_by_kind}")
@@ -561,12 +622,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-file", help="Analyze an existing hex dump instead of launching ~/Desktop/alsa_log")
     parser.add_argument("--frame-bins", type=int, default=512, help="Expected FFT-tagged pairs per valid burst")
     parser.add_argument("--useful-bins", type=int, default=256, help="Useful FFT bins used in peak/shift analysis")
-    parser.add_argument("--tag-shift", type=int, default=30, help="Bit shift of the in-band tag")
-    parser.add_argument("--tag-mask", type=lambda value: int(value, 0), default=0x3, help="Bitmask of the in-band tag")
-    parser.add_argument("--payload-bits", type=int, default=18, help="Signed payload width inside each 32-bit word")
-    parser.add_argument("--tag-idle", type=int, default=0, help="Tag value used for idle words")
-    parser.add_argument("--tag-bfpexp", type=int, default=1, help="Tag value used for BFPEXP words")
-    parser.add_argument("--tag-fft", type=int, default=2, help="Tag value used for FFT words")
+    parser.add_argument("--packet-index-shift", type=int, default=DEFAULT_PACKET_INDEX_SHIFT, help="Bit shift of the packet-index field")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index width in bits")
+    parser.add_argument("--fft-packet-index-base", type=int, default=DEFAULT_FFT_PACKET_INDEX_BASE, help="First packet index used by FFT payload words")
+    parser.add_argument("--tag-shift", type=int, default=DEFAULT_TAG_SHIFT, help="Bit shift of the in-band tag")
+    parser.add_argument("--tag-mask", type=lambda value: int(value, 0), default=DEFAULT_TAG_MASK, help="Bitmask of the in-band tag")
+    parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width inside each 32-bit word")
+    parser.add_argument("--tag-idle", type=int, default=DEFAULT_TAG_IDLE, help="Tag value used for idle words")
+    parser.add_argument("--tag-bfpexp", type=int, default=DEFAULT_TAG_BFPEXP, help="Tag value used for BFPEXP words")
+    parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value used for FFT words")
     parser.add_argument("--bfpexp-hold-pairs", type=int, default=128, help="Expected BFPEXP preamble length before a valid FFT burst")
     parser.add_argument("--allow-fft-without-bfpexp", action="store_true", help="Let the contract tracker accept FFT startup without a BFPEXP preamble")
     parser.add_argument("--loss-tolerance-pairs", type=int, default=0, help="Gap tolerance used only by the on-screen contract tracker")
@@ -576,10 +640,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.frame_bins <= 0:
+        parser.error("--frame-bins must be positive")
+    if args.frame_bins > args.fft_packet_index_base:
+        parser.error("--frame-bins must fit inside the FFT packet-index range")
+    if args.packet_index_bits <= 0:
+        parser.error("--packet-index-bits must be positive")
 
     cfg = TaggedTransportConfig(
         frame_bins=args.frame_bins,
         useful_bins=args.useful_bins,
+        packet_index_shift=args.packet_index_shift,
+        packet_index_bits=args.packet_index_bits,
+        fft_packet_index_base=args.fft_packet_index_base,
         tag_shift=args.tag_shift,
         tag_mask=args.tag_mask,
         payload_bits=args.payload_bits,

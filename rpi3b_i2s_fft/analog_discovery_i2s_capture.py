@@ -11,15 +11,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+try:
+    from .i2s_stream import (
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        decode_tagged_i2s_word,
+    )
+except ImportError:
+    from i2s_stream import (
+        DEFAULT_PACKET_INDEX_BITS,
+        DEFAULT_PACKET_INDEX_SHIFT,
+        DEFAULT_PAYLOAD_BITS,
+        DEFAULT_TAG_MASK,
+        DEFAULT_TAG_SHIFT,
+        decode_tagged_i2s_word,
+    )
+
 DEFAULT_DIO_SCK = 13
 DEFAULT_DIO_WS = 14
 DEFAULT_DIO_SD = 15
 DEFAULT_SAMPLE_RATE_HZ = 100_000_000.0
 DEFAULT_CAPTURE_SECONDS = 0.010
 DEFAULT_BITS_PER_WORD = 32
-DEFAULT_TAG_SHIFT = 30
-DEFAULT_TAG_MASK = 0x3
-DEFAULT_PAYLOAD_BITS = 18
 
 ACQMODE_RECORD = ctypes.c_int(3)
 TRIGSRC_NONE = ctypes.c_ubyte(0)
@@ -43,6 +59,8 @@ class DecodeConfig:
     dio_sd: int
     bits_per_word: int
     ws_low_channel: str
+    packet_index_shift: int
+    packet_index_bits: int
     tag_shift: int
     tag_mask: int
     payload_bits: int
@@ -56,6 +74,7 @@ class DecodedWord:
     ws: int
     channel: str
     word: int
+    packet_index: int
     tag: int
     payload_unsigned: int
     payload_signed: int
@@ -100,15 +119,33 @@ def _channel_for_ws(ws: int, ws_low_channel: str) -> str:
     return "right" if low == "left" else "left"
 
 
-def decode_tagged_word(word: int, *, tag_shift: int, tag_mask: int, payload_bits: int) -> tuple[int, int, int, int]:
-    tag = (word >> tag_shift) & tag_mask
+def decode_tagged_word(
+    word: int,
+    *,
+    packet_index_shift: int,
+    packet_index_bits: int,
+    tag_shift: int,
+    tag_mask: int,
+    payload_bits: int,
+) -> tuple[int, int, int, int, int]:
+    decoded = decode_tagged_i2s_word(
+        word,
+        packet_index_shift=packet_index_shift,
+        packet_index_bits=packet_index_bits,
+        tag_shift=tag_shift,
+        tag_mask=tag_mask,
+        payload_bits=payload_bits,
+    )
     payload_mask = (1 << payload_bits) - 1 if payload_bits > 0 else 0
-    payload_unsigned = word & payload_mask
+    payload_unsigned = int(word) & payload_mask
     payload_signed = _sign_extend(payload_unsigned, payload_bits)
-    reserved_width = max(tag_shift - payload_bits, 0)
-    reserved_mask = (1 << reserved_width) - 1 if reserved_width > 0 else 0
-    reserved = (word >> payload_bits) & reserved_mask
-    return tag, payload_unsigned, payload_signed, reserved
+    return (
+        int(decoded["packet_index"]),
+        int(decoded["tag"]),
+        int(payload_unsigned),
+        payload_signed,
+        int(decoded["reserved"]),
+    )
 
 
 def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSummary:
@@ -161,8 +198,10 @@ def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSumm
                     if not ws_changed:
                         error_counts["ws_missing_on_last_bit"] += 1
                     else:
-                        tag, payload_unsigned, payload_signed, reserved = decode_tagged_word(
+                        packet_index, tag, payload_unsigned, payload_signed, reserved = decode_tagged_word(
                             completed_word,
+                            packet_index_shift=config.packet_index_shift,
+                            packet_index_bits=config.packet_index_bits,
                             tag_shift=config.tag_shift,
                             tag_mask=config.tag_mask,
                             payload_bits=config.payload_bits,
@@ -175,6 +214,7 @@ def decode_i2s_words(samples: Sequence[int], config: DecodeConfig) -> DecodeSumm
                                 ws=slot_ws,
                                 channel=_channel_for_ws(slot_ws, config.ws_low_channel),
                                 word=completed_word,
+                                packet_index=packet_index,
                                 tag=tag,
                                 payload_unsigned=payload_unsigned,
                                 payload_signed=payload_signed,
@@ -369,6 +409,7 @@ def write_samples_csv(
                 "sck_rising",
                 "decoded_word_hex",
                 "decoded_channel",
+                "decoded_packet_index",
                 "decoded_tag",
                 "decoded_payload_signed",
                 "decoded_reserved_hex",
@@ -393,6 +434,7 @@ def write_samples_csv(
                     rising,
                     "" if decoded is None else f"0x{decoded.word & 0xFFFFFFFF:08X}",
                     "" if decoded is None else decoded.channel,
+                    "" if decoded is None else decoded.packet_index,
                     "" if decoded is None else decoded.tag,
                     "" if decoded is None else decoded.payload_signed,
                     "" if decoded is None else f"0x{decoded.reserved:X}",
@@ -412,6 +454,7 @@ def write_words_csv(path: Path, words: Sequence[DecodedWord]) -> None:
                 "ws",
                 "channel",
                 "word_hex",
+                "packet_index",
                 "tag",
                 "payload_unsigned",
                 "payload_signed",
@@ -427,6 +470,7 @@ def write_words_csv(path: Path, words: Sequence[DecodedWord]) -> None:
                     word.ws,
                     word.channel,
                     f"0x{word.word & 0xFFFFFFFF:08X}",
+                    word.packet_index,
                     word.tag,
                     word.payload_unsigned,
                     word.payload_signed,
@@ -442,10 +486,12 @@ def write_frames_csv(path: Path, frames: Sequence[StereoFrame]) -> None:
             [
                 "frame_index",
                 "left_word_hex",
+                "left_packet_index",
                 "left_tag",
                 "left_payload_signed",
                 "left_sample_index",
                 "right_word_hex",
+                "right_packet_index",
                 "right_tag",
                 "right_payload_signed",
                 "right_sample_index",
@@ -456,10 +502,12 @@ def write_frames_csv(path: Path, frames: Sequence[StereoFrame]) -> None:
                 [
                     frame.frame_index,
                     f"0x{frame.left.word & 0xFFFFFFFF:08X}",
+                    frame.left.packet_index,
                     frame.left.tag,
                     frame.left.payload_signed,
                     frame.left.sample_index,
                     f"0x{frame.right.word & 0xFFFFFFFF:08X}",
+                    frame.right.packet_index,
                     frame.right.tag,
                     frame.right.payload_signed,
                     frame.right.sample_index,
@@ -494,6 +542,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="left",
         help="Channel represented when WS is low",
     )
+    parser.add_argument("--packet-index-shift", type=lambda value: int(value, 0), default=DEFAULT_PACKET_INDEX_SHIFT, help="Packet-index field LSB position")
+    parser.add_argument("--packet-index-bits", type=int, default=DEFAULT_PACKET_INDEX_BITS, help="Packet-index field width in bits")
     parser.add_argument("--tag-shift", type=lambda value: int(value, 0), default=DEFAULT_TAG_SHIFT, help="Tag field LSB position")
     parser.add_argument("--tag-mask", type=lambda value: int(value, 0), default=DEFAULT_TAG_MASK, help="Tag field mask")
     parser.add_argument("--payload-bits", type=int, default=DEFAULT_PAYLOAD_BITS, help="Signed payload width in bits")
@@ -514,6 +564,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--capture-seconds deve ser positivo")
     if args.bits_per_word <= 0:
         raise SystemExit("--bits-per-word deve ser positivo")
+    if args.packet_index_bits <= 0:
+        raise SystemExit("--packet-index-bits deve ser positivo")
 
     output_prefix = args.output_prefix or _default_output_prefix()
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -540,6 +592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dio_sd=args.dio_sd,
         bits_per_word=args.bits_per_word,
         ws_low_channel=args.ws_low_channel,
+        packet_index_shift=args.packet_index_shift,
+        packet_index_bits=args.packet_index_bits,
         tag_shift=args.tag_shift,
         tag_mask=args.tag_mask,
         payload_bits=args.payload_bits,
