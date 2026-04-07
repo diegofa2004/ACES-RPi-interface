@@ -1,10 +1,10 @@
-"""Helpers for bridging FPGA FFT data from SPI on Raspberry Pi."""
+"""Helpers for bridging raw FPGA audio to Raspberry Pi."""
 
 from .compararEvento import compararEvento
-from .fpga_fft_adapter import FFTAdapterConfig, FPGAFFTReceiver
+from .fpga_audio_adapter import AudioCaptureConfig, FPGAAudioReceiver
 
 __all__ = [
     "compararEvento",
-    "FFTAdapterConfig",
-    "FPGAFFTReceiver",
+    "AudioCaptureConfig",
+    "FPGAAudioReceiver",
 ]

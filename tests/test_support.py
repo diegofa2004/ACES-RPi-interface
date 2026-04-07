@@ -1,8 +1,6 @@
 import io
 from typing import Optional
 
-import numpy as np
-
 
 class ChunkedBytesIO(io.BytesIO):
     def __init__(self, data: bytes, max_chunk_bytes: Optional[int] = None):
@@ -38,45 +36,3 @@ class FakeProcess:
 
     def kill(self):
         self.returncode = -9
-
-
-class FakeSPI:
-    def __init__(self, data: bytes):
-        self._data = data
-        self._offset = 0
-        self.closed = False
-
-    def xfer2(self, tx_data):
-        rx = []
-        for _ in tx_data:
-            if self._offset < len(self._data):
-                rx.append(self._data[self._offset])
-                self._offset += 1
-            else:
-                rx.append(0)
-        return rx
-
-    def close(self):
-        self.closed = True
-
-
-def pack_raw_pairs(pairs):
-    return np.asarray(list(pairs), dtype=np.int32).reshape(-1, 2).tobytes()
-
-
-def pack_tagged_word(tag: int, payload: int, *, payload_bits: int = 18, tag_shift: int = 30) -> int:
-    mask = (1 << payload_bits) - 1
-    payload_u32 = payload & mask
-    word = (int(tag) << tag_shift) | payload_u32
-    return int(np.asarray([np.uint32(word)], dtype=np.uint32).view(np.int32)[0])
-
-
-def pack_tagged_pairs(entries, *, payload_bits: int = 18, tag_shift: int = 30):
-    pairs = [
-        (
-            pack_tagged_word(tag, left, payload_bits=payload_bits, tag_shift=tag_shift),
-            pack_tagged_word(tag, right, payload_bits=payload_bits, tag_shift=tag_shift),
-        )
-        for tag, left, right in entries
-    ]
-    return pack_raw_pairs(pairs)

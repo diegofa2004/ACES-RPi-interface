@@ -150,6 +150,8 @@ class PlotFFTTests(unittest.TestCase):
 
     def test_render_plot_can_write_png_in_headless_mode(self):
         plt, _, _ = plotFFT._load_pyplot("Agg")
+        if plt is None:
+            self.skipTest("matplotlib is not available in this environment")
         fig, axes = plt.subplots(2, 1, figsize=(6, 6))
         spectrum_ax, spectrogram_ax = axes
         fft_cache = np.abs(np.arange(1, 41, dtype=np.float32).reshape(5, 8))
@@ -158,7 +160,7 @@ class PlotFFTTests(unittest.TestCase):
             spectrum_ax,
             spectrogram_ax,
             fft_cache,
-            rate=DEFAULT_CAPTURE_RATE_HZ,
+            rate=plotFFT.DEFAULT_CAPTURE_RATE_HZ,
             frame_bins=512,
             max_freq=8000.0,
             step_hz=1000.0,
@@ -177,6 +179,8 @@ class PlotFFTTests(unittest.TestCase):
 
     def test_render_single_window_plot_supports_zero_center_and_mock_overlay(self):
         plt, _, _ = plotFFT._load_pyplot("Agg")
+        if plt is None:
+            self.skipTest("matplotlib is not available in this environment")
         fig, spectrum_ax = plt.subplots(1, 1, figsize=(6, 4))
         fft_frame = np.asarray([1.0, 2.0, 8.0, 2.0], dtype=np.float32)
         mock_frame = np.asarray([1.0, 3.0, 7.0, 3.0], dtype=np.float32)
@@ -214,7 +218,7 @@ class PlotFFTTests(unittest.TestCase):
             output_path = Path(tmpdir) / "fft_builtin.png"
             plotFFT._render_png_fallback(
                 fft_cache,
-                rate=DEFAULT_CAPTURE_RATE_HZ,
+                rate=plotFFT.DEFAULT_CAPTURE_RATE_HZ,
                 frame_bins=512,
                 max_freq=8000.0,
                 output_path=output_path,
