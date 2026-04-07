@@ -34,14 +34,17 @@ class RunChannelDebugMatrixScriptTests(unittest.TestCase):
             commands = (output_dir / "replay_commands.sh").read_text(encoding="utf-8")
             manifest = (output_dir / "session_info.txt").read_text(encoding="utf-8")
             readme = (output_dir / "README.txt").read_text(encoding="utf-8")
+            summary = (output_dir / "scenario_summary.tsv").read_text(encoding="utf-8")
 
-        self.assertIn("--debug-raw-capture", commands)
-        self.assertEqual(commands.count("--debug-raw-capture"), 1)
-        self.assertGreaterEqual(commands.count("--debug-replay-raw"), 3)
-        self.assertIn("raw_capture=", manifest)
-        self.assertIn("raw_index=", manifest)
-        self.assertIn("channel_capture.raw", readme)
-        self.assertIn("channel_capture.index.jsonl", readme)
+        self.assertIn("mirror_capture.raw", commands)
+        self.assertIn("mirror_capture_auto.csv", commands)
+        self.assertEqual(commands.count("fft_i2s_logger.py"), 1)
+        self.assertGreaterEqual(commands.count("verify_transport_stream.py"), 3)
+        self.assertIn("capture_backend=auto", manifest)
+        self.assertIn("channel_modes=auto left right", manifest)
+        self.assertIn("Mic mirror debug session", readme)
+        self.assertIn("mirror_capture.raw", readme)
+        self.assertIn("scenario\tstatus\tsample_count", summary)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
@@ -11,10 +13,11 @@ if str(TEST_ROOT) not in sys.path:
 from rpi3b_i2s_fft.analog_discovery_i2s_capture import (
     DecodeConfig,
     decode_i2s_words,
+    write_frames_csv,
+    write_frames_raw,
     write_samples_csv,
     write_words_csv,
 )
-from tests.test_support import pack_tagged_word
 
 
 def _ws_for_channel(channel: str, ws_low_channel: str) -> int:
@@ -58,7 +61,7 @@ def _synthesize_i2s_samples(
 
 
 class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
-    def test_decodes_tagged_words_and_pairs_frames(self):
+    def test_decodes_raw_words_and_pairs_stereo_frames(self):
         config = DecodeConfig(
             sample_rate_hz=100_000_000.0,
             dio_sck=13,
@@ -66,25 +69,18 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
             dio_sd=15,
             bits_per_word=32,
             ws_low_channel="left",
-            packet_index_shift=22,
-            packet_index_bits=10,
-            tag_shift=20,
-            tag_mask=0x3,
-            payload_bits=18,
+            sample_shift_bits=8,
         )
 
         preamble_word = 0x00000000
-        bfpexp_word = pack_tagged_word(1, -18, packet_index=0)
-        fft_left_word = pack_tagged_word(2, 87381, packet_index=512)
-        fft_right_word = pack_tagged_word(2, -43691, packet_index=512)
+        left_word = 0x00123400
+        right_word = 0xFFF00000
         tail_word = 0x00000000
 
         slots = [
             ("left", preamble_word),
-            ("right", bfpexp_word),
-            ("left", bfpexp_word),
-            ("right", fft_right_word),
-            ("left", fft_left_word),
+            ("right", right_word),
+            ("left", left_word),
             ("right", tail_word),
         ]
         samples = _synthesize_i2s_samples(
@@ -98,19 +94,18 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
 
         summary = decode_i2s_words(samples, config)
 
-        self.assertEqual(len(summary.words), 4)
-        self.assertEqual([word.tag for word in summary.words], [1, 1, 2, 2])
-        self.assertEqual([word.packet_index for word in summary.words], [0, 0, 512, 512])
-        self.assertEqual([word.channel for word in summary.words], ["right", "left", "right", "left"])
-        self.assertEqual([word.payload_signed for word in summary.words], [-18, -18, -43691, 87381])
-        self.assertEqual(len(summary.frames), 2)
-        self.assertEqual(summary.frames[0].left.payload_signed, -18)
-        self.assertEqual(summary.frames[0].right.payload_signed, -18)
-        self.assertEqual(summary.frames[1].left.payload_signed, 87381)
-        self.assertEqual(summary.frames[1].right.payload_signed, -43691)
+        self.assertEqual(len(summary.words), 2)
+        self.assertEqual([word.channel for word in summary.words], ["right", "left"])
+        self.assertEqual(summary.words[0].value_signed, -1048576)
+        self.assertEqual(summary.words[0].sample_signed, -4096)
+        self.assertEqual(summary.words[1].value_signed, 1192960)
+        self.assertEqual(summary.words[1].sample_signed, 4660)
+        self.assertEqual(len(summary.frames), 1)
+        self.assertEqual(summary.frames[0].left.sample_signed, 4660)
+        self.assertEqual(summary.frames[0].right.sample_signed, -4096)
         self.assertEqual(summary.error_counts, {"ws_missing_on_last_bit": 1})
 
-    def test_writers_emit_raw_and_decoded_csv_rows(self):
+    def test_writers_emit_csv_and_raw_stereo_outputs(self):
         config = DecodeConfig(
             sample_rate_hz=100_000_000.0,
             dio_sck=13,
@@ -118,17 +113,13 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
             dio_sd=15,
             bits_per_word=32,
             ws_low_channel="left",
-            packet_index_shift=22,
-            packet_index_bits=10,
-            tag_shift=20,
-            tag_mask=0x3,
-            payload_bits=18,
+            sample_shift_bits=8,
         )
 
         slots = [
             ("left", 0),
-            ("right", pack_tagged_word(1, -18, packet_index=0)),
-            ("left", pack_tagged_word(1, -18, packet_index=0)),
+            ("right", 0xFFF00000),
+            ("left", 0x00123400),
             ("right", 0),
         ]
         samples = _synthesize_i2s_samples(
@@ -144,25 +135,36 @@ class AnalogDiscoveryI2SCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             samples_csv = Path(tmpdir) / "samples.csv"
             words_csv = Path(tmpdir) / "words.csv"
+            frames_csv = Path(tmpdir) / "frames.csv"
+            frames_raw = Path(tmpdir) / "frames.raw"
 
             write_samples_csv(samples_csv, samples, summary, config)
             write_words_csv(words_csv, summary.words)
+            write_frames_csv(frames_csv, summary.frames)
+            write_frames_raw(frames_raw, summary.frames)
 
-            with samples_csv.open(newline="") as handle:
+            with samples_csv.open(newline="", encoding="utf-8") as handle:
                 sample_rows = list(csv.DictReader(handle))
-            with words_csv.open(newline="") as handle:
+            with words_csv.open(newline="", encoding="utf-8") as handle:
                 word_rows = list(csv.DictReader(handle))
+            with frames_csv.open(newline="", encoding="utf-8") as handle:
+                frame_rows = list(csv.DictReader(handle))
+            raw_bytes = frames_raw.read_bytes()
 
         self.assertEqual(len(sample_rows), len(samples))
         self.assertEqual(len(word_rows), len(summary.words))
-        self.assertEqual(word_rows[0]["word_hex"], "0x0013FFEE")
-        self.assertEqual(word_rows[1]["word_hex"], "0x0013FFEE")
-        self.assertEqual(word_rows[0]["packet_index"], "0")
+        self.assertEqual(len(frame_rows), len(summary.frames))
+        self.assertEqual(word_rows[0]["word_hex"], "0xFFF00000")
+        self.assertEqual(word_rows[0]["value_signed"], "-1048576")
+        self.assertEqual(word_rows[0]["sample_signed"], "-4096")
         decoded_rows = [row for row in sample_rows if row["decoded_word_hex"]]
         self.assertEqual(len(decoded_rows), 2)
         self.assertEqual(decoded_rows[0]["decoded_channel"], "right")
-        self.assertEqual(decoded_rows[0]["decoded_packet_index"], "0")
-        self.assertEqual(decoded_rows[0]["decoded_payload_signed"], "-18")
+        self.assertEqual(decoded_rows[0]["decoded_sample_signed"], "-4096")
+        self.assertEqual(frame_rows[0]["left_sample_signed"], "4660")
+        self.assertEqual(frame_rows[0]["right_sample_signed"], "-4096")
+        raw_stereo = np.frombuffer(raw_bytes, dtype=np.int32).reshape(-1, 2)
+        np.testing.assert_array_equal(raw_stereo, np.asarray([[4660, -4096]], dtype=np.int32))
 
 
 if __name__ == "__main__":

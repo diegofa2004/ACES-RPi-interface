@@ -11,7 +11,6 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from rpi3b_i2s_fft import fft_i2s_logger
-from tests.test_support import pack_tagged_word
 
 
 class FFTI2SLoggerTests(unittest.TestCase):
@@ -25,37 +24,39 @@ class FFTI2SLoggerTests(unittest.TestCase):
         self.assertEqual(fft_i2s_logger.format_i32_hex(-1), "0xFFFFFFFF")
         self.assertEqual(fft_i2s_logger.format_i32_hex(np.int32(-2147483648)), "0x80000000")
 
-    def test_write_csv_rows_increments_sequence(self):
-        output = io.StringIO()
-        writer = csv.writer(output)
+    def test_select_logged_channel_shifts_selected_mono_data(self):
         stereo = np.asarray(
             [
-                [pack_tagged_word(1, 10, packet_index=0), pack_tagged_word(1, 20, packet_index=0)],
-                [pack_tagged_word(2, -1, packet_index=512), pack_tagged_word(2, 8, packet_index=512)],
+                [10, 100],
+                [20, 200],
+                [30, 300],
             ],
             dtype=np.int32,
         )
-        timestamps = iter([1000, 1001])
-        tracker = fft_i2s_logger.create_contract_tracker(
-            frame_bins=2,
-            bfpexp_hold_pairs=1,
-            allow_fft_without_bfpexp=False,
-            loss_tolerance_pairs=0,
+
+        mono, used = fft_i2s_logger.select_logged_channel(
+            stereo,
+            channel_mode="right",
+            sample_shift_bits=2,
         )
+
+        self.assertEqual(used, "right")
+        np.testing.assert_array_equal(mono, np.asarray([25, 50, 75], dtype=np.int32))
+
+    def test_write_csv_header_and_rows_emit_raw_and_mono_columns(self):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        fft_i2s_logger.write_csv_header(writer)
+        stereo = np.asarray([[10, -20], [30, -40]], dtype=np.int32)
+        mono = np.asarray([10, 30], dtype=np.int32)
+        timestamps = iter([1000, 1001])
+
         next_seq = fft_i2s_logger.write_csv_rows(
             writer,
             stereo,
+            mono,
+            "left",
             7,
-            packet_index_shift=22,
-            packet_index_bits=10,
-            tag_shift=20,
-            tag_mask=0x3,
-            payload_bits=18,
-            tag_idle=0,
-            tag_bfpexp=1,
-            tag_fft=2,
-            fft_packet_index_base=512,
-            contract_tracker=tracker,
             timestamp_ns_fn=lambda: next(timestamps),
         )
 
@@ -63,104 +64,22 @@ class FFTI2SLoggerTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "1000,7,0x0010000A,0x00100014,bfpexp,bfpexp_preamble,0,0,0,0,1,1,10,20,0,0,0,0",
-                "1001,8,0x8023FFFF,0x80200008,fft,fft_frame,0,0,512,512,2,2,-1,8,0,0,0,0",
+                "timestamp_ns,sequence,left_i32,right_i32,left_hex,right_hex,mono_i32,channel_used,abs_left,abs_right,abs_mono",
+                "1000,7,10,-20,0x0000000A,0xFFFFFFEC,10,left,10,20,10",
+                "1001,8,30,-40,0x0000001E,0xFFFFFFD8,30,left,30,40,30",
             ],
         )
 
-    def test_mirrored_pair_normalizer_keeps_preferred_orientation(self):
-        normalizer = fft_i2s_logger.MirroredPairNormalizer()
-        stereo = np.asarray(
-            [
-                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
-                [pack_tagged_word(2, -0x15555, packet_index=512), pack_tagged_word(2, 0x15555, packet_index=512)],
-                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
-                [pack_tagged_word(1, 0x12, packet_index=0), pack_tagged_word(1, 0x12, packet_index=0)],
-            ],
-            dtype=np.int32,
-        )
-
-        normalized = normalizer.normalize(stereo)
-        expected = np.asarray(
-            [
-                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
-                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
-                [pack_tagged_word(2, 0x15555, packet_index=512), pack_tagged_word(2, -0x15555, packet_index=512)],
-                [pack_tagged_word(1, 0x12, packet_index=0), pack_tagged_word(1, 0x12, packet_index=0)],
-            ],
-            dtype=np.int32,
-        )
-        np.testing.assert_array_equal(normalized, expected)
-
-    def test_classify_tagged_pair_reports_mismatch(self):
-        self.assertEqual(
-            fft_i2s_logger.classify_tagged_pair(
-                2,
-                1,
-                left_packet_index=512,
-                right_packet_index=0,
-                tag_idle=0,
-                tag_bfpexp=1,
-                tag_fft=2,
-                fft_packet_index_base=512,
-            ),
-            "tag_mismatch",
-        )
-
-    def test_contract_tracker_requires_full_bfpexp_preamble(self):
-        tracker = fft_i2s_logger.create_contract_tracker(
-            frame_bins=4,
-            bfpexp_hold_pairs=3,
-            allow_fft_without_bfpexp=False,
-            loss_tolerance_pairs=0,
-        )
-
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "idle"), ("search_idle", 0, -1))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 1))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("protocol_wait_bfpexp", 0, -1))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 1))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 2))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
-
-    def test_contract_tracker_resets_when_idle_breaks_fft_frame(self):
-        tracker = fft_i2s_logger.create_contract_tracker(
-            frame_bins=4,
-            bfpexp_hold_pairs=1,
-            allow_fft_without_bfpexp=False,
-            loss_tolerance_pairs=0,
-        )
-
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 1))
-        self.assertEqual(
-            fft_i2s_logger.advance_contract_tracker(tracker, "idle"),
-            ("protocol_reset_idle", 0, -1),
-        )
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
-
-    def test_contract_tracker_tolerates_loss_inside_preamble_and_fft_frame(self):
-        tracker = fft_i2s_logger.create_contract_tracker(
-            frame_bins=4,
-            bfpexp_hold_pairs=2,
-            allow_fft_without_bfpexp=False,
-            loss_tolerance_pairs=1,
-        )
-
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "bfpexp"), ("bfpexp_preamble", 0, 0))
-        self.assertEqual(
-            fft_i2s_logger.advance_contract_tracker(tracker, "tag_mismatch"),
-            ("bfpexp_preamble_gap", 0, 1),
-        )
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 0))
-        self.assertEqual(
-            fft_i2s_logger.advance_contract_tracker(tracker, "idle"),
-            ("fft_frame_gap", 0, 1),
-        )
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 2))
-        self.assertEqual(fft_i2s_logger.advance_contract_tracker(tracker, "fft"), ("fft_frame", 0, 3))
+    def test_write_csv_rows_requires_matching_frame_count(self):
+        writer = csv.writer(io.StringIO())
+        with self.assertRaises(ValueError):
+            fft_i2s_logger.write_csv_rows(
+                writer,
+                np.asarray([[1, 2], [3, 4]], dtype=np.int32),
+                np.asarray([1], dtype=np.int32),
+                "left",
+                0,
+            )
 
 
 if __name__ == "__main__":
