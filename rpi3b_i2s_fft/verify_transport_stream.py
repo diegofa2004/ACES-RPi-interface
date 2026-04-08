@@ -18,6 +18,8 @@ import numpy as np
 try:
     from .i2s_stream import (
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -28,10 +30,14 @@ try:
         DEFAULT_TAG_SHIFT,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        resolve_helper_tagged_realign_options,
     )
 except ImportError:
     from i2s_stream import (
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -42,10 +48,12 @@ except ImportError:
         DEFAULT_TAG_SHIFT,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        resolve_helper_tagged_realign_options,
     )
 
-
-DEFAULT_CAPTURE_BINARY = str(Path("~/Desktop/alsa_log").expanduser())
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CAPTURE_BINARY = str((SCRIPT_DIR / "alsa_logger").resolve())
 DEFAULT_CAPTURE_DEVICE = "hw:2,0"
 DEFAULT_CAPTURE_RATE_HZ = 48828
 DEFAULT_CAPTURE_READ_FRAMES = 512
@@ -74,6 +82,7 @@ class DecodedWord:
     hex_value: str
     tag: int
     packet_index: int
+    bin_index: int
     payload: int
     reserved: int
     reserved_nonzero: bool
@@ -122,6 +131,12 @@ def decode_tagged_word(word: int, cfg: TaggedTransportConfig) -> DecodedWord:
         hex_value=_u32_hex(word),
         tag=int(decoded["tag"]),
         packet_index=int(decoded["packet_index"]),
+        bin_index=fft_bin_index_from_packet_index(
+            int(decoded["packet_index"]),
+            tag=int(decoded["tag"]),
+            tag_fft=cfg.tag_fft,
+            fft_packet_index_base=cfg.fft_packet_index_base,
+        ),
         payload=int(decoded["payload"]),
         reserved=int(decoded["reserved"]),
         reserved_nonzero=bool(decoded["reserved_nonzero"]),
@@ -285,7 +300,9 @@ def parse_hex_pair_line(line: str, cfg: TaggedTransportConfig) -> Optional[tuple
     if not stripped:
         return None
     parts = stripped.split()
-    if len(parts) != 2:
+    if len(parts) < 2:
+        return None
+    if not parts[0].lower().startswith("0x") or not parts[1].lower().startswith("0x"):
         return None
     left = decode_tagged_word(int(parts[0], 16), cfg)
     right = decode_tagged_word(int(parts[1], 16), cfg)
@@ -377,6 +394,7 @@ class TransportMonitor:
             f"kind={kind:<12} phase={phase:<24} "
             f"frame={frame_number:03d} idx={phase_index:03d} "
             f"pkt={left.packet_index:03d}/{right.packet_index:03d} "
+            f"bin={left.bin_index:03d}/{right.bin_index:03d} "
             f"real={left.payload:8d} imag={right.payload:8d}"
         )
         if left.reserved_nonzero or right.reserved_nonzero:
@@ -512,11 +530,37 @@ def _stderr_pump(stderr: TextIO, printer: Callable[[str], None]) -> None:
     for line in stderr:
         stripped = line.rstrip()
         if stripped:
-            printer(f"[alsa_log] {stripped}")
+            printer(f"[alsa_logger] {stripped}")
 
 
-def _legacy_capture_cmd(binary_path: str, device: str, rate: int, read_frames: int) -> list[str]:
-    return [binary_path, device, str(rate), str(read_frames)]
+def _build_capture_cmd(
+    binary_path: str,
+    device: str,
+    rate: int,
+    read_frames: int,
+    *,
+    capture_realign_initial_word_skip: int,
+    capture_realign_swap_channels: bool,
+) -> list[str]:
+    cmd = [
+        binary_path,
+        "--device",
+        device,
+        "--rate",
+        str(rate),
+        "--mode",
+        "hex",
+        "--read-frames",
+        str(read_frames),
+        "--stats-interval-ms",
+        "0",
+        "--show-tagged-fields",
+    ]
+    if capture_realign_initial_word_skip > 0:
+        cmd.extend(["--realign-initial-word-skip", str(capture_realign_initial_word_skip)])
+    if capture_realign_swap_channels:
+        cmd.append("--realign-swap-channels")
+    return cmd
 
 
 def _run_live_capture(
@@ -525,12 +569,21 @@ def _run_live_capture(
     device: str,
     rate: int,
     read_frames: int,
+    capture_realign_initial_word_skip: int,
+    capture_realign_swap_channels: bool,
     capture_seconds: float,
     max_pairs: int,
     monitor: TransportMonitor,
     printer: Callable[[str], None],
 ) -> TransportSummary:
-    cmd = _legacy_capture_cmd(binary_path, device, rate, read_frames)
+    cmd = _build_capture_cmd(
+        binary_path,
+        device,
+        rate,
+        read_frames,
+        capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+        capture_realign_swap_channels=capture_realign_swap_channels,
+    )
     printer(f"Starting capture: {' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd,
@@ -610,12 +663,33 @@ def _print_summary(summary: TransportSummary, printer: Callable[[str], None]) ->
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect the raw tagged I2S transport and print live real/imag hex pairs from ~/Desktop/alsa_log."
+        description="Inspect the tagged I2S transport and print live real/imag hex pairs from the native alsa_logger helper."
     )
-    parser.add_argument("--capture-binary", default=DEFAULT_CAPTURE_BINARY, help="Legacy hex capture helper (default: ~/Desktop/alsa_log)")
+    parser.add_argument("--capture-binary", default=DEFAULT_CAPTURE_BINARY, help="Path to the compiled alsa_logger helper")
     parser.add_argument("-D", "--device", default=DEFAULT_CAPTURE_DEVICE, help="ALSA capture device")
     parser.add_argument("-r", "--rate", type=int, default=DEFAULT_CAPTURE_RATE_HZ, help="Capture rate in Hz")
     parser.add_argument("--read-frames", type=int, default=DEFAULT_CAPTURE_READ_FRAMES, help="Frames per ALSA read in the legacy helper")
+    parser.add_argument(
+        "--capture-realign-tagged",
+        action="store_true",
+        help=(
+            "Use the helper realignment preset for tagged words "
+            f"(drop {DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP} initial word and "
+            f"{'swap' if DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS else 'keep'} channels)"
+        ),
+    )
+    parser.add_argument(
+        "--capture-realign-initial-word-skip",
+        type=int,
+        default=None,
+        help="Number of initial 32-bit words the native helper should discard before re-pairing stereo data",
+    )
+    parser.add_argument(
+        "--capture-realign-swap-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Swap left/right channels in the native helper after tagged-word re-pairing",
+    )
     parser.add_argument("--seconds", type=float, default=4.0, help="Live capture duration in seconds (0 means until Ctrl+C)")
     parser.add_argument("--max-pairs", type=int, default=0, help="Stop after N decoded stereo pairs (0 means no pair limit)")
     parser.add_argument("--print-limit", type=int, default=1024, help="Print at most N raw hex pairs to stdout (0 prints all)")
@@ -646,6 +720,14 @@ def main() -> int:
         parser.error("--frame-bins must fit inside the FFT packet-index range")
     if args.packet_index_bits <= 0:
         parser.error("--packet-index-bits must be positive")
+    if args.capture_realign_initial_word_skip is not None and args.capture_realign_initial_word_skip < 0:
+        parser.error("--capture-realign-initial-word-skip must be non-negative")
+
+    capture_realign_initial_word_skip, capture_realign_swap_channels = resolve_helper_tagged_realign_options(
+        use_preset=bool(args.capture_realign_tagged),
+        initial_word_skip=args.capture_realign_initial_word_skip,
+        swap_channels=args.capture_realign_swap_channels,
+    )
 
     cfg = TaggedTransportConfig(
         frame_bins=args.frame_bins,
@@ -685,6 +767,8 @@ def main() -> int:
             device=args.device,
             rate=args.rate,
             read_frames=args.read_frames,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
             capture_seconds=args.seconds,
             max_pairs=args.max_pairs,
             monitor=monitor,

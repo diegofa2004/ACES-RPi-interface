@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -8,6 +9,7 @@ import numpy as np
 try:
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        CAPTURE_BACKEND_NATIVE,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
         DEFAULT_PACKET_INDEX_BITS,
@@ -19,9 +21,11 @@ try:
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
-        build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        helper_tagged_realign_enabled,
+        parse_capture_telemetry_line,
+        resolve_capture_command,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -30,6 +34,7 @@ try:
 except ImportError:
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        CAPTURE_BACKEND_NATIVE,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
         DEFAULT_PACKET_INDEX_BITS,
@@ -41,9 +46,11 @@ except ImportError:
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
-        build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        helper_tagged_realign_enabled,
+        parse_capture_telemetry_line,
+        resolve_capture_command,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -68,6 +75,9 @@ class FFTAdapterConfig:
     useful_bins: int = 256
     capture_backend: str = "auto"
     capture_binary: Optional[str] = None
+    capture_telemetry: bool = False
+    capture_realign_initial_word_skip: int = 0
+    capture_realign_swap_channels: bool = False
     gpio_chip: str = "/dev/gpiochip0"
     bfpexp_flag_line: Optional[int] = None
     done_line: Optional[int] = None
@@ -93,6 +103,8 @@ class FFTAdapterConfig:
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
+        if self.capture_realign_initial_word_skip < 0:
+            raise ValueError("capture_realign_initial_word_skip must be non-negative")
         if self.frame_bins <= 0:
             raise ValueError("frame_bins must be positive")
         if self.frame_bins > self.fft_packet_index_base:
@@ -177,6 +189,10 @@ class FPGAFFTReceiver:
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins: tuple[int, ...] = tuple()
         self._captured_frame_count = 0
+        self._capture_telemetry_lock = threading.Lock()
+        self._capture_telemetry_events: list[dict[str, object]] = []
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._helper_handles_tagged_alignment = False
 
         n_fft = 2 * (self.cfg.useful_bins - 1)
         self.mel_filter = build_mel_filter(
@@ -318,6 +334,29 @@ class FPGAFFTReceiver:
             self._byte_buffer.extend(chunk)
 
         return len(self._byte_buffer) >= min_bytes
+
+    def _capture_stderr_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+
+        while True:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            event = parse_capture_telemetry_line(line)
+            if event is None:
+                continue
+            with self._capture_telemetry_lock:
+                self._capture_telemetry_events.append(event)
+
+    def drain_capture_telemetry_events(self) -> list[dict[str, object]]:
+        with self._capture_telemetry_lock:
+            if not self._capture_telemetry_events:
+                return []
+            events = list(self._capture_telemetry_events)
+            self._capture_telemetry_events.clear()
+        return events
 
     def _pop_pairs(self, pair_count: int, exact: bool) -> Optional[np.ndarray]:
         if pair_count <= 0:
@@ -475,9 +514,10 @@ class FPGAFFTReceiver:
                 pairs = self._pop_pairs(self._poll_pairs, exact=False)
                 if pairs is None:
                     break
-                pairs = self._tagged_realigner.push_pairs(pairs)
-                if pairs.size == 0:
-                    continue
+                if not self._helper_handles_tagged_alignment:
+                    pairs = self._tagged_realigner.push_pairs(pairs)
+                    if pairs.size == 0:
+                        continue
             for idx, pair in enumerate(pairs):
                 kind, packet_index, payload = self._pair_kind_packet_index_and_payload(pair)
 
@@ -589,11 +629,14 @@ class FPGAFFTReceiver:
     def start(self) -> None:
         resolved_device = resolve_audio_device(self.cfg.device)
         self.cfg.device = resolved_device
-        cmd = build_capture_cmd(
+        resolved_backend, cmd = resolve_capture_command(
             resolved_device,
             self.cfg.sample_rate,
             backend=self.cfg.capture_backend,
             capture_binary=self.cfg.capture_binary,
+            capture_telemetry=self.cfg.capture_telemetry,
+            capture_realign_initial_word_skip=self.cfg.capture_realign_initial_word_skip,
+            capture_realign_swap_channels=self.cfg.capture_realign_swap_channels,
         )
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
@@ -602,18 +645,36 @@ class FPGAFFTReceiver:
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins = tuple()
         self._captured_frame_count = 0
+        self._helper_handles_tagged_alignment = (
+            resolved_backend == CAPTURE_BACKEND_NATIVE
+            and helper_tagged_realign_enabled(
+                self.cfg.capture_realign_initial_word_skip,
+                self.cfg.capture_realign_swap_channels,
+            )
+        )
+        self.drain_capture_telemetry_events()
         try:
             self._proc = start_capture_process(
                 resolved_device,
                 self.cfg.sample_rate,
                 backend=self.cfg.capture_backend,
                 capture_binary=self.cfg.capture_binary,
+                capture_telemetry=self.cfg.capture_telemetry,
+                capture_realign_initial_word_skip=self.cfg.capture_realign_initial_word_skip,
+                capture_realign_swap_channels=self.cfg.capture_realign_swap_channels,
+                capture_stderr=self.cfg.capture_telemetry,
             )
+            if self.cfg.capture_telemetry and self._proc.stderr is not None:
+                self._stderr_thread = threading.Thread(target=self._capture_stderr_loop, daemon=True)
+                self._stderr_thread.start()
             self._setup_gpio()
         except Exception:
             if self._proc is not None:
                 stop_process(self._proc)
                 self._proc = None
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=1.0)
+                self._stderr_thread = None
             self._teardown_gpio()
             raise
         print("Starting:", " ".join(cmd), flush=True)
@@ -623,6 +684,9 @@ class FPGAFFTReceiver:
         if self._proc is not None:
             stop_process(self._proc)
             self._proc = None
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
+            self._stderr_thread = None
         self._byte_buffer.clear()
         self._tagged_realigner.reset()
         self._tagged_pair_buffer = np.empty((0, 2), dtype=np.int32)
@@ -630,6 +694,7 @@ class FPGAFFTReceiver:
         self.last_frame_had_explicit_bfpexp = False
         self.last_frame_missing_bins = tuple()
         self._captured_frame_count = 0
+        self._helper_handles_tagged_alignment = False
         self._teardown_gpio()
 
     def read_frame(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:

@@ -100,6 +100,32 @@ class I2SStreamTests(unittest.TestCase):
         self.assertIn("--mode", cmd)
         self.assertIn("raw", cmd)
 
+    def test_build_native_capture_cmd_enables_jsonl_telemetry_when_requested(self):
+        cmd = i2s_stream.build_native_capture_cmd(
+            "/tmp/alsa_logger",
+            "hw:1,0",
+            i2s_stream.DEFAULT_CAPTURE_RATE_HZ,
+            capture_telemetry=True,
+        )
+
+        self.assertIn("--telemetry-format", cmd)
+        telemetry_idx = cmd.index("--telemetry-format")
+        self.assertEqual(cmd[telemetry_idx + 1], "jsonl")
+
+    def test_build_native_capture_cmd_enables_helper_realign_when_requested(self):
+        cmd = i2s_stream.build_native_capture_cmd(
+            "/tmp/alsa_logger",
+            "hw:1,0",
+            i2s_stream.DEFAULT_CAPTURE_RATE_HZ,
+            capture_realign_initial_word_skip=1,
+            capture_realign_swap_channels=True,
+        )
+
+        self.assertIn("--realign-initial-word-skip", cmd)
+        realign_idx = cmd.index("--realign-initial-word-skip")
+        self.assertEqual(cmd[realign_idx + 1], "1")
+        self.assertIn("--realign-swap-channels", cmd)
+
     def test_resolve_capture_command_requires_binary_for_explicit_native_backend(self):
         with mock.patch.object(i2s_stream, "find_native_capture_binary", return_value=None):
             with self.assertRaises(RuntimeError) as ctx:
@@ -110,6 +136,41 @@ class I2SStreamTests(unittest.TestCase):
                 )
 
         self.assertIn("no compiled helper was found", str(ctx.exception))
+
+    def test_resolve_capture_command_rejects_helper_realign_with_arecord_backend(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            i2s_stream.resolve_capture_command(
+                "hw:1,0",
+                i2s_stream.DEFAULT_CAPTURE_RATE_HZ,
+                backend=i2s_stream.CAPTURE_BACKEND_ARECORD,
+                capture_realign_initial_word_skip=1,
+            )
+
+        self.assertIn("requires the native alsa_logger backend", str(ctx.exception))
+
+    def test_resolve_capture_command_rejects_helper_realign_when_native_helper_is_missing(self):
+        with mock.patch.object(i2s_stream, "find_native_capture_binary", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                i2s_stream.resolve_capture_command(
+                    "hw:1,0",
+                    i2s_stream.DEFAULT_CAPTURE_RATE_HZ,
+                    capture_realign_initial_word_skip=1,
+                )
+
+        self.assertIn("helper realignment was requested", str(ctx.exception))
+
+    def test_parse_capture_telemetry_line_accepts_jsonl_and_plain_text(self):
+        json_payload = i2s_stream.parse_capture_telemetry_line(b'{"type":"capture_chunk","frames":512}\n')
+        text_payload = i2s_stream.parse_capture_telemetry_line("plain stderr line\n")
+
+        self.assertEqual(json_payload, {"type": "capture_chunk", "frames": 512})
+        self.assertEqual(
+            text_payload,
+            {
+                "type": "capture_stderr_text",
+                "message": "plain stderr line",
+            },
+        )
 
     def test_trim_incomplete_frames_discards_partial_tail(self):
         raw = b"\x00" * 19

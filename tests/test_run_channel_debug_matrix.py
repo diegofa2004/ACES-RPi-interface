@@ -34,6 +34,7 @@ class RunChannelDebugMatrixScriptTests(unittest.TestCase):
             commands = (output_dir / "replay_commands.sh").read_text(encoding="utf-8")
             manifest = (output_dir / "session_info.txt").read_text(encoding="utf-8")
             readme = (output_dir / "README.txt").read_text(encoding="utf-8")
+            summary_header = (output_dir / "scenario_summary.tsv").read_text(encoding="utf-8").splitlines()[0]
 
         self.assertIn("--debug-raw-capture", commands)
         self.assertEqual(commands.count("--debug-raw-capture"), 1)
@@ -42,6 +43,8 @@ class RunChannelDebugMatrixScriptTests(unittest.TestCase):
         self.assertIn("raw_index=", manifest)
         self.assertIn("channel_capture.raw", readme)
         self.assertIn("channel_capture.index.jsonl", readme)
+        self.assertIn("capture_xruns", summary_header)
+        self.assertIn("capture_queue_high_water", summary_header)
 
 
 if __name__ == "__main__":

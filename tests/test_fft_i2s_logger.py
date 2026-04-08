@@ -63,8 +63,8 @@ class FFTI2SLoggerTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "1000,7,0x0010000A,0x00100014,bfpexp,bfpexp_preamble,0,0,0,0,1,1,10,20,0,0,0,0",
-                "1001,8,0x8023FFFF,0x80200008,fft,fft_frame,0,0,512,512,2,2,-1,8,0,0,0,0",
+                "1000,7,0x0010000A,0x00100014,bfpexp,bfpexp_preamble,0,0,0,0,-1,-1,1,1,10,20,0,0,0,0",
+                "1001,8,0x8023FFFF,0x80200008,fft,fft_frame,0,0,512,512,0,0,2,2,-1,8,0,0,0,0",
             ],
         )
 

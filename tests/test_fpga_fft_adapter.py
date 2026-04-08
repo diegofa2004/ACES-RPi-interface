@@ -50,24 +50,61 @@ class FPGAFFTReceiverTests(unittest.TestCase):
         rx = FPGAFFTReceiver(cfg)
 
         with mock.patch.object(fpga_fft_adapter, "resolve_audio_device", return_value="hw:2,0"), \
-             mock.patch.object(fpga_fft_adapter, "build_capture_cmd", return_value=["fake-capture", "--raw"]) as build_mock, \
+             mock.patch.object(
+                 fpga_fft_adapter,
+                 "resolve_capture_command",
+                 return_value=("arecord", ["fake-capture", "--raw"]),
+             ) as resolve_mock, \
              mock.patch.object(fpga_fft_adapter, "start_capture_process", return_value=fake_proc) as start_mock, \
              mock.patch.object(fpga_fft_adapter, "stop_process") as stop_mock:
             rx.start()
-            build_mock.assert_called_once_with(
+            resolve_mock.assert_called_once_with(
                 "hw:2,0",
                 48828,
                 backend="auto",
                 capture_binary=None,
+                capture_telemetry=False,
+                capture_realign_initial_word_skip=0,
+                capture_realign_swap_channels=False,
             )
             start_mock.assert_called_once_with(
                 "hw:2,0",
                 48828,
                 backend="auto",
                 capture_binary=None,
+                capture_telemetry=False,
+                capture_realign_initial_word_skip=0,
+                capture_realign_swap_channels=False,
+                capture_stderr=False,
             )
             rx.stop()
             stop_mock.assert_called_once_with(fake_proc)
+        self.assertFalse(rx._helper_handles_tagged_alignment)
+
+    def test_start_enables_helper_aligned_mode_when_native_capture_realign_is_requested(self):
+        fake_proc = FakeProcess(b"")
+        cfg = FFTAdapterConfig(
+            device="auto",
+            use_i2s_tags=True,
+            capture_backend="alsa-c",
+            capture_realign_initial_word_skip=1,
+            capture_realign_swap_channels=True,
+        )
+        rx = FPGAFFTReceiver(cfg)
+
+        with mock.patch.object(fpga_fft_adapter, "resolve_audio_device", return_value="hw:2,0"), \
+             mock.patch.object(
+                 fpga_fft_adapter,
+                 "resolve_capture_command",
+                 return_value=(fpga_fft_adapter.CAPTURE_BACKEND_NATIVE, ["alsa_logger", "--mode", "raw"]),
+             ), \
+             mock.patch.object(fpga_fft_adapter, "start_capture_process", return_value=fake_proc), \
+             mock.patch.object(fpga_fft_adapter, "stop_process"):
+            rx.start()
+            self.assertTrue(rx._helper_handles_tagged_alignment)
+            rx.stop()
+
+        self.assertFalse(rx._helper_handles_tagged_alignment)
 
     def test_read_frame_in_tagged_mode_decodes_bfpexp_then_fft_pairs(self):
         cfg = FFTAdapterConfig(

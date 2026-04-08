@@ -13,9 +13,12 @@ try:
     from .fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from .i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        CAPTURE_BACKEND_NATIVE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -25,10 +28,13 @@ try:
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
-        build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        helper_tagged_realign_enabled,
         read_exactly,
+        resolve_capture_command,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -38,9 +44,12 @@ except ImportError:
     from fpga_fft_adapter import DEFAULT_BFPEXP_HOLD_PAIRS, DEFAULT_TAG_LOSS_TOLERANCE_PAIRS
     from i2s_stream import (
         AUTO_AUDIO_DEVICE,
+        CAPTURE_BACKEND_NATIVE,
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -50,10 +59,13 @@ except ImportError:
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
         TaggedI2SRealigner,
-        build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        helper_tagged_realign_enabled,
         read_exactly,
+        resolve_capture_command,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
         start_capture_process,
         stop_process,
@@ -361,6 +373,18 @@ def write_csv_rows(
                 contract_index,
                 left["packet_index"],
                 right["packet_index"],
+                fft_bin_index_from_packet_index(
+                    int(left["packet_index"]),
+                    tag=int(left["tag"]),
+                    tag_fft=tag_fft,
+                    fft_packet_index_base=fft_packet_index_base,
+                ),
+                fft_bin_index_from_packet_index(
+                    int(right["packet_index"]),
+                    tag=int(right["tag"]),
+                    tag_fft=tag_fft,
+                    fft_packet_index_base=fft_packet_index_base,
+                ),
                 left["tag"],
                 right["tag"],
                 left["payload"],
@@ -396,6 +420,27 @@ def main() -> int:
         "--capture-binary",
         default=None,
         help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
+    )
+    parser.add_argument(
+        "--capture-realign-tagged",
+        action="store_true",
+        help=(
+            "Use the native helper realignment preset for tagged words "
+            f"(drop {DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP} initial word and "
+            f"{'swap' if DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS else 'keep'} channels)"
+        ),
+    )
+    parser.add_argument(
+        "--capture-realign-initial-word-skip",
+        type=int,
+        default=None,
+        help="Number of initial 32-bit words the native helper should discard before re-pairing stereo data",
+    )
+    parser.add_argument(
+        "--capture-realign-swap-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Swap left/right channels in the native helper after tagged-word re-pairing",
     )
     parser.add_argument(
         "-r",
@@ -456,6 +501,8 @@ def main() -> int:
         parser.error("--chunk-frames must be positive")
     if args.flush_every_chunks <= 0:
         parser.error("--flush-every-chunks must be positive")
+    if args.capture_realign_initial_word_skip is not None and args.capture_realign_initial_word_skip < 0:
+        parser.error("--capture-realign-initial-word-skip must be non-negative")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
     if args.packet_index_bits <= 0:
@@ -472,6 +519,11 @@ def main() -> int:
 
     bytes_per_frame = 8  # 2 channels x int32
     chunk_bytes = args.chunk_frames * bytes_per_frame
+    capture_realign_initial_word_skip, capture_realign_swap_channels = resolve_helper_tagged_realign_options(
+        use_preset=bool(args.capture_realign_tagged),
+        initial_word_skip=args.capture_realign_initial_word_skip,
+        swap_channels=args.capture_realign_swap_channels,
+    )
 
     seq = 0
     chunk_index = 0
@@ -503,11 +555,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_stop)
     signal.signal(signal.SIGTERM, handle_stop)
 
-    cmd = build_capture_cmd(
+    resolved_backend, cmd = resolve_capture_command(
         device,
         args.rate,
         backend=args.capture_backend,
         capture_binary=args.capture_binary,
+        capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+        capture_realign_swap_channels=capture_realign_swap_channels,
+    )
+    use_helper_realign = (
+        resolved_backend == CAPTURE_BACKEND_NATIVE
+        and helper_tagged_realign_enabled(
+            capture_realign_initial_word_skip,
+            capture_realign_swap_channels,
+        )
     )
     print("Using ALSA capture device:", device, flush=True)
     print("Starting:", " ".join(cmd), flush=True)
@@ -519,6 +580,8 @@ def main() -> int:
             args.rate,
             backend=args.capture_backend,
             capture_binary=args.capture_binary,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
@@ -539,6 +602,8 @@ def main() -> int:
                     "contract_index",
                     "left_packet_index",
                     "right_packet_index",
+                    "left_bin_index",
+                    "right_bin_index",
                     "left_tag",
                     "right_tag",
                     "left_payload",
@@ -566,10 +631,13 @@ def main() -> int:
                 if stereo.size == 0:
                     continue
 
-                stereo = realigner.push_pairs(stereo)
-                if stereo.size == 0:
-                    continue
-                stereo = normalizer.normalize(stereo)
+                if use_helper_realign:
+                    stereo = np.asarray(stereo, dtype=np.int32).reshape(-1, 2)
+                else:
+                    stereo = realigner.push_pairs(stereo)
+                    if stereo.size == 0:
+                        continue
+                    stereo = normalizer.normalize(stereo)
 
                 seq = write_csv_rows(
                     writer,

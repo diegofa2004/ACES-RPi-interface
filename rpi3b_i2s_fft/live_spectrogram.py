@@ -21,6 +21,8 @@ try:
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -29,6 +31,7 @@ try:
         DEFAULT_TAG_IDLE,
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
 except ImportError:
@@ -43,6 +46,8 @@ except ImportError:
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -51,6 +56,7 @@ except ImportError:
         DEFAULT_TAG_IDLE,
         DEFAULT_TAG_MASK,
         DEFAULT_TAG_SHIFT,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
 
@@ -245,6 +251,8 @@ def _update_live_figure(
     peak_bin = int(np.argmax(latest_db))
     peak_freq_hz = float(freqs_hz[peak_bin]) if peak_bin < freqs_hz.size else 0.0
     freq_limit = float(freqs_hz[-1]) if freqs_hz.size else max_freq
+    if freq_limit <= 0.0:
+        freq_limit = max(float(freq_per_bin), 1.0)
 
     spectrum_line.set_data(freqs_hz, latest_db)
     spectrum_ax.set_xlim(0.0, freq_limit)
@@ -260,6 +268,8 @@ def _update_live_figure(
         history_duration = float(history_times[-1] - history_times[0])
     else:
         history_duration = 0.0
+    if history_duration <= 0.0:
+        history_duration = max(1e-3, float(frame_bins) / float(rate))
     start_time = -history_duration
     spectrogram_im.set_data(fft_db.T)
     spectrogram_im.set_extent((start_time, 0.0, 0.0, freq_limit))
@@ -275,9 +285,6 @@ def _update_live_figure(
     if tick_freqs_hz.size > 0:
         spectrogram_ax.set_yticks(tick_freqs_hz)
         spectrogram_ax.set_yticklabels([f"{int(freq)}" for freq in tick_freqs_hz])
-
-    if history_duration <= 0.0:
-        history_duration = max(1e-3, float(frame_bins) / float(rate))
 
     xtick_count = 6
     tick_start = -history_seconds
@@ -307,6 +314,27 @@ def main() -> int:
         "--capture-binary",
         default=None,
         help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
+    )
+    parser.add_argument(
+        "--capture-realign-tagged",
+        action="store_true",
+        help=(
+            "Use the native helper realignment preset for tagged words "
+            f"(drop {DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP} initial word and "
+            f"{'swap' if DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS else 'keep'} channels)"
+        ),
+    )
+    parser.add_argument(
+        "--capture-realign-initial-word-skip",
+        type=int,
+        default=None,
+        help="Number of initial 32-bit words the native helper should discard before re-pairing stereo data",
+    )
+    parser.add_argument(
+        "--capture-realign-swap-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Swap left/right channels in the native helper after tagged-word re-pairing",
     )
     parser.add_argument(
         "-r",
@@ -467,6 +495,8 @@ def main() -> int:
         parser.error("--payload-bits must be positive")
     if args.packet_index_bits <= 0:
         parser.error("--packet-index-bits must be positive")
+    if args.capture_realign_initial_word_skip is not None and args.capture_realign_initial_word_skip < 0:
+        parser.error("--capture-realign-initial-word-skip must be non-negative")
     if args.min_db is not None and args.max_db is not None and args.min_db >= args.max_db:
         parser.error("--min-db must be smaller than --max-db")
 
@@ -477,6 +507,11 @@ def main() -> int:
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
     apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
     sync_mode = str(sync_cfg["sync_mode"])
+    capture_realign_initial_word_skip, capture_realign_swap_channels = resolve_helper_tagged_realign_options(
+        use_preset=bool(args.capture_realign_tagged),
+        initial_word_skip=args.capture_realign_initial_word_skip,
+        swap_channels=args.capture_realign_swap_channels,
+    )
 
     if bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
@@ -496,6 +531,8 @@ def main() -> int:
             useful_bins=args.useful_bins,
             capture_backend=args.capture_backend,
             capture_binary=args.capture_binary,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
             gpio_chip=args.gpio_chip,
             bfpexp_flag_line=args.bfpexp_flag_line,
             done_line=args.done_line,

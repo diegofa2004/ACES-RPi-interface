@@ -149,6 +149,18 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
         self.assertEqual(summary["reserved_nonzero_words"], 2)
         self.assertEqual(summary["flag_unknown_chunks"], 1)
 
+    def test_decode_debug_word_includes_fft_bin_index(self):
+        cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
+        fft_word = pack_tagged_word(2, 5, packet_index=513)
+        bfpexp_word = pack_tagged_word(1, 7, packet_index=0)
+
+        fft_decoded = analyzer_from_fpga_fft._decode_debug_word(fft_word, cfg)
+        bfpexp_decoded = analyzer_from_fpga_fft._decode_debug_word(bfpexp_word, cfg)
+
+        self.assertEqual(fft_decoded["packet_index"], 513)
+        self.assertEqual(fft_decoded["bin_index"], 1)
+        self.assertEqual(bfpexp_decoded["bin_index"], -1)
+
     def test_iter_channel_debug_chunks_from_raw_file_uses_recorded_chunk_sizes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_path = Path(tmpdir) / "capture.raw"
@@ -164,6 +176,79 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
 
         self.assertEqual([chunk.shape[0] for chunk in chunks], [2, 1, 2])
         np.testing.assert_array_equal(chunks[1], np.asarray([[5, 6]], dtype=np.int32))
+
+    def test_load_channel_debug_capture_index_collects_helper_events(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "capture.index.jsonl"
+            with index_path.open("w", encoding="utf-8") as handle:
+                for payload in (
+                    {"type": "session_start", "device": "hw:2,0"},
+                    {"type": "capture_session_start", "actual_rate_hz": 48828},
+                    {"type": "capture_chunk", "chunk_index": 0, "frames": 512},
+                    {"type": "chunk", "chunk_index": 0, "pair_count": 2},
+                    {"type": "summary", "duration_seconds": 1.0},
+                ):
+                    handle.write(json.dumps(payload))
+                    handle.write("\n")
+
+            loaded = analyzer_from_fpga_fft.load_channel_debug_capture_index(index_path)
+
+        self.assertEqual(loaded["session_start"]["device"], "hw:2,0")
+        self.assertEqual(len(loaded["chunks"]), 1)
+        self.assertEqual(len(loaded["capture_events"]), 2)
+        self.assertEqual(loaded["capture_events"][0]["type"], "capture_session_start")
+        self.assertEqual(loaded["capture_events"][1]["type"], "capture_chunk")
+
+    def test_summarize_capture_telemetry_events_uses_final_helper_stats(self):
+        diagnostics = analyzer_from_fpga_fft.summarize_capture_telemetry_events(
+            [
+                {
+                    "type": "capture_session_start",
+                    "requested_rate_hz": 48828,
+                    "actual_rate_hz": 48828,
+                    "read_frames": 512,
+                    "period_frames": 512,
+                    "buffer_frames": 2048,
+                    "queue_chunks": 32,
+                    "mode": "raw",
+                    "telemetry_format": "jsonl",
+                },
+                {
+                    "type": "capture_warning",
+                    "warning": "rate_adjusted",
+                },
+                {
+                    "type": "capture_chunk",
+                    "chunk_index": 7,
+                    "captured_chunks": 8,
+                    "captured_frames": 4096,
+                    "queue_high_water_slots": 3,
+                    "queue_full_waits": 1,
+                },
+                {
+                    "type": "capture_final",
+                    "captured_chunks": 8,
+                    "captured_frames": 4096,
+                    "written_chunks": 8,
+                    "written_frames": 4096,
+                    "xruns": 2,
+                    "recoveries": 2,
+                    "partial_reads": 1,
+                    "queue_used_slots": 0,
+                    "queue_high_water_slots": 3,
+                    "queue_full_waits": 1,
+                    "queue_slot_count": 32,
+                    "rate_hz": 48828,
+                },
+            ]
+        )
+
+        self.assertEqual(diagnostics["helper_event_count"], 4)
+        self.assertTrue(diagnostics["rate_adjusted"])
+        self.assertEqual(diagnostics["xruns"], 2)
+        self.assertEqual(diagnostics["partial_reads"], 1)
+        self.assertEqual(diagnostics["queue_high_water_slots"], 3)
+        self.assertEqual(diagnostics["event_counts"]["capture_final"], 1)
 
     def test_run_channel_debug_replay_uses_saved_capture_index_metadata(self):
         cfg = FFTAdapterConfig(frame_bins=4, useful_bins=4, use_i2s_tags=True)
@@ -193,6 +278,18 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
                         "device": "hw:2,0",
                     },
                     {
+                        "type": "capture_session_start",
+                        "device": "hw:2,0",
+                        "requested_rate_hz": 48828,
+                        "actual_rate_hz": 48828,
+                        "read_frames": 512,
+                        "period_frames": 512,
+                        "buffer_frames": 2048,
+                        "queue_chunks": 32,
+                        "mode": "raw",
+                        "telemetry_format": "jsonl",
+                    },
+                    {
                         "type": "chunk",
                         "chunk_index": 0,
                         "timestamp_ns": 100,
@@ -215,6 +312,21 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
                         "duration_seconds": 0.75,
                         "interrupted": False,
                     },
+                    {
+                        "type": "capture_final",
+                        "captured_chunks": 2,
+                        "captured_frames": 5,
+                        "written_chunks": 2,
+                        "written_frames": 5,
+                        "xruns": 1,
+                        "recoveries": 1,
+                        "partial_reads": 0,
+                        "queue_used_slots": 0,
+                        "queue_high_water_slots": 1,
+                        "queue_full_waits": 0,
+                        "queue_slot_count": 32,
+                        "rate_hz": 48828,
+                    },
                 ):
                     handle.write(json.dumps(payload))
                     handle.write("\n")
@@ -236,13 +348,17 @@ class AnalyzerFromFPGAFFTTests(unittest.TestCase):
 
         self.assertEqual(payloads[0]["source"]["kind"], "raw_replay")
         self.assertEqual(payloads[0]["device"], "hw:2,0")
-        self.assertEqual(payloads[1]["flag_active"], True)
-        self.assertEqual(payloads[1]["pair_offset"], 0)
-        self.assertEqual(payloads[2]["flag_active"], False)
-        self.assertEqual(payloads[2]["pair_offset"], 2)
-        self.assertEqual(payloads[2]["byte_offset"], 16)
-        self.assertEqual(payloads[3]["duration_seconds"], 0.75)
-        self.assertEqual(payloads[3]["top_fft_run_lengths"], [2])
+        self.assertEqual(payloads[1]["type"], "capture_session_start")
+        self.assertEqual(payloads[2]["type"], "capture_final")
+        self.assertEqual(payloads[3]["flag_active"], True)
+        self.assertEqual(payloads[3]["pair_offset"], 0)
+        self.assertEqual(payloads[4]["flag_active"], False)
+        self.assertEqual(payloads[4]["pair_offset"], 2)
+        self.assertEqual(payloads[4]["byte_offset"], 16)
+        self.assertEqual(payloads[5]["duration_seconds"], 0.75)
+        self.assertEqual(payloads[5]["top_fft_run_lengths"], [2])
+        self.assertEqual(payloads[5]["capture_diagnostics"]["xruns"], 1)
+        self.assertEqual(payloads[5]["capture_diagnostics"]["queue_high_water_slots"], 1)
 
     def test_frames_for_seconds_rounds_up(self):
         self.assertEqual(analyzer_from_fpga_fft.frames_for_seconds(DEFAULT_CAPTURE_RATE_HZ, 512, 5.0), 477)

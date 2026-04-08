@@ -356,6 +356,7 @@ Robustness improvements added together with the tests:
 - `FPGAFFTReceiver` now preserves unread tagged pairs from the same chunk when a frame ends or breaks early, instead of dropping them
 - tagged-mode frame reconstruction now uses the packet index, so isolated lost words zero-fill only the missing bins instead of desynchronizing the whole frame
 - `FPGAFFTReceiver.last_frame_missing_bins` exposes which FFT bins had to be synthesized as zeros on the last returned frame
+- passive debug raw captures now persist helper-side ALSA telemetry (`capture_session_start`, `capture_chunk`, `capture_recovery`, `capture_final`) into the capture index, so offline replay can separate stream corruption from host-side overrun/recovery
 - tagged-mode configuration now rejects `payload_bits` that overlap the tag field
 - event recording now freezes the pre-buffer at the exact moment `Enter` is pressed, avoiding duplication of frames from the future window
 - logger and plot scripts expose smaller helper functions so behavior can be validated directly in unit tests
@@ -454,9 +455,10 @@ Debug matrix helper:
 
 - `run_channel_debug_matrix.sh` automates the most useful passive debug captures and stores:
 	- one `jsonl` per scenario,
-	- a `scenario_summary.tsv`,
+	- a `scenario_summary.tsv` that now also includes helper-side capture diagnostics,
 	- the exact replay commands,
-	- and a `session_info.txt` you can commit with the logs.
+	- a `session_info.txt` you can commit with the logs,
+	- and one shared `channel_capture.index.jsonl` that records both chunk offsets and helper-side ALSA telemetry.
 
 Example:
 
@@ -473,6 +475,16 @@ Useful option when a BFPEXP GPIO exists:
 	--packet-index-shift 22 --packet-index-bits 10 --fft-packet-index-base 512 \
 	--tag-shift 20 --tag-mask 0x3 --payload-bits 18
 ```
+
+What the shared offline bundle gives you now:
+
+- `channel_capture.raw`: exact raw stereo words captured from the Pi I2S device
+- `channel_capture.index.jsonl`: chunk offsets plus helper telemetry about ALSA capture progress
+- replayed scenario logs that copy those helper events, so the JSONL stays self-contained
+- `capture_diagnostics` in each summary with `xruns`, `recoveries`, `partial_reads`, `queue_high_water_slots`, and `queue_full_waits`
+
+This is the recommended artifact set when the observed problem might be caused
+either by physical-link packet loss or by host-side capture pressure.
 
 FPGA transmit reference (example RTL behavior):
 

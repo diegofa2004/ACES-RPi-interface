@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from collections import Counter, deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Tuple
 
@@ -23,6 +24,8 @@ try:
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -34,6 +37,8 @@ try:
         build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
 except ImportError:
@@ -49,6 +54,8 @@ except ImportError:
         DEFAULT_CAPTURE_BACKEND,
         DEFAULT_CAPTURE_RATE_HZ,
         DEFAULT_FFT_PACKET_INDEX_BASE,
+        DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP,
+        DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS,
         DEFAULT_PACKET_INDEX_BITS,
         DEFAULT_PACKET_INDEX_SHIFT,
         DEFAULT_PAYLOAD_BITS,
@@ -60,6 +67,8 @@ except ImportError:
         build_capture_cmd,
         classify_tagged_i2s_pair,
         decode_tagged_i2s_word,
+        fft_bin_index_from_packet_index,
+        resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
 
@@ -75,7 +84,7 @@ RECORD_TRIGGER_FILENAME = WORK_DIR / "record_button.trigger"
 PREBUFFER_SECONDS = 5.0
 HISTORY_SECONDS = 15.0
 RECORD_SECONDS = 5.0
-DEBUG_LOG_FORMAT_VERSION = 1
+DEBUG_LOG_FORMAT_VERSION = 2
 DEFAULT_DEBUG_CAPTURE_SECONDS = 10.0
 DEFAULT_DEBUG_CHUNK_PAIRS = 1024
 DEFAULT_DEBUG_PREVIEW_PAIRS = 12
@@ -232,6 +241,12 @@ def _decode_debug_word(word: int, cfg: FFTAdapterConfig) -> dict[str, object]:
         "i32": int(word),
         "tag": int(decoded["tag"]),
         "packet_index": int(decoded["packet_index"]),
+        "bin_index": fft_bin_index_from_packet_index(
+            int(decoded["packet_index"]),
+            tag=int(decoded["tag"]),
+            tag_fft=cfg.tag_fft,
+            fft_packet_index_base=cfg.fft_packet_index_base,
+        ),
         "payload": int(decoded["payload"]),
         "reserved": int(decoded["reserved"]),
         "reserved_nonzero": bool(decoded["reserved_nonzero"]),
@@ -424,11 +439,12 @@ def build_channel_debug_summary(
     duration_seconds: float,
     interrupted: bool,
     timestamp_ns: int,
+    capture_diagnostics: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
     fft_run_lengths = list(state["fft_run_lengths"])
     fft_run_lengths.sort(reverse=True)
 
-    return {
+    summary = {
         "type": "summary",
         "timestamp_ns": int(timestamp_ns),
         "duration_seconds": float(duration_seconds),
@@ -447,6 +463,9 @@ def build_channel_debug_summary(
         "flag_low_chunks": int(state["flag_low_chunks"]),
         "flag_unknown_chunks": int(state["flag_unknown_chunks"]),
     }
+    if capture_diagnostics:
+        summary["capture_diagnostics"] = capture_diagnostics
+    return summary
 
 
 def _write_jsonl_line(handle, payload: dict[str, object]) -> None:
@@ -510,12 +529,15 @@ def load_channel_debug_capture_index(index_path: Optional[Path]) -> dict[str, ob
         "session_start": {},
         "summary": {},
         "chunks": [],
+        "capture_events": [],
     }
     if index_path is None or not index_path.exists():
         return result
 
     chunks = result["chunks"]
+    capture_events = result["capture_events"]
     assert isinstance(chunks, list)
+    assert isinstance(capture_events, list)
 
     with index_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -529,8 +551,91 @@ def load_channel_debug_capture_index(index_path: Optional[Path]) -> dict[str, ob
                 result["summary"] = payload
             elif payload_type == "chunk":
                 chunks.append(payload)
+            elif isinstance(payload_type, str) and payload_type.startswith("capture_"):
+                capture_events.append(payload)
 
     return result
+
+
+def _persist_capture_telemetry_events(
+    rx: FPGAFFTReceiver,
+    handle,
+    capture_events: list[dict[str, object]],
+) -> None:
+    drained_events = rx.drain_capture_telemetry_events()
+    if not drained_events:
+        return
+
+    capture_events.extend(drained_events)
+    for event in drained_events:
+        _write_jsonl_line(handle, event)
+
+
+def summarize_capture_telemetry_events(events: Sequence[dict[str, object]]) -> dict[str, object]:
+    if not events:
+        return {}
+
+    event_counts: Counter[str] = Counter()
+    capture_start: dict[str, object] = {}
+    latest_stats: dict[str, object] = {}
+    latest_chunk: dict[str, object] = {}
+    rate_adjusted = False
+
+    for event in events:
+        payload_type = str(event.get("type") or "")
+        event_counts[payload_type] += 1
+        if payload_type == "capture_session_start" and not capture_start:
+            capture_start = event
+        elif payload_type == "capture_chunk":
+            latest_chunk = event
+        elif payload_type in ("capture_stats", "capture_final"):
+            latest_stats = event
+        elif payload_type == "capture_warning" and event.get("warning") == "rate_adjusted":
+            rate_adjusted = True
+
+    source = latest_stats or latest_chunk or capture_start
+    diagnostics: dict[str, object] = {
+        "helper_event_count": int(len(events)),
+        "event_counts": dict(sorted(event_counts.items())),
+        "rate_adjusted": bool(rate_adjusted),
+    }
+
+    if capture_start:
+        for field in (
+            "requested_rate_hz",
+            "actual_rate_hz",
+            "read_frames",
+            "period_frames",
+            "buffer_frames",
+            "queue_chunks",
+            "mode",
+            "telemetry_format",
+        ):
+            if field in capture_start:
+                diagnostics[field] = capture_start[field]
+
+    if latest_chunk and "chunk_index" in latest_chunk:
+        diagnostics["last_chunk_index"] = int(latest_chunk["chunk_index"])
+
+    if source:
+        for field in (
+            "captured_chunks",
+            "captured_frames",
+            "written_chunks",
+            "written_frames",
+            "xruns",
+            "recoveries",
+            "partial_reads",
+            "queue_used_slots",
+            "queue_high_water_slots",
+            "queue_full_waits",
+            "queue_slot_count",
+            "rate_hz",
+        ):
+            if field in source:
+                diagnostics[field] = source[field]
+
+    return diagnostics
 
 
 def _build_debug_session_start(
@@ -557,6 +662,9 @@ def _build_debug_session_start(
                 cfg.sample_rate,
                 backend=cfg.capture_backend,
                 capture_binary=cfg.capture_binary,
+                capture_telemetry=cfg.capture_telemetry,
+                capture_realign_initial_word_skip=cfg.capture_realign_initial_word_skip,
+                capture_realign_swap_channels=cfg.capture_realign_swap_channels,
             )
             if device
             else None
@@ -567,6 +675,9 @@ def _build_debug_session_start(
             "useful_bins": cfg.useful_bins,
             "capture_backend": cfg.capture_backend,
             "capture_binary": cfg.capture_binary,
+            "capture_telemetry": cfg.capture_telemetry,
+            "capture_realign_initial_word_skip": cfg.capture_realign_initial_word_skip,
+            "capture_realign_swap_channels": cfg.capture_realign_swap_channels,
             "use_i2s_tags": cfg.use_i2s_tags,
             "tag_shift": cfg.tag_shift,
             "tag_mask": cfg.tag_mask,
@@ -598,7 +709,8 @@ def capture_channel_debug_raw(
     capture_seconds: float,
     chunk_pairs: int,
 ) -> int:
-    rx = FPGAFFTReceiver(cfg)
+    capture_cfg = replace(cfg, capture_telemetry=True)
+    rx = FPGAFFTReceiver(capture_cfg)
     try:
         rx.start()
     except RuntimeError as exc:
@@ -611,17 +723,18 @@ def capture_channel_debug_raw(
     start_monotonic = time.monotonic()
     total_pairs = 0
     chunk_index = 0
+    capture_events: list[dict[str, object]] = []
 
     print("Channel debug raw capture active: writing the full I2S stream for offline replay.", flush=True)
     print("Raw capture:", raw_path, flush=True)
     print("Chunk index:", index_path, flush=True)
 
-    try:
-        with raw_path.open("wb") as raw_handle, index_path.open("w", encoding="utf-8") as index_handle:
+    with raw_path.open("wb") as raw_handle, index_path.open("w", encoding="utf-8") as index_handle:
+        try:
             _write_jsonl_line(
                 index_handle,
                 _build_debug_session_start(
-                    cfg,
+                    capture_cfg,
                     device=device,
                     capture_seconds=capture_seconds,
                     chunk_pairs=chunk_pairs,
@@ -635,11 +748,13 @@ def capture_channel_debug_raw(
             )
 
             while True:
+                _persist_capture_telemetry_events(rx, index_handle, capture_events)
                 elapsed = time.monotonic() - start_monotonic
                 if elapsed >= capture_seconds:
                     break
 
                 pairs = rx.read_available_pairs(chunk_pairs)
+                _persist_capture_telemetry_events(rx, index_handle, capture_events)
                 if pairs is None:
                     if rx._proc is not None and rx._proc.poll() is not None:
                         break
@@ -663,7 +778,12 @@ def capture_channel_debug_raw(
                     },
                 )
                 chunk_index += 1
-
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Stopping raw capture...", flush=True)
+        finally:
+            rx.stop()
+            _persist_capture_telemetry_events(rx, index_handle, capture_events)
             _write_jsonl_line(
                 index_handle,
                 {
@@ -674,26 +794,9 @@ def capture_channel_debug_raw(
                     "chunk_count": int(chunk_index),
                     "total_pairs": int(total_pairs),
                     "raw_bytes": int(total_pairs * DEBUG_BYTES_PER_PAIR),
+                    "capture_diagnostics": summarize_capture_telemetry_events(capture_events),
                 },
             )
-    except KeyboardInterrupt:
-        interrupted = True
-        with index_path.open("a", encoding="utf-8") as index_handle:
-            _write_jsonl_line(
-                index_handle,
-                {
-                    "type": "summary",
-                    "timestamp_ns": time.time_ns(),
-                    "duration_seconds": float(time.monotonic() - start_monotonic),
-                    "interrupted": bool(interrupted),
-                    "chunk_count": int(chunk_index),
-                    "total_pairs": int(total_pairs),
-                    "raw_bytes": int(total_pairs * DEBUG_BYTES_PER_PAIR),
-                },
-            )
-        print("Stopping raw capture...", flush=True)
-    finally:
-        rx.stop()
 
     print("Raw capture complete.", flush=True)
     return 0
@@ -708,7 +811,8 @@ def run_channel_debug_capture(
     chunk_pairs: int,
     preview_pairs: int,
 ) -> int:
-    rx = FPGAFFTReceiver(cfg)
+    capture_cfg = replace(cfg, capture_telemetry=True)
+    rx = FPGAFFTReceiver(capture_cfg)
     try:
         rx.start()
     except RuntimeError as exc:
@@ -720,32 +824,35 @@ def run_channel_debug_capture(
     start_monotonic = time.monotonic()
     last_status = start_monotonic
     state = create_channel_debug_state()
+    capture_events: list[dict[str, object]] = []
 
     print("Channel debug mode active: passive capture, no frame protocol enforcement.", flush=True)
     print("Structured JSONL log:", log_path, flush=True)
     print("Commit this log file so we can inspect raw words, decoded tags, transitions, and FFT run lengths.", flush=True)
 
-    try:
-        with log_path.open("w", encoding="utf-8") as handle:
+    with log_path.open("w", encoding="utf-8") as handle:
+        try:
             _write_jsonl_line(
                 handle,
                 _build_debug_session_start(
-                    cfg,
+                    capture_cfg,
                     device=device,
                     capture_seconds=capture_seconds,
                     chunk_pairs=chunk_pairs,
                     preview_pairs=preview_pairs,
-                    source={"kind": "live_arecord"},
+                    source={"kind": "live_capture"},
                     timestamp_ns=time.time_ns(),
                 ),
             )
 
             while True:
+                _persist_capture_telemetry_events(rx, handle, capture_events)
                 elapsed = time.monotonic() - start_monotonic
                 if elapsed >= capture_seconds:
                     break
 
                 pairs = rx.read_available_pairs(chunk_pairs)
+                _persist_capture_telemetry_events(rx, handle, capture_events)
                 if pairs is None:
                     if rx._proc is not None and rx._proc.poll() is not None:
                         break
@@ -754,7 +861,7 @@ def run_channel_debug_capture(
                 flag_active = rx.read_flag_state()
                 chunk_event = process_channel_debug_chunk(
                     pairs,
-                    cfg,
+                    capture_cfg,
                     state,
                     preview_pairs=preview_pairs,
                     flag_active=flag_active,
@@ -777,7 +884,12 @@ def run_channel_debug_capture(
                         flush=True,
                     )
                     last_status = now
-
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Stopping debug capture...", flush=True)
+        finally:
+            rx.stop()
+            _persist_capture_telemetry_events(rx, handle, capture_events)
             finalize_channel_debug_state(state)
             _write_jsonl_line(
                 handle,
@@ -786,24 +898,9 @@ def run_channel_debug_capture(
                     duration_seconds=time.monotonic() - start_monotonic,
                     interrupted=interrupted,
                     timestamp_ns=time.time_ns(),
+                    capture_diagnostics=summarize_capture_telemetry_events(capture_events),
                 ),
             )
-    except KeyboardInterrupt:
-        interrupted = True
-        finalize_channel_debug_state(state)
-        with log_path.open("a", encoding="utf-8") as handle:
-            _write_jsonl_line(
-                handle,
-                build_channel_debug_summary(
-                    state,
-                    duration_seconds=time.monotonic() - start_monotonic,
-                    interrupted=interrupted,
-                    timestamp_ns=time.time_ns(),
-                ),
-            )
-        print("Stopping debug capture...", flush=True)
-    finally:
-        rx.stop()
 
     print("Debug capture complete.", flush=True)
     return 0
@@ -823,9 +920,11 @@ def run_channel_debug_replay(
     session_start = index_payload["session_start"]
     summary = index_payload["summary"]
     chunk_entries = index_payload["chunks"]
+    capture_events = index_payload["capture_events"]
     assert isinstance(session_start, dict)
     assert isinstance(summary, dict)
     assert isinstance(chunk_entries, list)
+    assert isinstance(capture_events, list)
 
     chunk_sizes = [int(entry.get("pair_count", 0)) for entry in chunk_entries] if chunk_entries else None
     state = create_channel_debug_state()
@@ -833,6 +932,9 @@ def run_channel_debug_replay(
 
     source_device = str(session_start.get("device") or device or "raw_replay")
     source_duration = float(summary.get("duration_seconds", 0.0)) if summary else 0.0
+    capture_diagnostics = summary.get("capture_diagnostics")
+    if not isinstance(capture_diagnostics, dict):
+        capture_diagnostics = summarize_capture_telemetry_events(capture_events)
     print("Channel debug replay mode active: decoding a saved raw I2S capture.", flush=True)
     print("Raw capture:", raw_path, flush=True)
     if index_path is not None:
@@ -857,6 +959,9 @@ def run_channel_debug_replay(
                 timestamp_ns=time.time_ns(),
             ),
         )
+
+        for capture_event in capture_events:
+            _write_jsonl_line(handle, capture_event)
 
         chunk_meta_iter = iter(chunk_entries)
         for pairs in iter_channel_debug_chunks_from_raw_file(raw_path, chunk_pairs, chunk_sizes=chunk_sizes):
@@ -886,6 +991,7 @@ def run_channel_debug_replay(
                 duration_seconds=source_duration,
                 interrupted=bool(summary.get("interrupted", False)),
                 timestamp_ns=time.time_ns(),
+                capture_diagnostics=capture_diagnostics,
             ),
         )
 
@@ -954,6 +1060,27 @@ def main() -> int:
         "--capture-binary",
         default=None,
         help="Path to the compiled native C capture helper (used when --capture-backend=alsa-c)",
+    )
+    parser.add_argument(
+        "--capture-realign-tagged",
+        action="store_true",
+        help=(
+            "Use the native helper realignment preset for tagged words "
+            f"(drop {DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP} initial word and "
+            f"{'swap' if DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS else 'keep'} channels)"
+        ),
+    )
+    parser.add_argument(
+        "--capture-realign-initial-word-skip",
+        type=int,
+        default=None,
+        help="Number of initial 32-bit words the native helper should discard before re-pairing stereo data",
+    )
+    parser.add_argument(
+        "--capture-realign-swap-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Swap left/right channels in the native helper after tagged-word re-pairing",
     )
     parser.add_argument(
         "-r",
@@ -1147,6 +1274,8 @@ def main() -> int:
         parser.error("--payload-bits must be positive")
     if args.packet_index_bits <= 0:
         parser.error("--packet-index-bits must be positive")
+    if args.capture_realign_initial_word_skip is not None and args.capture_realign_initial_word_skip < 0:
+        parser.error("--capture-realign-initial-word-skip must be non-negative")
     sync_cfg = _resolve_sync_cli_defaults(args)
     use_i2s_tags = bool(sync_cfg["use_i2s_tags"])
     bfpexp_hold_pairs = int(sync_cfg["bfpexp_hold_pairs"])
@@ -1154,6 +1283,11 @@ def main() -> int:
     allow_fft_without_bfpexp = bool(sync_cfg["allow_fft_without_bfpexp"])
     apply_bfpexp = True if args.apply_bfpexp is None else bool(args.apply_bfpexp)
     sync_mode = str(sync_cfg["sync_mode"])
+    capture_realign_initial_word_skip, capture_realign_swap_channels = resolve_helper_tagged_realign_options(
+        use_preset=bool(args.capture_realign_tagged),
+        initial_word_skip=args.capture_realign_initial_word_skip,
+        swap_channels=args.capture_realign_swap_channels,
+    )
 
     if bfpexp_hold_pairs <= 0:
         parser.error("--bfpexp-hold-pairs must be positive")
@@ -1211,6 +1345,8 @@ def main() -> int:
             useful_bins=args.useful_bins,
             capture_backend=args.capture_backend,
             capture_binary=args.capture_binary,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
             gpio_chip=args.gpio_chip,
             bfpexp_flag_line=args.bfpexp_flag_line,
             done_line=args.done_line,

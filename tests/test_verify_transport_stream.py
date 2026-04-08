@@ -25,6 +25,18 @@ def _pair_line(
 
 
 class VerifyTransportStreamTests(unittest.TestCase):
+    def test_accepts_enriched_alsa_logger_hex_lines_with_bin_annotations(self):
+        cfg = TaggedTransportConfig(frame_bins=4, useful_bins=4, bfpexp_pairs_required=1)
+        line = (
+            f"{_pair_line(512, 2, 1, 2).strip()} "
+            "kind=fft pkt=512/512 tag=fft/fft bin=0/0\n"
+        )
+
+        summary = analyze_tagged_hex_stream([line], cfg, print_limit=0, printer=lambda _line: None)
+
+        self.assertEqual(summary.pair_count, 1)
+        self.assertEqual(summary.kind_counts["fft"], 1)
+
     def test_detects_full_frames_and_zero_shift_when_frames_match(self):
         cfg = TaggedTransportConfig(frame_bins=4, useful_bins=4, bfpexp_pairs_required=2)
         lines = [

@@ -25,12 +25,25 @@ enum {
     DEFAULT_FLUSH_EVERY_CHUNKS = 8,
     DEFAULT_STATS_INTERVAL_MS = 1000,
     DEFAULT_PIPE_SIZE_BYTES = 1 << 16,
+    DEFAULT_PACKET_INDEX_BITS = 10,
+    DEFAULT_PACKET_INDEX_SHIFT = 22,
+    DEFAULT_FFT_PACKET_INDEX_BASE = 1 << (DEFAULT_PACKET_INDEX_BITS - 1),
+    DEFAULT_TAG_SHIFT = 20,
+    DEFAULT_TAG_MASK = 0x3,
+    DEFAULT_TAG_IDLE = 0,
+    DEFAULT_TAG_BFPEXP = 1,
+    DEFAULT_TAG_FFT = 2,
 };
 
 typedef enum {
     OUTPUT_MODE_HEX = 0,
     OUTPUT_MODE_RAW = 1,
 } output_mode_t;
+
+typedef enum {
+    TELEMETRY_FORMAT_TEXT = 0,
+    TELEMETRY_FORMAT_JSONL = 1,
+} telemetry_format_t;
 
 typedef struct {
     const char *device;
@@ -44,6 +57,18 @@ typedef struct {
     unsigned int stats_interval_ms;
     int pipe_size_bytes;
     output_mode_t mode;
+    telemetry_format_t telemetry_format;
+    unsigned int realign_initial_word_skip;
+    int realign_swap_channels;
+    int show_tagged_fields;
+    unsigned int packet_index_shift;
+    unsigned int packet_index_bits;
+    unsigned int fft_packet_index_base;
+    unsigned int tag_shift;
+    unsigned int tag_mask;
+    unsigned int tag_idle;
+    unsigned int tag_bfpexp;
+    unsigned int tag_fft;
 } capture_config_t;
 
 typedef struct {
@@ -73,6 +98,12 @@ typedef struct {
 } capture_stats_t;
 
 typedef struct {
+    size_t initial_word_skip_remaining;
+    int have_pending_word;
+    int32_t pending_word;
+} realign_state_t;
+
+typedef struct {
     capture_queue_t *queue;
     volatile sig_atomic_t *stop_flag;
     output_mode_t mode;
@@ -83,6 +114,10 @@ typedef struct {
     int close_file_on_exit;
     int error_code;
     capture_stats_t *stats;
+    const capture_config_t *cfg;
+    realign_state_t realign_state;
+    int32_t *transform_buffer;
+    size_t transform_capacity_words;
 } writer_context_t;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -113,6 +148,16 @@ static uint64_t monotonic_ms(void) {
     return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
+static uint64_t realtime_ns(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
+
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr,
             "Uso:\n"
@@ -128,6 +173,21 @@ static void print_usage(const char *prog) {
             "  -Q, --queue-chunks <N>       chunks no buffer interno (padrao: 32)\n"
             "  -m, --mode <hex|raw>         formato da saida (padrao: hex)\n"
             "  -o, --output <path|- >       arquivo de saida ou stdout (padrao: -)\n"
+            "      --telemetry-format <fmt> stderr em text ou jsonl (padrao: text)\n"
+            "      --realign-tagged         preset observado no Pi: descarta 1 word inicial e troca L/R\n"
+            "      --realign-initial-word-skip <N>\n"
+            "                               descarta N palavras S32 antes de reemparelhar o stream\n"
+            "      --realign-swap-channels  troca left/right apos o reemparelhamento\n"
+            "      --show-tagged-fields     acrescenta kind, packet_index, tag e bin no modo hex\n"
+            "      --packet-index-shift <N> shift do campo packet_index (padrao: 22)\n"
+            "      --packet-index-bits <N>  largura do campo packet_index (padrao: 10)\n"
+            "      --fft-packet-index-base <N>\n"
+            "                               primeiro packet_index usado pelos bins FFT (padrao: 512)\n"
+            "      --tag-shift <N>          shift do campo tag (padrao: 20)\n"
+            "      --tag-mask <N>           mascara do campo tag (padrao: 0x3)\n"
+            "      --tag-idle <N>           valor da tag idle (padrao: 0)\n"
+            "      --tag-bfpexp <N>         valor da tag BFPEXP (padrao: 1)\n"
+            "      --tag-fft <N>            valor da tag FFT (padrao: 2)\n"
             "      --pipe-size-bytes <N>    tamanho pedido para o pipe de stdout\n"
             "      --flush-every-chunks <N> flush do modo hex a cada N chunks\n"
             "      --stats-interval-ms <N>  intervalo dos contadores em stderr (0 desliga)\n"
@@ -135,7 +195,8 @@ static void print_usage(const char *prog) {
             "\n"
             "Modo raw escreve amostras S32_LE stereo diretamente, sem texto.\n"
             "Em modo I2S slave, --rate ajusta a taxa nominal pedida ao ALSA; o clock\n"
-            "fisico continua vindo da FPGA.\n",
+            "fisico continua vindo da FPGA. Com --realign-tagged/--show-tagged-fields,\n"
+            "o modo hex tambem exibe kind, packet_index, tag e bin FFT decodificados.\n",
             prog,
             prog);
 }
@@ -209,6 +270,238 @@ static int parse_output_mode(const char *text, output_mode_t *mode) {
     return -1;
 }
 
+static int parse_telemetry_format(const char *text, telemetry_format_t *format) {
+    if (text == NULL) {
+        return -1;
+    }
+    if (strcmp(text, "text") == 0) {
+        *format = TELEMETRY_FORMAT_TEXT;
+        return 0;
+    }
+    if (strcmp(text, "jsonl") == 0) {
+        *format = TELEMETRY_FORMAT_JSONL;
+        return 0;
+    }
+    return -1;
+}
+
+static size_t tag_mask_bit_width(uint32_t mask) {
+    size_t width = 0;
+
+    while (mask != 0U) {
+        width += 1U;
+        mask >>= 1U;
+    }
+
+    return width;
+}
+
+static int realignment_enabled(const capture_config_t *cfg) {
+    return cfg->realign_initial_word_skip > 0U || cfg->realign_swap_channels;
+}
+
+static const char *output_mode_name(output_mode_t mode) {
+    return mode == OUTPUT_MODE_RAW ? "raw" : "hex";
+}
+
+static void queue_snapshot(capture_queue_t *queue, size_t *used_slots, size_t *high_water_slots, uint64_t *full_waits);
+
+static void json_write_escaped(FILE *stream, const char *text) {
+    const unsigned char *ptr = (const unsigned char *)(text != NULL ? text : "");
+
+    fputc('"', stream);
+    while (*ptr != '\0') {
+        unsigned char ch = *ptr++;
+        switch (ch) {
+            case '\\':
+            case '"':
+                fputc('\\', stream);
+                fputc((int)ch, stream);
+                break;
+            case '\b':
+                fputs("\\b", stream);
+                break;
+            case '\f':
+                fputs("\\f", stream);
+                break;
+            case '\n':
+                fputs("\\n", stream);
+                break;
+            case '\r':
+                fputs("\\r", stream);
+                break;
+            case '\t':
+                fputs("\\t", stream);
+                break;
+            default:
+                if (ch < 0x20U) {
+                    fprintf(stream, "\\u%04X", (unsigned int)ch);
+                } else {
+                    fputc((int)ch, stream);
+                }
+                break;
+        }
+    }
+    fputc('"', stream);
+}
+
+static void telemetry_write_string_field(FILE *stream, const char *key, const char *value) {
+    fprintf(stream, ",\"%s\":", key);
+    json_write_escaped(stream, value);
+}
+
+static void telemetry_write_u64_field(FILE *stream, const char *key, uint64_t value) {
+    fprintf(stream, ",\"%s\":%" PRIu64, key, value);
+}
+
+static void telemetry_write_i64_field(FILE *stream, const char *key, int64_t value) {
+    fprintf(stream, ",\"%s\":%" PRId64, key, value);
+}
+
+static void telemetry_write_bool_field(FILE *stream, const char *key, bool value) {
+    fprintf(stream, ",\"%s\":%s", key, value ? "true" : "false");
+}
+
+static void telemetry_write_queue_fields(FILE *stream, capture_queue_t *queue) {
+    size_t used_slots = 0;
+    size_t high_water_slots = 0;
+    uint64_t full_waits = 0;
+
+    queue_snapshot(queue, &used_slots, &high_water_slots, &full_waits);
+    telemetry_write_u64_field(stream, "queue_used_slots", (uint64_t)used_slots);
+    telemetry_write_u64_field(stream, "queue_high_water_slots", (uint64_t)high_water_slots);
+    telemetry_write_u64_field(stream, "queue_full_waits", full_waits);
+    telemetry_write_u64_field(stream, "queue_slot_count", (uint64_t)queue->slot_count);
+}
+
+static void emit_capture_session_start(
+    const capture_config_t *cfg,
+    capture_queue_t *queue,
+    unsigned int requested_rate_hz
+) {
+    if (cfg->telemetry_format == TELEMETRY_FORMAT_TEXT) {
+        fprintf(stderr,
+                "Captura ALSA iniciada: device=%s requested_rate=%u actual_rate=%u read_frames=%lu period=%lu buffer=%lu queue_chunks=%zu mode=%s realign_word_skip=%u realign_swap=%s tagged_fields=%s\n",
+                cfg->device,
+                requested_rate_hz,
+                cfg->rate_hz,
+                (unsigned long)cfg->read_frames,
+                (unsigned long)cfg->period_frames,
+                (unsigned long)cfg->buffer_frames,
+                cfg->queue_chunks,
+                output_mode_name(cfg->mode),
+                cfg->realign_initial_word_skip,
+                cfg->realign_swap_channels ? "yes" : "no",
+                cfg->show_tagged_fields ? "yes" : "no");
+        return;
+    }
+
+    fprintf(stderr, "{\"type\":\"capture_session_start\"");
+    telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+    telemetry_write_string_field(stderr, "device", cfg->device);
+    telemetry_write_u64_field(stderr, "requested_rate_hz", (uint64_t)requested_rate_hz);
+    telemetry_write_u64_field(stderr, "actual_rate_hz", (uint64_t)cfg->rate_hz);
+    telemetry_write_u64_field(stderr, "read_frames", (uint64_t)cfg->read_frames);
+    telemetry_write_u64_field(stderr, "period_frames", (uint64_t)cfg->period_frames);
+    telemetry_write_u64_field(stderr, "buffer_frames", (uint64_t)cfg->buffer_frames);
+    telemetry_write_u64_field(stderr, "queue_chunks", (uint64_t)cfg->queue_chunks);
+    telemetry_write_u64_field(stderr, "flush_every_chunks", (uint64_t)cfg->flush_every_chunks);
+    telemetry_write_u64_field(stderr, "stats_interval_ms", (uint64_t)cfg->stats_interval_ms);
+    telemetry_write_u64_field(stderr, "pipe_size_bytes", (uint64_t)(cfg->pipe_size_bytes >= 0 ? cfg->pipe_size_bytes : 0));
+    telemetry_write_string_field(stderr, "mode", output_mode_name(cfg->mode));
+    telemetry_write_string_field(stderr, "telemetry_format", "jsonl");
+    telemetry_write_u64_field(stderr, "realign_initial_word_skip", (uint64_t)cfg->realign_initial_word_skip);
+    telemetry_write_bool_field(stderr, "realign_swap_channels", cfg->realign_swap_channels != 0);
+    telemetry_write_bool_field(stderr, "show_tagged_fields", cfg->show_tagged_fields != 0);
+    telemetry_write_u64_field(stderr, "packet_index_shift", (uint64_t)cfg->packet_index_shift);
+    telemetry_write_u64_field(stderr, "packet_index_bits", (uint64_t)cfg->packet_index_bits);
+    telemetry_write_u64_field(stderr, "fft_packet_index_base", (uint64_t)cfg->fft_packet_index_base);
+    telemetry_write_u64_field(stderr, "tag_shift", (uint64_t)cfg->tag_shift);
+    telemetry_write_u64_field(stderr, "tag_mask", (uint64_t)cfg->tag_mask);
+    telemetry_write_u64_field(stderr, "tag_idle", (uint64_t)cfg->tag_idle);
+    telemetry_write_u64_field(stderr, "tag_bfpexp", (uint64_t)cfg->tag_bfpexp);
+    telemetry_write_u64_field(stderr, "tag_fft", (uint64_t)cfg->tag_fft);
+    telemetry_write_queue_fields(stderr, queue);
+    fputs("}\n", stderr);
+    fflush(stderr);
+}
+
+static void emit_capture_warning_rate_adjusted(
+    const capture_config_t *cfg,
+    unsigned int requested_rate_hz
+) {
+    if (cfg->telemetry_format == TELEMETRY_FORMAT_TEXT) {
+        fprintf(stderr,
+                "Aviso: ALSA negociou rate=%u Hz apos pedido de %u Hz\n",
+                cfg->rate_hz,
+                requested_rate_hz);
+        return;
+    }
+
+    fprintf(stderr, "{\"type\":\"capture_warning\"");
+    telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+    telemetry_write_string_field(stderr, "warning", "rate_adjusted");
+    telemetry_write_u64_field(stderr, "requested_rate_hz", (uint64_t)requested_rate_hz);
+    telemetry_write_u64_field(stderr, "actual_rate_hz", (uint64_t)cfg->rate_hz);
+    fputs("}\n", stderr);
+    fflush(stderr);
+}
+
+static void emit_capture_chunk(
+    const capture_config_t *cfg,
+    capture_queue_t *queue,
+    const capture_stats_t *stats,
+    snd_pcm_sframes_t frames,
+    bool partial_read
+) {
+    if (cfg->telemetry_format != TELEMETRY_FORMAT_JSONL) {
+        return;
+    }
+
+    fprintf(stderr, "{\"type\":\"capture_chunk\"");
+    telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+    telemetry_write_u64_field(stderr, "chunk_index", stats->captured_chunks > 0 ? stats->captured_chunks - 1ULL : 0ULL);
+    telemetry_write_u64_field(stderr, "frames", (uint64_t)frames);
+    telemetry_write_bool_field(stderr, "partial_read", partial_read);
+    telemetry_write_u64_field(stderr, "captured_chunks", stats->captured_chunks);
+    telemetry_write_u64_field(stderr, "captured_frames", stats->captured_frames);
+    telemetry_write_u64_field(stderr, "written_chunks", stats->written_chunks);
+    telemetry_write_u64_field(stderr, "written_frames", stats->written_frames);
+    telemetry_write_u64_field(stderr, "xruns", stats->xruns);
+    telemetry_write_u64_field(stderr, "recoveries", stats->recoveries);
+    telemetry_write_u64_field(stderr, "partial_reads", stats->partial_reads);
+    telemetry_write_queue_fields(stderr, queue);
+    fputs("}\n", stderr);
+    fflush(stderr);
+}
+
+static void emit_capture_recovery(
+    const capture_config_t *cfg,
+    capture_queue_t *queue,
+    const capture_stats_t *stats,
+    const char *context,
+    int err,
+    int recovered
+) {
+    if (cfg->telemetry_format != TELEMETRY_FORMAT_JSONL) {
+        return;
+    }
+
+    fprintf(stderr, "{\"type\":\"capture_recovery\"");
+    telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+    telemetry_write_string_field(stderr, "context", context);
+    telemetry_write_i64_field(stderr, "error_code", (int64_t)err);
+    telemetry_write_string_field(stderr, "error_name", snd_strerror(err));
+    telemetry_write_i64_field(stderr, "recover_result", (int64_t)recovered);
+    telemetry_write_bool_field(stderr, "xrun", err == -EPIPE);
+    telemetry_write_u64_field(stderr, "xruns", stats->xruns);
+    telemetry_write_u64_field(stderr, "recoveries", stats->recoveries);
+    telemetry_write_u64_field(stderr, "partial_reads", stats->partial_reads);
+    telemetry_write_queue_fields(stderr, queue);
+    fputs("}\n", stderr);
+    fflush(stderr);
+}
+
 static int parse_args(int argc, char **argv, capture_config_t *cfg) {
     static const struct option long_opts[] = {
         {"device", required_argument, NULL, 'D'},
@@ -219,9 +512,22 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
         {"queue-chunks", required_argument, NULL, 'Q'},
         {"mode", required_argument, NULL, 'm'},
         {"output", required_argument, NULL, 'o'},
+        {"telemetry-format", required_argument, NULL, 999},
         {"pipe-size-bytes", required_argument, NULL, 1000},
         {"flush-every-chunks", required_argument, NULL, 1001},
         {"stats-interval-ms", required_argument, NULL, 1002},
+        {"realign-tagged", no_argument, NULL, 1003},
+        {"realign-initial-word-skip", required_argument, NULL, 1004},
+        {"realign-swap-channels", no_argument, NULL, 1005},
+        {"show-tagged-fields", no_argument, NULL, 1006},
+        {"packet-index-shift", required_argument, NULL, 1007},
+        {"packet-index-bits", required_argument, NULL, 1008},
+        {"fft-packet-index-base", required_argument, NULL, 1009},
+        {"tag-shift", required_argument, NULL, 1010},
+        {"tag-mask", required_argument, NULL, 1011},
+        {"tag-idle", required_argument, NULL, 1012},
+        {"tag-bfpexp", required_argument, NULL, 1013},
+        {"tag-fft", required_argument, NULL, 1014},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -232,6 +538,7 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
     int opt_index = 0;
     int period_explicit = 0;
     int buffer_explicit = 0;
+    size_t tag_width = 0;
 
     while ((opt = getopt_long(argc, argv, "D:r:n:F:B:Q:m:o:h", long_opts, &opt_index)) != -1) {
         switch (opt) {
@@ -283,6 +590,12 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
             case 'o':
                 cfg->output_path = optarg;
                 break;
+            case 999:
+                if (parse_telemetry_format(optarg, &cfg->telemetry_format) != 0) {
+                    fprintf(stderr, "telemetry-format invalido: %s (use text ou jsonl)\n", optarg);
+                    return -1;
+                }
+                break;
             case 1000:
                 if (parse_nonneg_u32_arg(optarg, &u32_value) != 0) {
                     fprintf(stderr, "pipe-size-bytes invalido: %s\n", optarg);
@@ -299,6 +612,71 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
             case 1002:
                 if (parse_nonneg_u32_arg(optarg, &cfg->stats_interval_ms) != 0) {
                     fprintf(stderr, "stats-interval-ms invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1003:
+                cfg->realign_initial_word_skip = 1U;
+                cfg->realign_swap_channels = 1;
+                cfg->show_tagged_fields = 1;
+                break;
+            case 1004:
+                if (parse_nonneg_u32_arg(optarg, &cfg->realign_initial_word_skip) != 0) {
+                    fprintf(stderr, "realign-initial-word-skip invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1005:
+                cfg->realign_swap_channels = 1;
+                break;
+            case 1006:
+                cfg->show_tagged_fields = 1;
+                break;
+            case 1007:
+                if (parse_nonneg_u32_arg(optarg, &cfg->packet_index_shift) != 0) {
+                    fprintf(stderr, "packet-index-shift invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1008:
+                if (parse_u32_arg(optarg, &cfg->packet_index_bits) != 0) {
+                    fprintf(stderr, "packet-index-bits invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1009:
+                if (parse_u32_arg(optarg, &cfg->fft_packet_index_base) != 0) {
+                    fprintf(stderr, "fft-packet-index-base invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1010:
+                if (parse_nonneg_u32_arg(optarg, &cfg->tag_shift) != 0) {
+                    fprintf(stderr, "tag-shift invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1011:
+                if (parse_u32_arg(optarg, &cfg->tag_mask) != 0) {
+                    fprintf(stderr, "tag-mask invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1012:
+                if (parse_nonneg_u32_arg(optarg, &cfg->tag_idle) != 0) {
+                    fprintf(stderr, "tag-idle invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1013:
+                if (parse_nonneg_u32_arg(optarg, &cfg->tag_bfpexp) != 0) {
+                    fprintf(stderr, "tag-bfpexp invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1014:
+                if (parse_nonneg_u32_arg(optarg, &cfg->tag_fft) != 0) {
+                    fprintf(stderr, "tag-fft invalido: %s\n", optarg);
                     return -1;
                 }
                 break;
@@ -340,6 +718,34 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
 
     if (cfg->buffer_frames < (cfg->period_frames * 2)) {
         cfg->buffer_frames = cfg->period_frames * 2;
+    }
+    if (cfg->packet_index_bits == 0U || cfg->packet_index_bits > 31U) {
+        fprintf(stderr, "packet-index-bits deve ficar entre 1 e 31\n");
+        return -1;
+    }
+    if (cfg->tag_mask == 0U) {
+        fprintf(stderr, "tag-mask deve ser maior que zero\n");
+        return -1;
+    }
+    if (cfg->packet_index_shift > 31U || cfg->tag_shift > 31U) {
+        fprintf(stderr, "packet-index-shift/tag-shift devem ficar entre 0 e 31\n");
+        return -1;
+    }
+    tag_width = tag_mask_bit_width(cfg->tag_mask);
+    if ((cfg->packet_index_shift + cfg->packet_index_bits) > 32U) {
+        fprintf(stderr, "campo packet_index excede 32 bits\n");
+        return -1;
+    }
+    if ((cfg->tag_shift + tag_width) > 32U) {
+        fprintf(stderr, "campo tag excede 32 bits\n");
+        return -1;
+    }
+    if (cfg->packet_index_shift < (cfg->tag_shift + tag_width)) {
+        fprintf(stderr, "campo packet_index nao pode sobrepor o campo tag\n");
+        return -1;
+    }
+    if (realignment_enabled(cfg) && cfg->mode == OUTPUT_MODE_HEX) {
+        cfg->show_tagged_fields = 1;
     }
 
     return 0;
@@ -487,25 +893,278 @@ static ssize_t write_all(int fd, const void *buffer, size_t bytes) {
     return (ssize_t)offset;
 }
 
-static int write_hex_chunk(FILE *output, const int32_t *samples, snd_pcm_sframes_t frames) {
+static uint32_t tagged_packet_index_mask(const capture_config_t *cfg) {
+    return (uint32_t)((1ULL << cfg->packet_index_bits) - 1ULL);
+}
+
+static unsigned int decode_packet_index(const capture_config_t *cfg, uint32_t word) {
+    return (unsigned int)((word >> cfg->packet_index_shift) & tagged_packet_index_mask(cfg));
+}
+
+static unsigned int decode_tag_value(const capture_config_t *cfg, uint32_t word) {
+    return (unsigned int)((word >> cfg->tag_shift) & cfg->tag_mask);
+}
+
+static const char *decode_tag_name(const capture_config_t *cfg, unsigned int tag_value) {
+    if (tag_value == cfg->tag_idle) {
+        return "idle";
+    }
+    if (tag_value == cfg->tag_bfpexp) {
+        return "bfpexp";
+    }
+    if (tag_value == cfg->tag_fft) {
+        return "fft";
+    }
+    return "unknown";
+}
+
+static const char *classify_pair_kind(
+    const capture_config_t *cfg,
+    unsigned int left_tag,
+    unsigned int right_tag,
+    unsigned int left_packet_index,
+    unsigned int right_packet_index
+) {
+    if (left_tag != right_tag) {
+        return "tag_mismatch";
+    }
+    if (left_packet_index != right_packet_index) {
+        return "packet_index_mismatch";
+    }
+    if (left_tag == cfg->tag_idle) {
+        return left_packet_index == 0U ? "idle" : "packet_index_mismatch";
+    }
+    if (left_tag == cfg->tag_bfpexp) {
+        return left_packet_index < cfg->fft_packet_index_base ? "bfpexp" : "packet_index_mismatch";
+    }
+    if (left_tag == cfg->tag_fft) {
+        return left_packet_index >= cfg->fft_packet_index_base ? "fft" : "packet_index_mismatch";
+    }
+    return "unknown_tag";
+}
+
+static void format_bin_field(
+    const capture_config_t *cfg,
+    unsigned int tag_value,
+    unsigned int packet_index,
+    char *buffer,
+    size_t buffer_size
+) {
+    if (tag_value == cfg->tag_fft && packet_index >= cfg->fft_packet_index_base) {
+        (void)snprintf(buffer, buffer_size, "%u", packet_index - cfg->fft_packet_index_base);
+        return;
+    }
+    (void)snprintf(buffer, buffer_size, "-");
+}
+
+static int ensure_transform_capacity(writer_context_t *writer, size_t required_words) {
+    int32_t *new_buffer = NULL;
+    size_t new_capacity = 0;
+
+    if (required_words <= writer->transform_capacity_words) {
+        return 0;
+    }
+
+    new_capacity = required_words;
+    new_buffer = realloc(writer->transform_buffer, new_capacity * sizeof(int32_t));
+    if (new_buffer == NULL) {
+        return -1;
+    }
+
+    writer->transform_buffer = new_buffer;
+    writer->transform_capacity_words = new_capacity;
+    return 0;
+}
+
+static int realign_chunk(
+    writer_context_t *writer,
+    const int32_t *samples,
+    snd_pcm_sframes_t frames,
+    const int32_t **out_samples,
+    snd_pcm_sframes_t *out_frames
+) {
+    const capture_config_t *cfg = writer->cfg;
+    size_t input_words = (size_t)frames * CHANNEL_COUNT;
+    size_t output_words = 0;
+    size_t idx = 0;
+
+    if (!realignment_enabled(cfg)) {
+        *out_samples = samples;
+        *out_frames = frames;
+        return 0;
+    }
+
+    if (ensure_transform_capacity(writer, input_words + 1U) != 0) {
+        return -1;
+    }
+
+    if (writer->realign_state.have_pending_word) {
+        writer->transform_buffer[output_words++] = writer->realign_state.pending_word;
+        writer->realign_state.have_pending_word = 0;
+    }
+
+    for (idx = 0; idx < input_words; ++idx) {
+        if (writer->realign_state.initial_word_skip_remaining > 0U) {
+            writer->realign_state.initial_word_skip_remaining -= 1U;
+            continue;
+        }
+        writer->transform_buffer[output_words++] = samples[idx];
+    }
+
+    if ((output_words % CHANNEL_COUNT) != 0U) {
+        writer->realign_state.pending_word = writer->transform_buffer[output_words - 1U];
+        writer->realign_state.have_pending_word = 1;
+        output_words -= 1U;
+    }
+
+    if (cfg->realign_swap_channels) {
+        for (idx = 0; idx < output_words; idx += CHANNEL_COUNT) {
+            int32_t tmp = writer->transform_buffer[idx];
+            writer->transform_buffer[idx] = writer->transform_buffer[idx + 1U];
+            writer->transform_buffer[idx + 1U] = tmp;
+        }
+    }
+
+    *out_samples = writer->transform_buffer;
+    *out_frames = (snd_pcm_sframes_t)(output_words / CHANNEL_COUNT);
+    return 0;
+}
+
+static int write_hex_chunk(writer_context_t *writer, const int32_t *samples, snd_pcm_sframes_t frames) {
+    FILE *output = writer->hex_output;
+    const capture_config_t *cfg = writer->cfg;
     snd_pcm_sframes_t idx;
 
     for (idx = 0; idx < frames; ++idx) {
         uint32_t left = (uint32_t)samples[(size_t)idx * CHANNEL_COUNT];
         uint32_t right = (uint32_t)samples[(size_t)idx * CHANNEL_COUNT + 1U];
-        if (fprintf(output, "0x%08" PRIX32 " 0x%08" PRIX32 "\n", left, right) < 0) {
-            return -1;
+        if (!cfg->show_tagged_fields) {
+            if (fprintf(output, "0x%08" PRIX32 " 0x%08" PRIX32 "\n", left, right) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        {
+            unsigned int left_packet_index = decode_packet_index(cfg, left);
+            unsigned int right_packet_index = decode_packet_index(cfg, right);
+            unsigned int left_tag = decode_tag_value(cfg, left);
+            unsigned int right_tag = decode_tag_value(cfg, right);
+            char left_bin[32];
+            char right_bin[32];
+            const char *kind = classify_pair_kind(cfg, left_tag, right_tag, left_packet_index, right_packet_index);
+
+            format_bin_field(cfg, left_tag, left_packet_index, left_bin, sizeof(left_bin));
+            format_bin_field(cfg, right_tag, right_packet_index, right_bin, sizeof(right_bin));
+            if (fprintf(output,
+                        "0x%08" PRIX32 " 0x%08" PRIX32
+                        " kind=%s pkt=%u/%u tag=%s/%s bin=%s/%s\n",
+                        left,
+                        right,
+                        kind,
+                        left_packet_index,
+                        right_packet_index,
+                        decode_tag_name(cfg, left_tag),
+                        decode_tag_name(cfg, right_tag),
+                        left_bin,
+                        right_bin) < 0) {
+                return -1;
+            }
         }
     }
 
     return 0;
 }
 
+static void free_writer_buffers(writer_context_t *writer) {
+    free(writer->transform_buffer);
+    writer->transform_buffer = NULL;
+    writer->transform_capacity_words = 0;
+}
+
+static void writer_emit_realign_summary(writer_context_t *writer) {
+    if (!realignment_enabled(writer->cfg) || !writer->realign_state.have_pending_word) {
+        return;
+    }
+
+    if (writer->cfg->telemetry_format == TELEMETRY_FORMAT_JSONL) {
+        fprintf(stderr, "{\"type\":\"capture_warning\"");
+        telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+        telemetry_write_string_field(stderr, "warning", "realign_trailing_word_dropped");
+        telemetry_write_i64_field(stderr, "word_hex", (int64_t)((uint32_t)writer->realign_state.pending_word));
+        fputs("}\n", stderr);
+        fflush(stderr);
+        return;
+    }
+
+    fprintf(stderr,
+            "Aviso: realinhamento descartou a ultima palavra solta 0x%08" PRIX32 "\n",
+            (uint32_t)writer->realign_state.pending_word);
+}
+
+static void *writer_main(void *opaque) {
+    writer_context_t *writer = (writer_context_t *)opaque;
+
+    while (1) {
+        size_t slot_index = 0;
+        snd_pcm_sframes_t frames = 0;
+        snd_pcm_sframes_t output_frames = 0;
+        int32_t *samples = NULL;
+        const int32_t *output_samples = NULL;
+
+        if (queue_acquire_read_slot(writer->queue, &slot_index, &frames) != 0) {
+            break;
+        }
+
+        samples = queue_slot_ptr(writer->queue, slot_index);
+        if (realign_chunk(writer, samples, frames, &output_samples, &output_frames) != 0) {
+            writer->error_code = ENOMEM;
+            *writer->stop_flag = 1;
+            queue_close(writer->queue);
+            break;
+        }
+
+        if (output_frames > 0) {
+            if (writer->mode == OUTPUT_MODE_RAW) {
+                size_t chunk_bytes = (size_t)output_frames * CHANNEL_COUNT * sizeof(int32_t);
+                if (write_all(writer->out_fd, output_samples, chunk_bytes) < 0) {
+                    writer->error_code = errno != 0 ? errno : EIO;
+                    *writer->stop_flag = 1;
+                    queue_close(writer->queue);
+                    break;
+                }
+            } else {
+                if (write_hex_chunk(writer, output_samples, output_frames) != 0) {
+                    writer->error_code = errno != 0 ? errno : EIO;
+                    *writer->stop_flag = 1;
+                    queue_close(writer->queue);
+                    break;
+                }
+                if (writer->flush_every_chunks > 0 &&
+                    (((writer->stats->written_chunks + 1ULL) % writer->flush_every_chunks) == 0ULL)) {
+                    fflush(writer->hex_output);
+                }
+            }
+
+            writer->stats->written_chunks += 1;
+            writer->stats->written_frames += (uint64_t)output_frames;
+        }
+
+        queue_release_read_slot(writer->queue);
+    }
+
+    writer_emit_realign_summary(writer);
+    if (writer->mode == OUTPUT_MODE_HEX && writer->hex_output != NULL) {
+        fflush(writer->hex_output);
+    }
+    return NULL;
+}
+
 static int set_pipe_size_if_possible(int fd, int bytes) {
 #ifdef F_SETPIPE_SZ
     if (bytes > 0 && fcntl(fd, F_SETPIPE_SZ, bytes) < 0) {
-        return -1;
-    }
+            return -1;
+        }
 #else
     (void)fd;
     (void)bytes;
@@ -568,51 +1227,7 @@ static void close_output_sink(writer_context_t *writer) {
     writer->out_fd = -1;
     writer->close_file_on_exit = 0;
     writer->close_fd_on_exit = 0;
-}
-
-static void *writer_main(void *opaque) {
-    writer_context_t *writer = (writer_context_t *)opaque;
-
-    while (1) {
-        size_t slot_index = 0;
-        snd_pcm_sframes_t frames = 0;
-        int32_t *samples = NULL;
-
-        if (queue_acquire_read_slot(writer->queue, &slot_index, &frames) != 0) {
-            break;
-        }
-
-        samples = queue_slot_ptr(writer->queue, slot_index);
-        if (writer->mode == OUTPUT_MODE_RAW) {
-            size_t chunk_bytes = (size_t)frames * CHANNEL_COUNT * sizeof(int32_t);
-            if (write_all(writer->out_fd, samples, chunk_bytes) < 0) {
-                writer->error_code = errno != 0 ? errno : EIO;
-                *writer->stop_flag = 1;
-                queue_close(writer->queue);
-                break;
-            }
-        } else {
-            if (write_hex_chunk(writer->hex_output, samples, frames) != 0) {
-                writer->error_code = errno != 0 ? errno : EIO;
-                *writer->stop_flag = 1;
-                queue_close(writer->queue);
-                break;
-            }
-            if (writer->flush_every_chunks > 0 &&
-                (((writer->stats->written_chunks + 1ULL) % writer->flush_every_chunks) == 0ULL)) {
-                fflush(writer->hex_output);
-            }
-        }
-
-        writer->stats->written_chunks += 1;
-        writer->stats->written_frames += (uint64_t)frames;
-        queue_release_read_slot(writer->queue);
-    }
-
-    if (writer->mode == OUTPUT_MODE_HEX && writer->hex_output != NULL) {
-        fflush(writer->hex_output);
-    }
-    return NULL;
+    free_writer_buffers(writer);
 }
 
 static int set_hw_params(
@@ -695,7 +1310,14 @@ static int set_sw_params(snd_pcm_t *pcm, snd_pcm_uframes_t avail_min, snd_pcm_uf
     return 0;
 }
 
-static int recover_capture_error(snd_pcm_t *pcm, int err, capture_stats_t *stats, const char *context) {
+static int recover_capture_error(
+    snd_pcm_t *pcm,
+    int err,
+    const capture_config_t *cfg,
+    capture_queue_t *queue,
+    capture_stats_t *stats,
+    const char *context
+) {
     int recovered;
 
     if (err == -EPIPE) {
@@ -704,11 +1326,13 @@ static int recover_capture_error(snd_pcm_t *pcm, int err, capture_stats_t *stats
 
     recovered = snd_pcm_recover(pcm, err, 1);
     if (recovered < 0) {
+        emit_capture_recovery(cfg, queue, stats, context, err, recovered);
         fprintf(stderr, "%s: %s\n", context, snd_strerror(recovered));
         return recovered;
     }
 
     stats->recoveries += 1;
+    emit_capture_recovery(cfg, queue, stats, context, err, recovered);
     return 0;
 }
 
@@ -725,13 +1349,34 @@ static void print_stats(
 
     queue_snapshot(queue, &used_slots, &high_water_slots, &full_waits);
 
+    if (cfg->telemetry_format == TELEMETRY_FORMAT_JSONL) {
+        fprintf(stderr, "{\"type\":\"%s\"", final_report ? "capture_final" : "capture_stats");
+        telemetry_write_u64_field(stderr, "timestamp_ns", realtime_ns());
+        telemetry_write_string_field(stderr, "mode", output_mode_name(cfg->mode));
+        telemetry_write_u64_field(stderr, "rate_hz", (uint64_t)cfg->rate_hz);
+        telemetry_write_u64_field(stderr, "captured_chunks", stats->captured_chunks);
+        telemetry_write_u64_field(stderr, "captured_frames", stats->captured_frames);
+        telemetry_write_u64_field(stderr, "written_chunks", stats->written_chunks);
+        telemetry_write_u64_field(stderr, "written_frames", stats->written_frames);
+        telemetry_write_u64_field(stderr, "xruns", stats->xruns);
+        telemetry_write_u64_field(stderr, "recoveries", stats->recoveries);
+        telemetry_write_u64_field(stderr, "partial_reads", stats->partial_reads);
+        telemetry_write_u64_field(stderr, "queue_used_slots", (uint64_t)used_slots);
+        telemetry_write_u64_field(stderr, "queue_slot_count", (uint64_t)queue->slot_count);
+        telemetry_write_u64_field(stderr, "queue_high_water_slots", (uint64_t)high_water_slots);
+        telemetry_write_u64_field(stderr, "queue_full_waits", full_waits);
+        fputs("}\n", stderr);
+        fflush(stderr);
+        return;
+    }
+
     fprintf(stderr,
             "[%s] mode=%s rate=%u captured_chunks=%" PRIu64 " captured_frames=%" PRIu64
             " written_chunks=%" PRIu64 " written_frames=%" PRIu64
             " xruns=%" PRIu64 " recoveries=%" PRIu64 " partial_reads=%" PRIu64
             " queue=%zu/%zu queue_high=%zu full_waits=%" PRIu64 "\n",
             label,
-            cfg->mode == OUTPUT_MODE_RAW ? "raw" : "hex",
+            output_mode_name(cfg->mode),
             cfg->rate_hz,
             stats->captured_chunks,
             stats->captured_frames,
@@ -759,6 +1404,18 @@ int main(int argc, char **argv) {
         .stats_interval_ms = DEFAULT_STATS_INTERVAL_MS,
         .pipe_size_bytes = DEFAULT_PIPE_SIZE_BYTES,
         .mode = OUTPUT_MODE_HEX,
+        .telemetry_format = TELEMETRY_FORMAT_TEXT,
+        .realign_initial_word_skip = 0U,
+        .realign_swap_channels = 0,
+        .show_tagged_fields = 0,
+        .packet_index_shift = DEFAULT_PACKET_INDEX_SHIFT,
+        .packet_index_bits = DEFAULT_PACKET_INDEX_BITS,
+        .fft_packet_index_base = DEFAULT_FFT_PACKET_INDEX_BASE,
+        .tag_shift = DEFAULT_TAG_SHIFT,
+        .tag_mask = DEFAULT_TAG_MASK,
+        .tag_idle = DEFAULT_TAG_IDLE,
+        .tag_bfpexp = DEFAULT_TAG_BFPEXP,
+        .tag_fft = DEFAULT_TAG_FFT,
     };
     capture_queue_t queue;
     capture_stats_t stats;
@@ -795,6 +1452,8 @@ int main(int argc, char **argv) {
     writer.mode = cfg.mode;
     writer.flush_every_chunks = cfg.flush_every_chunks;
     writer.stats = &stats;
+    writer.cfg = &cfg;
+    writer.realign_state.initial_word_skip_remaining = cfg.realign_initial_word_skip;
 
     if (open_output_sink(&cfg, &writer) != 0) {
         queue_destroy(&queue);
@@ -819,10 +1478,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (cfg.rate_hz != requested_rate_hz) {
-        fprintf(stderr,
-                "Aviso: ALSA negociou rate=%u Hz apos pedido de %u Hz\n",
-                cfg.rate_hz,
-                requested_rate_hz);
+        emit_capture_warning_rate_adjusted(&cfg, requested_rate_hz);
     }
     if ((err = set_sw_params(pcm, cfg.period_frames, cfg.buffer_frames)) < 0) {
         goto cleanup;
@@ -832,16 +1488,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    fprintf(stderr,
-            "Captura ALSA iniciada: device=%s requested_rate=%u actual_rate=%u read_frames=%lu period=%lu buffer=%lu queue_chunks=%zu mode=%s\n",
-            cfg.device,
-            requested_rate_hz,
-            cfg.rate_hz,
-            (unsigned long)cfg.read_frames,
-            (unsigned long)cfg.period_frames,
-            (unsigned long)cfg.buffer_frames,
-            cfg.queue_chunks,
-            cfg.mode == OUTPUT_MODE_RAW ? "raw" : "hex");
+    emit_capture_session_start(&cfg, &queue, requested_rate_hz);
 
     last_stats_ms = monotonic_ms();
 
@@ -858,7 +1505,7 @@ int main(int argc, char **argv) {
         slot = queue_slot_ptr(&queue, slot_index);
         got = snd_pcm_readi(pcm, slot, cfg.read_frames);
         if (got < 0) {
-            if (recover_capture_error(pcm, (int)got, &stats, "snd_pcm_readi") < 0) {
+            if (recover_capture_error(pcm, (int)got, &cfg, &queue, &stats, "snd_pcm_readi") < 0) {
                 goto cleanup;
             }
             continue;
@@ -873,6 +1520,7 @@ int main(int argc, char **argv) {
         queue_commit_write_slot(&queue, slot_index, got);
         stats.captured_chunks += 1;
         stats.captured_frames += (uint64_t)got;
+        emit_capture_chunk(&cfg, &queue, &stats, got, (snd_pcm_uframes_t)got < cfg.read_frames);
         if (cfg.stats_interval_ms > 0 && (monotonic_ms() - last_stats_ms) >= cfg.stats_interval_ms) {
             print_stats(&cfg, &queue, &stats, false);
             last_stats_ms = monotonic_ms();

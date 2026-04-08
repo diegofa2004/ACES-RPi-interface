@@ -1,9 +1,10 @@
+import json
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Optional, Union
 
 import numpy as np
 
@@ -94,6 +95,65 @@ DEFAULT_PAYLOAD_BITS = _DEFAULT_PAYLOAD_BITS
 DEFAULT_TAG_IDLE = _DEFAULT_TAG_IDLE
 DEFAULT_TAG_BFPEXP = _DEFAULT_TAG_BFPEXP
 DEFAULT_TAG_FFT = _DEFAULT_TAG_FFT
+DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP = 1
+DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS = True
+
+
+def parse_capture_telemetry_line(line: Union[bytes, str]) -> Optional[dict[str, object]]:
+    if isinstance(line, bytes):
+        text = line.decode("utf-8", errors="replace").strip()
+    else:
+        text = str(line).strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {
+            "type": "capture_stderr_text",
+            "message": text,
+        }
+
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "type": "capture_stderr_text",
+        "message": text,
+    }
+
+
+def resolve_helper_tagged_realign_options(
+    *,
+    use_preset: bool = False,
+    initial_word_skip: Optional[int] = None,
+    swap_channels: Optional[bool] = None,
+) -> tuple[int, bool]:
+    resolved_initial_word_skip = DEFAULT_HELPER_TAGGED_REALIGN_INITIAL_WORD_SKIP if use_preset else 0
+    resolved_swap_channels = DEFAULT_HELPER_TAGGED_REALIGN_SWAP_CHANNELS if use_preset else False
+
+    if initial_word_skip is not None:
+        resolved_initial_word_skip = int(initial_word_skip)
+    if swap_channels is not None:
+        resolved_swap_channels = bool(swap_channels)
+
+    return resolved_initial_word_skip, resolved_swap_channels
+
+
+def helper_tagged_realign_enabled(initial_word_skip: int, swap_channels: bool) -> bool:
+    return int(initial_word_skip) > 0 or bool(swap_channels)
+
+
+def fft_bin_index_from_packet_index(
+    packet_index: int,
+    *,
+    tag: Optional[int] = None,
+    tag_fft: int = _DEFAULT_TAG_FFT,
+    fft_packet_index_base: int = _DEFAULT_FFT_PACKET_INDEX_BASE,
+) -> int:
+    if tag is not None and int(tag) != int(tag_fft):
+        return -1
+    return int(packet_index) - int(fft_packet_index_base)
 
 
 @dataclass(frozen=True)
@@ -812,10 +872,22 @@ def resolve_capture_command(
     *,
     backend: Optional[str] = None,
     capture_binary: Optional[str] = None,
+    capture_telemetry: bool = False,
+    capture_realign_initial_word_skip: int = 0,
+    capture_realign_swap_channels: bool = False,
 ) -> tuple[str, list[str]]:
     normalized_backend = _normalize_capture_backend_name(backend)
+    helper_realign_requested = helper_tagged_realign_enabled(
+        capture_realign_initial_word_skip,
+        capture_realign_swap_channels,
+    )
 
     if normalized_backend == CAPTURE_BACKEND_ARECORD:
+        if helper_realign_requested:
+            raise RuntimeError(
+                "Tagged-word helper realignment requires the native alsa_logger backend. "
+                "Use --capture-backend alsa-c and make sure rpi3b_i2s_fft/alsa_logger is built."
+            )
         return CAPTURE_BACKEND_ARECORD, build_arecord_cmd(device, rate)
 
     binary_path = capture_binary or find_native_capture_binary()
@@ -825,15 +897,46 @@ def resolve_capture_command(
                 "Native C capture backend requested but no compiled helper was found. "
                 "Build rpi3b_i2s_fft/alsa_logger first or use --capture-backend arecord."
             )
-        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(binary_path, device, rate)
+        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(
+            binary_path,
+            device,
+            rate,
+            capture_telemetry=capture_telemetry,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
+        )
 
     if binary_path:
-        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(binary_path, device, rate)
+        return CAPTURE_BACKEND_NATIVE, build_native_capture_cmd(
+            binary_path,
+            device,
+            rate,
+            capture_telemetry=capture_telemetry,
+            capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+            capture_realign_swap_channels=capture_realign_swap_channels,
+        )
+
+    if helper_realign_requested:
+        raise RuntimeError(
+            "Tagged-word helper realignment was requested, but no compiled alsa_logger helper was found. "
+            "Build rpi3b_i2s_fft/alsa_logger or explicitly disable helper realignment."
+        )
 
     return CAPTURE_BACKEND_ARECORD, build_arecord_cmd(device, rate)
 
 
-def build_native_capture_cmd(binary_path: str, device: str, rate: int) -> list[str]:
+def build_native_capture_cmd(
+    binary_path: str,
+    device: str,
+    rate: int,
+    *,
+    capture_telemetry: bool = False,
+    capture_realign_initial_word_skip: int = 0,
+    capture_realign_swap_channels: bool = False,
+) -> list[str]:
+    if capture_realign_initial_word_skip < 0:
+        raise ValueError("capture_realign_initial_word_skip must be non-negative")
+
     cmd = [
         binary_path,
         "--device",
@@ -853,6 +956,12 @@ def build_native_capture_cmd(binary_path: str, device: str, rate: int) -> list[s
         "--stats-interval-ms",
         str(DEFAULT_NATIVE_CAPTURE_STATS_INTERVAL_MS),
     ]
+    if capture_telemetry:
+        cmd.extend(["--telemetry-format", "jsonl"])
+    if capture_realign_initial_word_skip > 0:
+        cmd.extend(["--realign-initial-word-skip", str(capture_realign_initial_word_skip)])
+    if capture_realign_swap_channels:
+        cmd.append("--realign-swap-channels")
     if DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES > 0:
         cmd.extend(["--pipe-size-bytes", str(DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES)])
     return cmd
@@ -864,12 +973,18 @@ def build_capture_cmd(
     *,
     backend: Optional[str] = None,
     capture_binary: Optional[str] = None,
+    capture_telemetry: bool = False,
+    capture_realign_initial_word_skip: int = 0,
+    capture_realign_swap_channels: bool = False,
 ) -> list[str]:
     _resolved_backend, cmd = resolve_capture_command(
         device,
         rate,
         backend=backend,
         capture_binary=capture_binary,
+        capture_telemetry=capture_telemetry,
+        capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+        capture_realign_swap_channels=capture_realign_swap_channels,
     )
     return cmd
 
@@ -905,16 +1020,23 @@ def start_capture_process(
     *,
     backend: Optional[str] = None,
     capture_binary: Optional[str] = None,
+    capture_telemetry: bool = False,
+    capture_realign_initial_word_skip: int = 0,
+    capture_realign_swap_channels: bool = False,
+    capture_stderr: bool = False,
 ) -> subprocess.Popen:
     resolved_backend, cmd = resolve_capture_command(
         device,
         rate,
         backend=backend,
         capture_binary=capture_binary,
+        capture_telemetry=capture_telemetry,
+        capture_realign_initial_word_skip=capture_realign_initial_word_skip,
+        capture_realign_swap_channels=capture_realign_swap_channels,
     )
     popen_kwargs = {
         "stdout": subprocess.PIPE,
-        "stderr": None,
+        "stderr": subprocess.PIPE if capture_stderr else None,
         "bufsize": 0,
     }
     try:
