@@ -875,6 +875,8 @@ def resolve_capture_command(
     capture_telemetry: bool = False,
     capture_realign_initial_word_skip: int = 0,
     capture_realign_swap_channels: bool = False,
+    capture_mode: str = "raw",
+    capture_extra_args: Optional[list[str]] = None,
 ) -> tuple[str, list[str]]:
     normalized_backend = _normalize_capture_backend_name(backend)
     helper_realign_requested = helper_tagged_realign_enabled(
@@ -883,6 +885,10 @@ def resolve_capture_command(
     )
 
     if normalized_backend == CAPTURE_BACKEND_ARECORD:
+        if capture_mode != "raw":
+            raise RuntimeError(
+                f"Capture mode {capture_mode!r} requires the native alsa_logger backend."
+            )
         if helper_realign_requested:
             raise RuntimeError(
                 "Tagged-word helper realignment requires the native alsa_logger backend. "
@@ -904,6 +910,8 @@ def resolve_capture_command(
             capture_telemetry=capture_telemetry,
             capture_realign_initial_word_skip=capture_realign_initial_word_skip,
             capture_realign_swap_channels=capture_realign_swap_channels,
+            mode=capture_mode,
+            extra_args=capture_extra_args,
         )
 
     if binary_path:
@@ -914,6 +922,8 @@ def resolve_capture_command(
             capture_telemetry=capture_telemetry,
             capture_realign_initial_word_skip=capture_realign_initial_word_skip,
             capture_realign_swap_channels=capture_realign_swap_channels,
+            mode=capture_mode,
+            extra_args=capture_extra_args,
         )
 
     if helper_realign_requested:
@@ -933,6 +943,8 @@ def build_native_capture_cmd(
     capture_telemetry: bool = False,
     capture_realign_initial_word_skip: int = 0,
     capture_realign_swap_channels: bool = False,
+    mode: str = "raw",
+    extra_args: Optional[list[str]] = None,
 ) -> list[str]:
     if capture_realign_initial_word_skip < 0:
         raise ValueError("capture_realign_initial_word_skip must be non-negative")
@@ -944,7 +956,7 @@ def build_native_capture_cmd(
         "--rate",
         str(rate),
         "--mode",
-        "raw",
+        mode,
         "--read-frames",
         str(DEFAULT_NATIVE_CAPTURE_READ_FRAMES),
         "--period-frames",
@@ -964,6 +976,8 @@ def build_native_capture_cmd(
         cmd.append("--realign-swap-channels")
     if DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES > 0:
         cmd.extend(["--pipe-size-bytes", str(DEFAULT_NATIVE_CAPTURE_PIPE_SIZE_BYTES)])
+    if extra_args:
+        cmd.extend(list(extra_args))
     return cmd
 
 
@@ -976,6 +990,8 @@ def build_capture_cmd(
     capture_telemetry: bool = False,
     capture_realign_initial_word_skip: int = 0,
     capture_realign_swap_channels: bool = False,
+    capture_mode: str = "raw",
+    capture_extra_args: Optional[list[str]] = None,
 ) -> list[str]:
     _resolved_backend, cmd = resolve_capture_command(
         device,
@@ -985,6 +1001,8 @@ def build_capture_cmd(
         capture_telemetry=capture_telemetry,
         capture_realign_initial_word_skip=capture_realign_initial_word_skip,
         capture_realign_swap_channels=capture_realign_swap_channels,
+        capture_mode=capture_mode,
+        capture_extra_args=capture_extra_args,
     )
     return cmd
 
@@ -1024,6 +1042,8 @@ def start_capture_process(
     capture_realign_initial_word_skip: int = 0,
     capture_realign_swap_channels: bool = False,
     capture_stderr: bool = False,
+    capture_mode: str = "raw",
+    capture_extra_args: Optional[list[str]] = None,
 ) -> subprocess.Popen:
     resolved_backend, cmd = resolve_capture_command(
         device,
@@ -1033,6 +1053,8 @@ def start_capture_process(
         capture_telemetry=capture_telemetry,
         capture_realign_initial_word_skip=capture_realign_initial_word_skip,
         capture_realign_swap_channels=capture_realign_swap_channels,
+        capture_mode=capture_mode,
+        capture_extra_args=capture_extra_args,
     )
     popen_kwargs = {
         "stdout": subprocess.PIPE,

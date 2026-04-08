@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import sys
 import threading
@@ -145,10 +146,10 @@ def _resolve_sync_cli_defaults(args: argparse.Namespace) -> dict[str, object]:
 def _trim_history(
     fft_history: deque[np.ndarray],
     history_times: deque[float],
-    now: float,
+    newest_time: float,
     history_seconds: float,
 ) -> None:
-    cutoff = float(now) - max(0.0, float(history_seconds))
+    cutoff = float(newest_time) - max(0.0, float(history_seconds))
     while history_times and float(history_times[0]) < cutoff:
         history_times.popleft()
         fft_history.popleft()
@@ -193,6 +194,73 @@ def _resolve_db_limits(
     return vmin, vmax
 
 
+def _compute_history_duration(history_times: np.ndarray, frame_duration_seconds: float) -> float:
+    if history_times.size == 0:
+        return 0.0
+    if history_times.size == 1:
+        return max(float(frame_duration_seconds), 0.0)
+
+    diffs = np.diff(history_times)
+    positive_diffs = diffs[diffs > 0.0]
+    effective_step = float(np.median(positive_diffs)) if positive_diffs.size else float(frame_duration_seconds)
+    return max(float(history_times[-1] - history_times[0]) + effective_step, float(frame_duration_seconds))
+
+
+def _format_frequency_label(freq_hz: float) -> str:
+    if freq_hz >= 1000.0:
+        freq_khz = freq_hz / 1000.0
+        rounded = round(freq_khz)
+        if abs(freq_khz - rounded) < 0.05:
+            return f"{int(rounded)}k"
+        return f"{freq_khz:.1f}k".rstrip("0").rstrip(".")
+    return str(int(round(freq_hz)))
+
+
+def _build_frequency_ticks(
+    freq_min_hz: float,
+    freq_max_hz: float,
+    *,
+    freq_scale: str,
+    step_hz: float,
+) -> np.ndarray:
+    if freq_max_hz <= 0.0:
+        return np.empty(0, dtype=np.float32)
+
+    if freq_scale == "log":
+        min_positive = max(freq_min_hz, 1.0)
+        start_decade = int(math.floor(math.log10(min_positive)))
+        stop_decade = int(math.ceil(math.log10(freq_max_hz)))
+        tick_values: list[float] = []
+        for decade in range(start_decade, stop_decade + 1):
+            scale = 10.0 ** decade
+            for multiplier in (1.0, 2.0, 5.0):
+                freq_hz = multiplier * scale
+                if min_positive <= freq_hz <= freq_max_hz:
+                    tick_values.append(freq_hz)
+        if not tick_values:
+            tick_values = [min_positive, freq_max_hz]
+        return np.asarray(sorted(set(float(v) for v in tick_values)), dtype=np.float32)
+
+    tick_start = 0.0 if freq_min_hz <= 0.0 else freq_min_hz
+    return np.arange(tick_start, freq_max_hz + step_hz, step_hz, dtype=np.float32)
+
+
+def _select_frequency_view(
+    fft_db: np.ndarray,
+    freqs_hz: np.ndarray,
+    *,
+    freq_scale: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if fft_db.size == 0 or freqs_hz.size == 0:
+        return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float32)
+    if freq_scale == "log":
+        positive_mask = freqs_hz > 0.0
+        if not bool(np.any(positive_mask)):
+            return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float32)
+        return fft_db[:, positive_mask], freqs_hz[positive_mask]
+    return fft_db, freqs_hz
+
+
 def _create_live_figure(plt):
     fig, axes = plt.subplots(
         2,
@@ -227,12 +295,19 @@ def _update_live_figure(
     max_freq: float,
     step_hz: float,
     history_seconds: float,
+    frame_duration_seconds: float,
     dynamic_range_db: float,
     min_db: Optional[float],
     max_db: Optional[float],
     smoothed_frames: int,
+    freq_scale: str,
 ) -> tuple[float, float]:
-    fft_db, freqs_hz, freq_per_bin = _compute_fft_db(fft_cache, rate, frame_bins, max_freq)
+    fft_db_full, freqs_hz_full, freq_per_bin = _compute_fft_db(fft_cache, rate, frame_bins, max_freq)
+    fft_db, freqs_hz = _select_frequency_view(
+        fft_db_full,
+        freqs_hz_full,
+        freq_scale=freq_scale,
+    )
     vmin, vmax = _resolve_db_limits(
         fft_db,
         min_db=min_db,
@@ -243,48 +318,59 @@ def _update_live_figure(
     if fft_db.size == 0 or freqs_hz.size == 0:
         spectrum_line.set_data([], [])
         spectrogram_im.set_data(np.zeros((2, 2), dtype=np.float32))
-        spectrogram_im.set_extent((-history_seconds, 0.0, 0.0, max_freq))
+        lower_freq = max(freq_per_bin, 1.0) if freq_scale == "log" else 0.0
+        spectrogram_im.set_extent((-history_seconds, 0.0, lower_freq, max_freq))
         spectrogram_im.set_clim(vmin=vmin, vmax=vmax)
+        spectrum_ax.set_xscale("log" if freq_scale == "log" else "linear")
+        spectrogram_ax.set_yscale("log" if freq_scale == "log" else "linear")
         return 0.0, 0.0
 
     latest_db = fft_db[-1]
     peak_bin = int(np.argmax(latest_db))
     peak_freq_hz = float(freqs_hz[peak_bin]) if peak_bin < freqs_hz.size else 0.0
+    freq_min = float(freqs_hz[0])
     freq_limit = float(freqs_hz[-1]) if freqs_hz.size else max_freq
     if freq_limit <= 0.0:
         freq_limit = max(float(freq_per_bin), 1.0)
 
     spectrum_line.set_data(freqs_hz, latest_db)
-    spectrum_ax.set_xlim(0.0, freq_limit)
+    spectrum_ax.set_xscale("log" if freq_scale == "log" else "linear")
+    if freq_scale == "log":
+        spectrum_ax.set_xlim(max(freq_min, freq_per_bin), freq_limit)
+    else:
+        spectrum_ax.set_xlim(0.0, freq_limit)
     spectrum_ax.set_ylim(vmin, vmax)
     spectrum_ax.set_ylabel("Magnitude (dB)")
     spectrum_ax.set_xlabel("Frequencia (Hz)")
     spectrum_ax.grid(True, which="both", alpha=0.25)
     spectrum_ax.set_title(
-        f"Espectro ao vivo | pico {peak_freq_hz:.1f} Hz | media temporal {max(1, smoothed_frames)} frame(s)"
+        f"Espectro ao vivo | pico {peak_freq_hz:.1f} Hz | media temporal {max(1, smoothed_frames)} frame(s) | eixo {freq_scale}"
     )
 
-    if history_times.size >= 2:
-        history_duration = float(history_times[-1] - history_times[0])
-    else:
-        history_duration = 0.0
+    history_duration = _compute_history_duration(history_times, frame_duration_seconds)
     if history_duration <= 0.0:
-        history_duration = max(1e-3, float(frame_bins) / float(rate))
+        history_duration = max(1e-3, float(frame_duration_seconds))
     start_time = -history_duration
     spectrogram_im.set_data(fft_db.T)
-    spectrogram_im.set_extent((start_time, 0.0, 0.0, freq_limit))
+    spectrogram_im.set_extent((start_time, 0.0, freq_min, freq_limit))
     spectrogram_im.set_clim(vmin=vmin, vmax=vmax)
 
     spectrogram_ax.set_xlim(-history_seconds, 0.0)
-    spectrogram_ax.set_ylim(0.0, freq_limit)
-    spectrogram_ax.set_title(f"Spectrograma ao vivo | janela temporal {history_seconds:.1f} s")
+    spectrogram_ax.set_yscale("log" if freq_scale == "log" else "linear")
+    spectrogram_ax.set_ylim(freq_min, freq_limit)
+    spectrogram_ax.set_title(f"Spectrograma ao vivo | janela temporal {history_seconds:.1f} s | eixo {freq_scale}")
     spectrogram_ax.set_xlabel("Tempo relativo (s)")
     spectrogram_ax.set_ylabel("Frequencia (Hz)")
 
-    tick_freqs_hz = np.arange(0.0, freq_limit + step_hz, step_hz)
+    tick_freqs_hz = _build_frequency_ticks(
+        freq_min,
+        freq_limit,
+        freq_scale=freq_scale,
+        step_hz=step_hz,
+    )
     if tick_freqs_hz.size > 0:
         spectrogram_ax.set_yticks(tick_freqs_hz)
-        spectrogram_ax.set_yticklabels([f"{int(freq)}" for freq in tick_freqs_hz])
+        spectrogram_ax.set_yticklabels([_format_frequency_label(float(freq)) for freq in tick_freqs_hz])
 
     xtick_count = 6
     tick_start = -history_seconds
@@ -349,10 +435,22 @@ def main() -> int:
     parser.add_argument("--step-hz", type=float, default=1000.0, help="Y-axis label spacing in Hz")
     parser.add_argument("--history-seconds", type=float, default=12.0, help="Rolling spectrogram history in seconds")
     parser.add_argument(
+        "--history-time-base",
+        choices=("data", "wall-clock"),
+        default="data",
+        help="Use FFT frame cadence ('data') or host arrival timestamps ('wall-clock') for the spectrogram time axis",
+    )
+    parser.add_argument(
+        "--freq-scale",
+        choices=("log", "linear"),
+        default="log",
+        help="Frequency-axis scale used by the live spectrum and spectrogram",
+    )
+    parser.add_argument(
         "--smooth-frames",
         type=int,
-        default=4,
-        help="Temporal averaging window applied before display (1 keeps full frame-to-frame sharpness)",
+        default=1,
+        help="Temporal averaging window applied before display (1 keeps true frame-to-frame sharpness)",
     )
     parser.add_argument("--fps", type=float, default=12.0, help="Maximum redraw rate of the GUI/PNG output")
     parser.add_argument(
@@ -581,8 +679,12 @@ def main() -> int:
         "frame_counter": 0,
         "capture_error": None,
         "last_bfpexp": 0,
+        "capture_started_wall": None,
+        "capture_last_wall": None,
+        "data_time_seconds": 0.0,
     }
     update_interval = 1.0 / float(args.fps)
+    frame_duration_seconds = float(args.frame_bins) / float(args.rate)
     freq_resolution_hz = float(args.rate) / float(args.frame_bins)
     nominal_frames_per_second = float(args.rate) / float(args.frame_bins)
     nominal_time_resolution_ms = 1000.0 / nominal_frames_per_second
@@ -611,7 +713,8 @@ def main() -> int:
         "Display resolution (nominal):",
         f"freq_bin={freq_resolution_hz:.3f} Hz",
         f"time_frame={nominal_time_resolution_ms:.3f} ms",
-        "history_trim=wall_clock",
+        f"history_trim={args.history_time_base}",
+        f"freq_scale={args.freq_scale}",
         flush=True,
     )
     print(
@@ -629,7 +732,8 @@ def main() -> int:
     last_status = time.monotonic()
     peak_freq_hz = 0.0
     history_duration = 0.0
-    effective_fps = 0.0
+    history_frame_density = 0.0
+    capture_wall_fps = 0.0
 
     def capture_loop() -> None:
         try:
@@ -640,7 +744,7 @@ def main() -> int:
 
                 fft_bins, _ = frame
                 fft_frame = np.asarray(fft_bins, dtype=np.float32)
-                now = time.monotonic()
+                arrival_wall = time.monotonic()
 
                 with history_lock:
                     smooth_history.append(fft_frame)
@@ -649,11 +753,19 @@ def main() -> int:
                     else:
                         display_frame = np.mean(np.asarray(smooth_history, dtype=np.float32), axis=0, dtype=np.float32)
 
+                    if args.history_time_base == "data":
+                        history_time = float(capture_state["data_time_seconds"])
+                        capture_state["data_time_seconds"] = history_time + frame_duration_seconds
+                    else:
+                        history_time = arrival_wall
                     fft_history.append(display_frame.copy())
-                    history_times.append(now)
-                    _trim_history(fft_history, history_times, now, args.history_seconds)
+                    history_times.append(history_time)
+                    _trim_history(fft_history, history_times, history_time, args.history_seconds)
                     capture_state["frame_counter"] = int(capture_state["frame_counter"]) + 1
                     capture_state["last_bfpexp"] = int(rx.last_frame_bfpexp)
+                    if capture_state["capture_started_wall"] is None:
+                        capture_state["capture_started_wall"] = arrival_wall
+                    capture_state["capture_last_wall"] = arrival_wall
         except Exception as exc:  # pragma: no cover - depends on live device state
             capture_state["capture_error"] = str(exc)
 
@@ -681,12 +793,21 @@ def main() -> int:
                 history_time_array = np.asarray(history_times, dtype=np.float64)
                 frame_counter = int(capture_state["frame_counter"])
                 last_bfpexp = int(capture_state["last_bfpexp"])
+                capture_started_wall = capture_state["capture_started_wall"]
+                capture_last_wall = capture_state["capture_last_wall"]
 
-            if history_time_array.size >= 2:
-                elapsed = float(history_time_array[-1] - history_time_array[0])
-                effective_fps = float((history_time_array.size - 1) / elapsed) if elapsed > 0.0 else 0.0
+            if history_time_array.size > 0:
+                history_duration = _compute_history_duration(history_time_array, frame_duration_seconds)
+                history_frame_density = float(history_time_array.size / history_duration) if history_duration > 0.0 else 0.0
             else:
-                effective_fps = 0.0
+                history_duration = 0.0
+                history_frame_density = 0.0
+
+            if capture_started_wall is not None and capture_last_wall is not None:
+                wall_elapsed = float(capture_last_wall - capture_started_wall)
+                capture_wall_fps = float(frame_counter / wall_elapsed) if wall_elapsed > 0.0 else 0.0
+            else:
+                capture_wall_fps = 0.0
 
             peak_freq_hz, history_duration = _update_live_figure(
                 spectrum_ax,
@@ -700,10 +821,12 @@ def main() -> int:
                 max_freq=args.max_freq,
                 step_hz=args.step_hz,
                 history_seconds=args.history_seconds,
+                frame_duration_seconds=frame_duration_seconds,
                 dynamic_range_db=args.dynamic_range_db,
                 min_db=args.min_db,
                 max_db=args.max_db,
                 smoothed_frames=args.smooth_frames,
+                freq_scale=args.freq_scale,
             )
 
             if interactive:
@@ -720,9 +843,11 @@ def main() -> int:
                 print(
                     "live:",
                     f"frames={frame_counter}",
+                    f"stored_frames={fft_cache.shape[0] if fft_cache.ndim == 2 else 0}",
                     f"renders={render_counter}",
                     f"history={history_duration:.2f}s",
-                    f"effective_fps={effective_fps:.1f}",
+                    f"history_frame_density={history_frame_density:.1f}",
+                    f"capture_wall_fps={capture_wall_fps:.1f}",
                     f"bfpexp={last_bfpexp}",
                     f"peak_freq_hz={peak_freq_hz:.1f}",
                     flush=True,

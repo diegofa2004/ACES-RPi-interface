@@ -30,6 +30,7 @@ enum {
     DEFAULT_FFT_PACKET_INDEX_BASE = 1 << (DEFAULT_PACKET_INDEX_BITS - 1),
     DEFAULT_TAG_SHIFT = 20,
     DEFAULT_TAG_MASK = 0x3,
+    DEFAULT_PAYLOAD_BITS = 18,
     DEFAULT_TAG_IDLE = 0,
     DEFAULT_TAG_BFPEXP = 1,
     DEFAULT_TAG_FFT = 2,
@@ -38,6 +39,7 @@ enum {
 typedef enum {
     OUTPUT_MODE_HEX = 0,
     OUTPUT_MODE_RAW = 1,
+    OUTPUT_MODE_FFT_RAW = 2,
 } output_mode_t;
 
 typedef enum {
@@ -66,9 +68,14 @@ typedef struct {
     unsigned int fft_packet_index_base;
     unsigned int tag_shift;
     unsigned int tag_mask;
+    unsigned int payload_bits;
     unsigned int tag_idle;
     unsigned int tag_bfpexp;
     unsigned int tag_fft;
+    unsigned int fft_frame_bins;
+    unsigned int bfpexp_hold_pairs;
+    unsigned int loss_tolerance_pairs;
+    int allow_fft_without_bfpexp;
 } capture_config_t;
 
 typedef struct {
@@ -104,6 +111,19 @@ typedef struct {
 } realign_state_t;
 
 typedef struct {
+    int waiting_for_start;
+    int current_bfpexp;
+    int have_explicit_bfpexp;
+    unsigned int bfpexp_gap_count;
+    unsigned int bfpexp_seen_count;
+    unsigned int highest_bin_index_seen;
+    unsigned int received_count;
+    int32_t *frame_pairs;
+    uint8_t *received_bins;
+    uint8_t *bfpexp_seen;
+} tagged_fft_state_t;
+
+typedef struct {
     capture_queue_t *queue;
     volatile sig_atomic_t *stop_flag;
     output_mode_t mode;
@@ -116,6 +136,7 @@ typedef struct {
     capture_stats_t *stats;
     const capture_config_t *cfg;
     realign_state_t realign_state;
+    tagged_fft_state_t tagged_fft_state;
     int32_t *transform_buffer;
     size_t transform_capacity_words;
 } writer_context_t;
@@ -171,32 +192,41 @@ static void print_usage(const char *prog) {
             "  -F, --period-frames <N>      tamanho do periodo ALSA (padrao: 512)\n"
             "  -B, --buffer-frames <N>      tamanho do buffer ALSA (padrao: 2048)\n"
             "  -Q, --queue-chunks <N>       chunks no buffer interno (padrao: 32)\n"
-            "  -m, --mode <hex|raw>         formato da saida (padrao: hex)\n"
+            "  -m, --mode <hex|raw|fft-raw> formato da saida (padrao: hex)\n"
             "  -o, --output <path|- >       arquivo de saida ou stdout (padrao: -)\n"
             "      --telemetry-format <fmt> stderr em text ou jsonl (padrao: text)\n"
             "      --realign-tagged         preset observado no Pi: descarta 1 word inicial e troca L/R\n"
             "      --realign-initial-word-skip <N>\n"
             "                               descarta N palavras S32 antes de reemparelhar o stream\n"
             "      --realign-swap-channels  troca left/right apos o reemparelhamento\n"
-            "      --show-tagged-fields     acrescenta kind, packet_index, tag e bin no modo hex\n"
+            "      --show-tagged-fields     acrescenta dec, kind, packet_index, tag e bin no modo hex\n"
             "      --packet-index-shift <N> shift do campo packet_index (padrao: 22)\n"
             "      --packet-index-bits <N>  largura do campo packet_index (padrao: 10)\n"
             "      --fft-packet-index-base <N>\n"
             "                               primeiro packet_index usado pelos bins FFT (padrao: 512)\n"
             "      --tag-shift <N>          shift do campo tag (padrao: 20)\n"
             "      --tag-mask <N>           mascara do campo tag (padrao: 0x3)\n"
+            "      --payload-bits <N>       largura do payload assinado em cada word (padrao: 18)\n"
             "      --tag-idle <N>           valor da tag idle (padrao: 0)\n"
             "      --tag-bfpexp <N>         valor da tag BFPEXP (padrao: 1)\n"
             "      --tag-fft <N>            valor da tag FFT (padrao: 2)\n"
+            "      --fft-frame-bins <N>     bins por quadro FFT emitido em fft-raw (padrao: 512)\n"
+            "      --bfpexp-hold-pairs <N>  BFPEXP consecutivos requeridos antes do burst FFT (padrao: 128)\n"
+            "      --loss-tolerance-pairs <N>\n"
+            "                               perdas/corrupcoes toleradas por preambulo/burst (padrao: 3)\n"
+            "      --allow-fft-without-bfpexp\n"
+            "                               aceita inicio de burst FFT sem preambulo BFPEXP completo\n"
             "      --pipe-size-bytes <N>    tamanho pedido para o pipe de stdout\n"
             "      --flush-every-chunks <N> flush do modo hex a cada N chunks\n"
             "      --stats-interval-ms <N>  intervalo dos contadores em stderr (0 desliga)\n"
             "  -h, --help                   mostra esta ajuda\n"
             "\n"
             "Modo raw escreve amostras S32_LE stereo diretamente, sem texto.\n"
+            "Modo fft-raw escreve quadros FFT decodificados em binario: cabecalho de 4 int32\n"
+            "(bfpexp, flags, received_bins, reservado) seguido de frame_bins pares real/imag S32_LE.\n"
             "Em modo I2S slave, --rate ajusta a taxa nominal pedida ao ALSA; o clock\n"
             "fisico continua vindo da FPGA. Com --realign-tagged/--show-tagged-fields,\n"
-            "o modo hex tambem exibe kind, packet_index, tag e bin FFT decodificados.\n",
+            "o modo hex tambem exibe payload decimal do par, kind, packet_index, tag e bin FFT decodificados.\n",
             prog,
             prog);
 }
@@ -267,6 +297,10 @@ static int parse_output_mode(const char *text, output_mode_t *mode) {
         *mode = OUTPUT_MODE_RAW;
         return 0;
     }
+    if (strcmp(text, "fft-raw") == 0) {
+        *mode = OUTPUT_MODE_FFT_RAW;
+        return 0;
+    }
     return -1;
 }
 
@@ -301,7 +335,13 @@ static int realignment_enabled(const capture_config_t *cfg) {
 }
 
 static const char *output_mode_name(output_mode_t mode) {
-    return mode == OUTPUT_MODE_RAW ? "raw" : "hex";
+    if (mode == OUTPUT_MODE_RAW) {
+        return "raw";
+    }
+    if (mode == OUTPUT_MODE_FFT_RAW) {
+        return "fft-raw";
+    }
+    return "hex";
 }
 
 static void queue_snapshot(capture_queue_t *queue, size_t *used_slots, size_t *high_water_slots, uint64_t *full_waits);
@@ -525,9 +565,14 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
         {"fft-packet-index-base", required_argument, NULL, 1009},
         {"tag-shift", required_argument, NULL, 1010},
         {"tag-mask", required_argument, NULL, 1011},
-        {"tag-idle", required_argument, NULL, 1012},
-        {"tag-bfpexp", required_argument, NULL, 1013},
-        {"tag-fft", required_argument, NULL, 1014},
+        {"payload-bits", required_argument, NULL, 1012},
+        {"tag-idle", required_argument, NULL, 1013},
+        {"tag-bfpexp", required_argument, NULL, 1014},
+        {"tag-fft", required_argument, NULL, 1015},
+        {"fft-frame-bins", required_argument, NULL, 1016},
+        {"bfpexp-hold-pairs", required_argument, NULL, 1017},
+        {"loss-tolerance-pairs", required_argument, NULL, 1018},
+        {"allow-fft-without-bfpexp", no_argument, NULL, 1019},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -583,7 +628,7 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
                 break;
             case 'm':
                 if (parse_output_mode(optarg, &cfg->mode) != 0) {
-                    fprintf(stderr, "mode invalido: %s (use hex ou raw)\n", optarg);
+                    fprintf(stderr, "mode invalido: %s (use hex, raw ou fft-raw)\n", optarg);
                     return -1;
                 }
                 break;
@@ -663,22 +708,49 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
                 }
                 break;
             case 1012:
+                if (parse_u32_arg(optarg, &cfg->payload_bits) != 0) {
+                    fprintf(stderr, "payload-bits invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1013:
                 if (parse_nonneg_u32_arg(optarg, &cfg->tag_idle) != 0) {
                     fprintf(stderr, "tag-idle invalido: %s\n", optarg);
                     return -1;
                 }
                 break;
-            case 1013:
+            case 1014:
                 if (parse_nonneg_u32_arg(optarg, &cfg->tag_bfpexp) != 0) {
                     fprintf(stderr, "tag-bfpexp invalido: %s\n", optarg);
                     return -1;
                 }
                 break;
-            case 1014:
+            case 1015:
                 if (parse_nonneg_u32_arg(optarg, &cfg->tag_fft) != 0) {
                     fprintf(stderr, "tag-fft invalido: %s\n", optarg);
                     return -1;
                 }
+                break;
+            case 1016:
+                if (parse_u32_arg(optarg, &cfg->fft_frame_bins) != 0) {
+                    fprintf(stderr, "fft-frame-bins invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1017:
+                if (parse_u32_arg(optarg, &cfg->bfpexp_hold_pairs) != 0) {
+                    fprintf(stderr, "bfpexp-hold-pairs invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1018:
+                if (parse_nonneg_u32_arg(optarg, &cfg->loss_tolerance_pairs) != 0) {
+                    fprintf(stderr, "loss-tolerance-pairs invalido: %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 1019:
+                cfg->allow_fft_without_bfpexp = 1;
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -727,6 +799,10 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
         fprintf(stderr, "tag-mask deve ser maior que zero\n");
         return -1;
     }
+    if (cfg->payload_bits == 0U || cfg->payload_bits >= cfg->tag_shift) {
+        fprintf(stderr, "payload-bits deve ficar entre 1 e tag-shift-1\n");
+        return -1;
+    }
     if (cfg->packet_index_shift > 31U || cfg->tag_shift > 31U) {
         fprintf(stderr, "packet-index-shift/tag-shift devem ficar entre 0 e 31\n");
         return -1;
@@ -742,6 +818,22 @@ static int parse_args(int argc, char **argv, capture_config_t *cfg) {
     }
     if (cfg->packet_index_shift < (cfg->tag_shift + tag_width)) {
         fprintf(stderr, "campo packet_index nao pode sobrepor o campo tag\n");
+        return -1;
+    }
+    if (cfg->fft_frame_bins == 0U) {
+        fprintf(stderr, "fft-frame-bins deve ser maior que zero\n");
+        return -1;
+    }
+    if (cfg->fft_frame_bins > cfg->fft_packet_index_base) {
+        fprintf(stderr, "fft-frame-bins deve caber no intervalo de packet_index FFT\n");
+        return -1;
+    }
+    if (cfg->bfpexp_hold_pairs == 0U) {
+        fprintf(stderr, "bfpexp-hold-pairs deve ser maior que zero\n");
+        return -1;
+    }
+    if (cfg->bfpexp_hold_pairs > cfg->fft_packet_index_base) {
+        fprintf(stderr, "bfpexp-hold-pairs deve caber no intervalo de packet_index BFPEXP\n");
         return -1;
     }
     if (realignment_enabled(cfg) && cfg->mode == OUTPUT_MODE_HEX) {
@@ -957,6 +1049,279 @@ static void format_bin_field(
     (void)snprintf(buffer, buffer_size, "-");
 }
 
+enum {
+    TAGGED_PAIR_KIND_LOSS = 0,
+    TAGGED_PAIR_KIND_IDLE = 1,
+    TAGGED_PAIR_KIND_BFPEXP = 2,
+    TAGGED_PAIR_KIND_FFT = 3,
+    FFT_RAW_HEADER_WORDS = 4,
+    FFT_RAW_FLAG_EXPLICIT_BFPEXP = 1,
+};
+
+static int decode_payload_value(const capture_config_t *cfg, uint32_t word) {
+    unsigned int payload_bits = cfg->payload_bits;
+    uint32_t payload_mask = 0U;
+    uint32_t payload = 0U;
+    uint32_t sign_bit = 0U;
+
+    if (payload_bits == 0U || payload_bits >= 32U) {
+        return (int32_t)word;
+    }
+
+    payload_mask = (uint32_t)((1ULL << payload_bits) - 1ULL);
+    payload = word & payload_mask;
+    sign_bit = (uint32_t)(1U << (payload_bits - 1U));
+    if ((payload & sign_bit) != 0U) {
+        payload |= ~payload_mask;
+    }
+    return (int32_t)payload;
+}
+
+static int classify_pair_kind_code(
+    const capture_config_t *cfg,
+    unsigned int left_tag,
+    unsigned int right_tag,
+    unsigned int left_packet_index,
+    unsigned int right_packet_index
+) {
+    const char *kind = classify_pair_kind(cfg, left_tag, right_tag, left_packet_index, right_packet_index);
+    if (strcmp(kind, "idle") == 0) {
+        return TAGGED_PAIR_KIND_IDLE;
+    }
+    if (strcmp(kind, "bfpexp") == 0) {
+        return TAGGED_PAIR_KIND_BFPEXP;
+    }
+    if (strcmp(kind, "fft") == 0) {
+        return TAGGED_PAIR_KIND_FFT;
+    }
+    return TAGGED_PAIR_KIND_LOSS;
+}
+
+static int ensure_tagged_fft_buffers(writer_context_t *writer) {
+    tagged_fft_state_t *state = &writer->tagged_fft_state;
+    size_t frame_word_count = 0;
+    int needs_init = 0;
+
+    if (writer->cfg->mode != OUTPUT_MODE_FFT_RAW) {
+        return 0;
+    }
+    if (writer->cfg->fft_frame_bins == 0U) {
+        return -1;
+    }
+
+    frame_word_count = (size_t)writer->cfg->fft_frame_bins * CHANNEL_COUNT;
+    if (state->frame_pairs == NULL) {
+        state->frame_pairs = calloc(frame_word_count, sizeof(int32_t));
+        needs_init = 1;
+    }
+    if (state->received_bins == NULL) {
+        state->received_bins = calloc((size_t)writer->cfg->fft_frame_bins, sizeof(uint8_t));
+        needs_init = 1;
+    }
+    if (state->bfpexp_seen == NULL) {
+        state->bfpexp_seen = calloc((size_t)writer->cfg->bfpexp_hold_pairs, sizeof(uint8_t));
+        needs_init = 1;
+    }
+    if (state->frame_pairs == NULL || state->received_bins == NULL || state->bfpexp_seen == NULL) {
+        return -1;
+    }
+
+    if (!needs_init) {
+        return 0;
+    }
+
+    state->waiting_for_start = 1;
+    state->current_bfpexp = 0;
+    state->have_explicit_bfpexp = 0;
+    state->bfpexp_gap_count = 0U;
+    state->bfpexp_seen_count = 0U;
+    state->highest_bin_index_seen = 0U;
+    state->received_count = 0U;
+    memset(state->frame_pairs, 0, frame_word_count * sizeof(int32_t));
+    memset(state->received_bins, 0, (size_t)writer->cfg->fft_frame_bins * sizeof(uint8_t));
+    memset(state->bfpexp_seen, 0, (size_t)writer->cfg->bfpexp_hold_pairs * sizeof(uint8_t));
+    return 0;
+}
+
+static void reset_fft_frame_accumulator(writer_context_t *writer) {
+    tagged_fft_state_t *state = &writer->tagged_fft_state;
+
+    state->waiting_for_start = 1;
+    state->have_explicit_bfpexp = 0;
+    state->bfpexp_gap_count = 0U;
+    state->bfpexp_seen_count = 0U;
+    state->highest_bin_index_seen = 0U;
+    state->received_count = 0U;
+    if (state->frame_pairs != NULL) {
+        memset(state->frame_pairs, 0, (size_t)writer->cfg->fft_frame_bins * CHANNEL_COUNT * sizeof(int32_t));
+    }
+    if (state->received_bins != NULL) {
+        memset(state->received_bins, 0, (size_t)writer->cfg->fft_frame_bins * sizeof(uint8_t));
+    }
+    if (state->bfpexp_seen != NULL) {
+        memset(state->bfpexp_seen, 0, (size_t)writer->cfg->bfpexp_hold_pairs * sizeof(uint8_t));
+    }
+}
+
+static int emit_fft_raw_frame(writer_context_t *writer) {
+    tagged_fft_state_t *state = &writer->tagged_fft_state;
+    int32_t header[FFT_RAW_HEADER_WORDS];
+    size_t payload_bytes = 0;
+
+    if (state->frame_pairs == NULL || writer->out_fd < 0) {
+        return 0;
+    }
+    if (state->received_count == 0U) {
+        return 0;
+    }
+
+    header[0] = (int32_t)state->current_bfpexp;
+    header[1] = state->have_explicit_bfpexp ? FFT_RAW_FLAG_EXPLICIT_BFPEXP : 0;
+    header[2] = (int32_t)state->received_count;
+    header[3] = 0;
+    if (write_all(writer->out_fd, header, sizeof(header)) < 0) {
+        return -1;
+    }
+
+    payload_bytes = (size_t)writer->cfg->fft_frame_bins * CHANNEL_COUNT * sizeof(int32_t);
+    if (write_all(writer->out_fd, state->frame_pairs, payload_bytes) < 0) {
+        return -1;
+    }
+
+    writer->stats->written_chunks += 1ULL;
+    writer->stats->written_frames += (uint64_t)writer->cfg->fft_frame_bins;
+    reset_fft_frame_accumulator(writer);
+    return 0;
+}
+
+static int write_fft_raw_chunk(writer_context_t *writer, const int32_t *samples, snd_pcm_sframes_t frames) {
+    const capture_config_t *cfg = writer->cfg;
+    tagged_fft_state_t *state = &writer->tagged_fft_state;
+    snd_pcm_sframes_t idx = 0;
+
+    if (ensure_tagged_fft_buffers(writer) != 0) {
+        return -1;
+    }
+
+    for (idx = 0; idx < frames; ++idx) {
+        uint32_t left = (uint32_t)samples[(size_t)idx * CHANNEL_COUNT];
+        uint32_t right = (uint32_t)samples[(size_t)idx * CHANNEL_COUNT + 1U];
+        unsigned int packet_index = decode_packet_index(cfg, left);
+        unsigned int left_tag = decode_tag_value(cfg, left);
+        unsigned int right_tag = decode_tag_value(cfg, right);
+        unsigned int right_packet_index = decode_packet_index(cfg, right);
+        int payload_left = decode_payload_value(cfg, left);
+        int payload_right = decode_payload_value(cfg, right);
+        int reprocess_pair = 1;
+
+        while (reprocess_pair) {
+            int kind_code = classify_pair_kind_code(cfg, left_tag, right_tag, packet_index, right_packet_index);
+            int bin_index = 0;
+            int full_bfpexp_preamble = 0;
+
+            reprocess_pair = 0;
+            if (state->waiting_for_start) {
+                if (kind_code == TAGGED_PAIR_KIND_IDLE) {
+                    if (state->bfpexp_seen_count > 0U && state->bfpexp_gap_count < cfg->loss_tolerance_pairs) {
+                        state->bfpexp_gap_count += 1U;
+                    }
+                    continue;
+                }
+                if (kind_code == TAGGED_PAIR_KIND_BFPEXP) {
+                    state->current_bfpexp = payload_left;
+                    state->have_explicit_bfpexp = 1;
+                    if (packet_index == 0U) {
+                        memset(state->bfpexp_seen, 0, (size_t)cfg->bfpexp_hold_pairs * sizeof(uint8_t));
+                        state->bfpexp_seen[0] = 1U;
+                        state->bfpexp_seen_count = 1U;
+                        state->bfpexp_gap_count = 0U;
+                    } else if (packet_index < cfg->bfpexp_hold_pairs && state->bfpexp_seen[packet_index] == 0U) {
+                        state->bfpexp_seen[packet_index] = 1U;
+                        state->bfpexp_seen_count += 1U;
+                    }
+                    continue;
+                }
+                if (kind_code == TAGGED_PAIR_KIND_LOSS) {
+                    if (state->bfpexp_seen_count > 0U && state->bfpexp_gap_count < cfg->loss_tolerance_pairs) {
+                        state->bfpexp_gap_count += 1U;
+                    }
+                    continue;
+                }
+                if (kind_code != TAGGED_PAIR_KIND_FFT) {
+                    continue;
+                }
+
+                bin_index = (int)packet_index - (int)cfg->fft_packet_index_base;
+                if (bin_index < 0 || (unsigned int)bin_index >= cfg->fft_frame_bins) {
+                    continue;
+                }
+
+                full_bfpexp_preamble = (
+                    state->bfpexp_seen_count > 0U &&
+                    state->bfpexp_seen[0] != 0U &&
+                    (state->bfpexp_seen_count + state->bfpexp_gap_count) >= cfg->bfpexp_hold_pairs
+                );
+                if (!full_bfpexp_preamble && !cfg->allow_fft_without_bfpexp) {
+                    continue;
+                }
+
+                state->waiting_for_start = 0;
+                state->received_count = 0U;
+                state->highest_bin_index_seen = (unsigned int)bin_index;
+                memset(state->frame_pairs, 0, (size_t)cfg->fft_frame_bins * CHANNEL_COUNT * sizeof(int32_t));
+                memset(state->received_bins, 0, (size_t)cfg->fft_frame_bins * sizeof(uint8_t));
+                state->frame_pairs[(size_t)bin_index * CHANNEL_COUNT] = (int32_t)payload_left;
+                state->frame_pairs[(size_t)bin_index * CHANNEL_COUNT + 1U] = (int32_t)payload_right;
+                state->received_bins[bin_index] = 1U;
+                state->received_count = 1U;
+                if (state->received_count >= cfg->fft_frame_bins && emit_fft_raw_frame(writer) != 0) {
+                    return -1;
+                }
+                continue;
+            }
+
+            if (kind_code == TAGGED_PAIR_KIND_BFPEXP) {
+                if (emit_fft_raw_frame(writer) != 0) {
+                    return -1;
+                }
+                state->current_bfpexp = payload_left;
+                state->have_explicit_bfpexp = 1;
+                reprocess_pair = 1;
+                continue;
+            }
+            if (kind_code == TAGGED_PAIR_KIND_FFT) {
+                bin_index = (int)packet_index - (int)cfg->fft_packet_index_base;
+                if (bin_index < 0 || (unsigned int)bin_index >= cfg->fft_frame_bins) {
+                    continue;
+                }
+                if ((unsigned int)bin_index < state->highest_bin_index_seen) {
+                    if (emit_fft_raw_frame(writer) != 0) {
+                        return -1;
+                    }
+                    reprocess_pair = 1;
+                    continue;
+                }
+                state->frame_pairs[(size_t)bin_index * CHANNEL_COUNT] = (int32_t)payload_left;
+                state->frame_pairs[(size_t)bin_index * CHANNEL_COUNT + 1U] = (int32_t)payload_right;
+                if (state->received_bins[bin_index] == 0U) {
+                    state->received_bins[bin_index] = 1U;
+                    state->received_count += 1U;
+                }
+                state->highest_bin_index_seen = (unsigned int)bin_index;
+                if (state->received_count >= cfg->fft_frame_bins && emit_fft_raw_frame(writer) != 0) {
+                    return -1;
+                }
+                continue;
+            }
+            if (kind_code == TAGGED_PAIR_KIND_IDLE || kind_code == TAGGED_PAIR_KIND_LOSS) {
+                continue;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int ensure_transform_capacity(writer_context_t *writer, size_t required_words) {
     int32_t *new_buffer = NULL;
     size_t new_capacity = 0;
@@ -1050,6 +1415,8 @@ static int write_hex_chunk(writer_context_t *writer, const int32_t *samples, snd
             unsigned int right_packet_index = decode_packet_index(cfg, right);
             unsigned int left_tag = decode_tag_value(cfg, left);
             unsigned int right_tag = decode_tag_value(cfg, right);
+            int payload_left = decode_payload_value(cfg, left);
+            int payload_right = decode_payload_value(cfg, right);
             char left_bin[32];
             char right_bin[32];
             const char *kind = classify_pair_kind(cfg, left_tag, right_tag, left_packet_index, right_packet_index);
@@ -1058,9 +1425,11 @@ static int write_hex_chunk(writer_context_t *writer, const int32_t *samples, snd
             format_bin_field(cfg, right_tag, right_packet_index, right_bin, sizeof(right_bin));
             if (fprintf(output,
                         "0x%08" PRIX32 " 0x%08" PRIX32
-                        " kind=%s pkt=%u/%u tag=%s/%s bin=%s/%s\n",
+                        " dec=%d/%d kind=%s pkt=%u/%u tag=%s/%s bin=%s/%s\n",
                         left,
                         right,
+                        payload_left,
+                        payload_right,
                         kind,
                         left_packet_index,
                         right_packet_index,
@@ -1080,6 +1449,12 @@ static void free_writer_buffers(writer_context_t *writer) {
     free(writer->transform_buffer);
     writer->transform_buffer = NULL;
     writer->transform_capacity_words = 0;
+    free(writer->tagged_fft_state.frame_pairs);
+    free(writer->tagged_fft_state.received_bins);
+    free(writer->tagged_fft_state.bfpexp_seen);
+    writer->tagged_fft_state.frame_pairs = NULL;
+    writer->tagged_fft_state.received_bins = NULL;
+    writer->tagged_fft_state.bfpexp_seen = NULL;
 }
 
 static void writer_emit_realign_summary(writer_context_t *writer) {
@@ -1100,6 +1475,15 @@ static void writer_emit_realign_summary(writer_context_t *writer) {
     fprintf(stderr,
             "Aviso: realinhamento descartou a ultima palavra solta 0x%08" PRIX32 "\n",
             (uint32_t)writer->realign_state.pending_word);
+}
+
+static void writer_emit_fft_summary(writer_context_t *writer) {
+    if (writer->mode != OUTPUT_MODE_FFT_RAW) {
+        return;
+    }
+    if (emit_fft_raw_frame(writer) != 0 && writer->error_code == 0) {
+        writer->error_code = errno != 0 ? errno : EIO;
+    }
 }
 
 static void *writer_main(void *opaque) {
@@ -1133,6 +1517,15 @@ static void *writer_main(void *opaque) {
                     queue_close(writer->queue);
                     break;
                 }
+                writer->stats->written_chunks += 1;
+                writer->stats->written_frames += (uint64_t)output_frames;
+            } else if (writer->mode == OUTPUT_MODE_FFT_RAW) {
+                if (write_fft_raw_chunk(writer, output_samples, output_frames) != 0) {
+                    writer->error_code = errno != 0 ? errno : EIO;
+                    *writer->stop_flag = 1;
+                    queue_close(writer->queue);
+                    break;
+                }
             } else {
                 if (write_hex_chunk(writer, output_samples, output_frames) != 0) {
                     writer->error_code = errno != 0 ? errno : EIO;
@@ -1144,15 +1537,15 @@ static void *writer_main(void *opaque) {
                     (((writer->stats->written_chunks + 1ULL) % writer->flush_every_chunks) == 0ULL)) {
                     fflush(writer->hex_output);
                 }
+                writer->stats->written_chunks += 1;
+                writer->stats->written_frames += (uint64_t)output_frames;
             }
-
-            writer->stats->written_chunks += 1;
-            writer->stats->written_frames += (uint64_t)output_frames;
         }
 
         queue_release_read_slot(writer->queue);
     }
 
+    writer_emit_fft_summary(writer);
     writer_emit_realign_summary(writer);
     if (writer->mode == OUTPUT_MODE_HEX && writer->hex_output != NULL) {
         fflush(writer->hex_output);
@@ -1178,10 +1571,10 @@ static int open_output_sink(const capture_config_t *cfg, writer_context_t *write
     writer->close_fd_on_exit = 0;
     writer->close_file_on_exit = 0;
 
-    if (cfg->mode == OUTPUT_MODE_RAW) {
+    if (cfg->mode == OUTPUT_MODE_RAW || cfg->mode == OUTPUT_MODE_FFT_RAW) {
         if (cfg->output_path == NULL || strcmp(cfg->output_path, "-") == 0) {
             if (isatty(STDOUT_FILENO)) {
-                fprintf(stderr, "Modo raw nao pode escrever no terminal. Use --output arquivo.raw ou pipe.\n");
+                fprintf(stderr, "Modo raw/fft-raw nao pode escrever no terminal. Use --output arquivo.raw ou pipe.\n");
                 return -1;
             }
             writer->out_fd = STDOUT_FILENO;
@@ -1413,9 +1806,14 @@ int main(int argc, char **argv) {
         .fft_packet_index_base = DEFAULT_FFT_PACKET_INDEX_BASE,
         .tag_shift = DEFAULT_TAG_SHIFT,
         .tag_mask = DEFAULT_TAG_MASK,
+        .payload_bits = DEFAULT_PAYLOAD_BITS,
         .tag_idle = DEFAULT_TAG_IDLE,
         .tag_bfpexp = DEFAULT_TAG_BFPEXP,
         .tag_fft = DEFAULT_TAG_FFT,
+        .fft_frame_bins = DEFAULT_READ_FRAMES,
+        .bfpexp_hold_pairs = 128U,
+        .loss_tolerance_pairs = 3U,
+        .allow_fft_without_bfpexp = 0,
     };
     capture_queue_t queue;
     capture_stats_t stats;
