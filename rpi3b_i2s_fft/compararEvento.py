@@ -38,6 +38,8 @@ class DirectComparatorConfig:
     max_reference_frames: int = 32
     search_margin_frames: int = 24
     max_search_frames: int = 64
+    min_db: Optional[float] = None
+    dynamic_range_db: float = 50.0
     noise_floor_percentile: float = 20.0
     salience_floor_percentile: float = 35.0
     salience_max_gain: float = 3.0
@@ -128,6 +130,41 @@ def _agrupar_bandas_fft(
         stop = max(start + 1, int(edges[idx + 1]))
         bands[:, idx] = np.mean(useful[:, start:stop], axis=1, dtype=np.float32)
     return bands
+
+
+def _resolve_effective_min_db(
+    fft_db: np.ndarray,
+    *,
+    min_db: Optional[float],
+    dynamic_range_db: float,
+) -> Optional[float]:
+    if min_db is not None:
+        return float(min_db)
+    if fft_db.size == 0:
+        return None
+    return float(np.max(fft_db) - float(dynamic_range_db))
+
+
+def _apply_min_db_gate(
+    fft_frames: np.ndarray,
+    min_db: Optional[float],
+    *,
+    dynamic_range_db: float,
+) -> np.ndarray:
+    fft_frames = np.asarray(fft_frames, dtype=np.float32)
+    if fft_frames.ndim != 2:
+        raise ValueError("FFT data must be 2D")
+
+    fft_mag = np.maximum(fft_frames, EPSILON)
+    fft_db = 20.0 * np.log10(fft_mag)
+    effective_min_db = _resolve_effective_min_db(
+        fft_db,
+        min_db=min_db,
+        dynamic_range_db=dynamic_range_db,
+    )
+    if effective_min_db is None:
+        return fft_frames
+    return np.where(fft_db >= effective_min_db, fft_frames, 0.0).astype(np.float32, copy=False)
 
 
 def _energia_frames(bands: np.ndarray) -> np.ndarray:
@@ -266,6 +303,7 @@ def build_reference_template(
     config: Optional[DirectComparatorConfig] = None,
 ) -> ReferenceTemplate:
     cfg = config or DirectComparatorConfig()
+    evento_fft = _apply_min_db_gate(evento_fft, cfg.min_db, dynamic_range_db=cfg.dynamic_range_db)
     bands = _agrupar_bandas_fft(evento_fft, band_count=cfg.band_count, useful_bins=cfg.useful_bins)
     energy = _energia_frames(bands)
     salience = _compute_band_salience(
@@ -302,7 +340,11 @@ def score_history_against_template(
     config: Optional[DirectComparatorConfig] = None,
 ) -> ComparisonResult:
     cfg = config or DirectComparatorConfig()
-    snapshot_fft = np.asarray(snapshot_fft, dtype=np.float32)
+    snapshot_fft = _apply_min_db_gate(
+        np.asarray(snapshot_fft, dtype=np.float32),
+        cfg.min_db,
+        dynamic_range_db=cfg.dynamic_range_db,
+    )
     if snapshot_fft.ndim != 2:
         raise ValueError("FFT history must be 2D")
     if snapshot_fft.shape[0] < template.frame_count or template.frame_count <= 0:

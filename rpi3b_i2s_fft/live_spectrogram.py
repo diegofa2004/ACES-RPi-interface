@@ -563,9 +563,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--apply-bfpexp",
+        dest="apply_bfpexp",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply the FFT block-floating exponent before plotting magnitudes (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-bfpexp",
+        dest="apply_bfpexp",
+        action="store_false",
+        help="Alias for disabling BFPEXP scaling before plotting magnitudes",
     )
     args = parser.parse_args()
 

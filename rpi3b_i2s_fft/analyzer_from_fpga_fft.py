@@ -1164,9 +1164,28 @@ def main() -> int:
     parser.add_argument("--tag-fft", type=int, default=DEFAULT_TAG_FFT, help="Tag value representing FFT complex bins")
     parser.add_argument(
         "--apply-bfpexp",
+        dest="apply_bfpexp",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply the FFT block-floating exponent before computing magnitudes (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-bfpexp",
+        dest="apply_bfpexp",
+        action="store_false",
+        help="Alias for disabling BFPEXP scaling before comparison data is generated",
+    )
+    parser.add_argument(
+        "--min-db",
+        type=float,
+        default=DirectComparatorConfig.min_db,
+        help="Ignore FFT bins below this dB floor before similarity is computed",
+    )
+    parser.add_argument(
+        "--dynamic-range-db",
+        type=float,
+        default=DirectComparatorConfig.dynamic_range_db,
+        help="Automatic comparison floor in dB when --min-db is not specified",
     )
     parser.add_argument(
         "--bfpexp-hold-pairs",
@@ -1311,6 +1330,8 @@ def main() -> int:
         parser.error("--compare-max-reference-frames must be positive")
     if args.compare_search_frames <= 0:
         parser.error("--compare-search-frames must be positive")
+    if args.dynamic_range_db <= 0.0:
+        parser.error("--dynamic-range-db must be positive")
     if args.debug_replay_raw and not args.debug_channel_log:
         parser.error("--debug-replay-raw requires --debug-channel-log")
     if args.debug_raw_capture and args.debug_replay_raw:
@@ -1414,6 +1435,8 @@ def main() -> int:
         min_energy_ratio=args.compare_min_energy_ratio,
         max_reference_frames=args.compare_max_reference_frames,
         max_search_frames=args.compare_search_frames,
+        min_db=args.min_db,
+        dynamic_range_db=args.dynamic_range_db,
     )
 
     def trigger_recording(source: str) -> bool:
@@ -1503,6 +1526,10 @@ def main() -> int:
         flush=True,
     )
     print(f"FFT scaling: apply_bfpexp={cfg.apply_bfpexp}", flush=True)
+    print(
+        f"Comparator FFT floor: min_db={compare_config.min_db} dynamic_range_db={compare_config.dynamic_range_db}",
+        flush=True,
+    )
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)

@@ -63,6 +63,20 @@ class CompararEventoHelperTests(unittest.TestCase):
         self.assertEqual(band_means.shape, (2, 32))
         np.testing.assert_allclose(band_means[0], esperado)
 
+    def test_apply_min_db_gate_zeroes_bins_below_requested_floor(self):
+        fft = np.asarray([[1e-4, 1e-2, 1e0]], dtype=np.float32)
+
+        gated = comparar_evento_module._apply_min_db_gate(fft, -20.0, dynamic_range_db=50.0)
+
+        np.testing.assert_allclose(gated, np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32))
+
+    def test_apply_min_db_gate_uses_dynamic_range_when_floor_is_not_fixed(self):
+        fft = np.asarray([[1e-4, 1e-2, 1e0]], dtype=np.float32)
+
+        gated = comparar_evento_module._apply_min_db_gate(fft, None, dynamic_range_db=50.0)
+
+        np.testing.assert_allclose(gated, np.asarray([[0.0, 1e-2, 1.0]], dtype=np.float32))
+
     def test_build_reference_template_extracts_active_slice(self):
         cfg = comparar_evento_module.DirectComparatorConfig(
             min_reference_frames=8,
