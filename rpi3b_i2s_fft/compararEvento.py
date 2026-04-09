@@ -38,14 +38,20 @@ class DirectComparatorConfig:
     max_reference_frames: int = 32
     search_margin_frames: int = 24
     max_search_frames: int = 64
+    noise_floor_percentile: float = 20.0
+    salience_floor_percentile: float = 35.0
+    salience_max_gain: float = 3.0
 
 
 @dataclass(frozen=True)
 class ReferenceTemplate:
     band_frames_unit: np.ndarray
+    band_frames_salience: np.ndarray
+    dominant_band_sequence: np.ndarray
     envelope_unit: np.ndarray
     mean_energy: float
     peak_energy: float
+    tonality_p75: float
     frame_count: int
     start_frame: int
     stop_frame: int
@@ -55,6 +61,8 @@ class ReferenceTemplate:
 class ComparisonResult:
     score: float
     spectral_score: float
+    salience_score: float
+    dominant_score: float
     envelope_score: float
     energy_score: float
     baseline_score: float
@@ -124,6 +132,37 @@ def _agrupar_bandas_fft(
 
 def _energia_frames(bands: np.ndarray) -> np.ndarray:
     return np.sum(np.asarray(bands, dtype=np.float32), axis=1, dtype=np.float32)
+
+
+def _compute_band_salience(
+    bands: np.ndarray,
+    *,
+    noise_floor_percentile: float,
+    salience_floor_percentile: float,
+    salience_max_gain: float,
+) -> np.ndarray:
+    bands = np.asarray(bands, dtype=np.float32)
+    if bands.ndim != 2:
+        raise ValueError("Band data must be 2D")
+
+    # Remove the persistent per-band floor estimated across time so the matcher
+    # focuses on event-driven deviations instead of stationary broadband noise.
+    band_floor = np.percentile(bands, noise_floor_percentile, axis=0, keepdims=True)
+    salience = np.maximum(bands - band_floor, 0.0)
+
+    # Remove the remaining frame-wide floor to keep wideband bursts from looking
+    # like a tonal match just because their envelope is similar.
+    frame_floor = np.percentile(salience, salience_floor_percentile, axis=1, keepdims=True)
+    salience = np.maximum(salience - frame_floor, 0.0)
+
+    frame_peak = np.percentile(salience, 95.0, axis=1, keepdims=True)
+    salience = salience / (frame_peak + EPSILON)
+    return np.clip(salience, 0.0, float(salience_max_gain)).astype(np.float32)
+
+
+def _band_tonality(salience: np.ndarray) -> np.ndarray:
+    salience = np.asarray(salience, dtype=np.float32)
+    return np.max(salience, axis=1) / (np.mean(salience, axis=1, dtype=np.float32) + EPSILON)
 
 
 def _fill_short_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
@@ -229,16 +268,27 @@ def build_reference_template(
     cfg = config or DirectComparatorConfig()
     bands = _agrupar_bandas_fft(evento_fft, band_count=cfg.band_count, useful_bins=cfg.useful_bins)
     energy = _energia_frames(bands)
+    salience = _compute_band_salience(
+        bands,
+        noise_floor_percentile=cfg.noise_floor_percentile,
+        salience_floor_percentile=cfg.salience_floor_percentile,
+        salience_max_gain=cfg.salience_max_gain,
+    )
     start, stop = _select_reference_slice(energy, cfg)
 
     ref_bands = bands[start:stop]
+    ref_salience = salience[start:stop]
     ref_energy = energy[start:stop]
+    ref_tonality = _band_tonality(ref_salience)
 
     return ReferenceTemplate(
         band_frames_unit=_unit_rows(ref_bands),
+        band_frames_salience=ref_salience,
+        dominant_band_sequence=np.argmax(ref_bands, axis=1).astype(np.int16),
         envelope_unit=_unit_vector(ref_energy),
         mean_energy=float(np.mean(ref_energy, dtype=np.float32) + EPSILON),
         peak_energy=float(np.max(ref_energy) + EPSILON),
+        tonality_p75=float(np.percentile(ref_tonality, 75.0) + EPSILON),
         frame_count=int(ref_bands.shape[0]),
         start_frame=int(start),
         stop_frame=int(stop),
@@ -260,19 +310,35 @@ def score_history_against_template(
 
     bands = _agrupar_bandas_fft(snapshot_fft, band_count=cfg.band_count, useful_bins=cfg.useful_bins)
     energy = _energia_frames(bands)
+    salience = _compute_band_salience(
+        bands,
+        noise_floor_percentile=cfg.noise_floor_percentile,
+        salience_floor_percentile=cfg.salience_floor_percentile,
+        salience_max_gain=cfg.salience_max_gain,
+    )
 
     search_frames = _search_tail_frames(template.frame_count, cfg)
     if bands.shape[0] > search_frames:
         bands = bands[-search_frames:]
         energy = energy[-search_frames:]
+        salience = salience[-search_frames:]
 
     normalized_bands = _unit_rows(bands)
     band_windows = sliding_window_view(normalized_bands, template.frame_count, axis=0)
     band_windows = np.moveaxis(band_windows, -1, 1)
+    salience_windows = sliding_window_view(salience, template.frame_count, axis=0)
+    salience_windows = np.moveaxis(salience_windows, -1, 1)
+    tonality_windows = sliding_window_view(_band_tonality(salience), template.frame_count)
+    dominant_windows = sliding_window_view(np.argmax(bands, axis=1), template.frame_count)
     energy_windows = sliding_window_view(energy, template.frame_count)
 
     frame_cosine = np.sum(band_windows * template.band_frames_unit[None, :, :], axis=2, dtype=np.float32)
     spectral_score = np.mean(frame_cosine, axis=1, dtype=np.float32)
+    salience_intersection = np.minimum(salience_windows, template.band_frames_salience[None, :, :])
+    salience_union = np.maximum(salience_windows, template.band_frames_salience[None, :, :])
+    salience_score = np.sum(salience_intersection, axis=(1, 2), dtype=np.float32) / (
+        np.sum(salience_union, axis=(1, 2), dtype=np.float32) + EPSILON
+    )
 
     energy_centered = energy_windows - np.mean(energy_windows, axis=1, keepdims=True, dtype=np.float32)
     energy_norm = np.linalg.norm(energy_centered, axis=1) + EPSILON
@@ -283,15 +349,32 @@ def score_history_against_template(
     energy_ratio = np.maximum(mean_energy / np.float32(template.mean_energy), EPSILON)
     energy_score = 1.0 - (np.minimum(np.abs(np.log2(energy_ratio)), 1.5) / 1.5)
     energy_score = np.clip(energy_score, 0.0, 1.0)
+    tonality_p75 = np.percentile(tonality_windows, 75.0, axis=1)
+    tonality_ratio = np.maximum(tonality_p75 / np.float32(template.tonality_p75), EPSILON)
+    tonality_score = 1.0 - (np.minimum(np.abs(np.log2(tonality_ratio)), 1.5) / 1.5)
+    tonality_score = np.clip(tonality_score, 0.0, 1.0)
+    dominant_score = np.mean(
+        dominant_windows == template.dominant_band_sequence[None, :],
+        axis=1,
+        dtype=np.float32,
+    )
 
     valid = (mean_energy >= (template.mean_energy * cfg.min_energy_ratio)) & (
         peak_energy >= (template.peak_energy * cfg.min_energy_ratio)
     )
 
+    # Treat spectral agreement as the primary discriminator. Mapping the cosine
+    # scores from [-1, 1] into [0, 1] made wrong-frequency events with similar
+    # envelopes look too good under broadband noise, so keep the spectral term
+    # in its native [0, 1] confidence region and down-weight the envelope.
+    spectral_confidence = np.clip((spectral_score - 0.10) / 0.60, 0.0, 1.0)
+    dominant_confidence = np.clip((dominant_score - 0.15) / 0.55, 0.0, 1.0)
     score = (
-        0.70 * ((spectral_score + 1.0) * 0.5)
-        + 0.20 * ((envelope_score + 1.0) * 0.5)
-        + 0.10 * energy_score
+        0.45 * spectral_confidence
+        + 0.15 * salience_score
+        + 0.15 * tonality_score
+        + 0.20 * dominant_confidence
+        + 0.05 * energy_score
     )
     score = np.where(valid, score, 0.0)
 
@@ -299,6 +382,8 @@ def score_history_against_template(
     return ComparisonResult(
         score=float(score[best_index]),
         spectral_score=float(spectral_score[best_index]),
+        salience_score=float(salience_score[best_index]),
+        dominant_score=float(dominant_score[best_index]),
         envelope_score=float(envelope_score[best_index]),
         energy_score=float(energy_score[best_index]),
         baseline_score=float(mean_energy[best_index]),
@@ -376,6 +461,8 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime, config: Optional[D
             f"base={baseline:.3f} "
             f"margem={margin:.3f} "
             f"espectro={result.spectral_score:.3f} "
+            f"saliencia={result.salience_score:.3f} "
+            f"dominante={result.dominant_score:.3f} "
             f"env={result.envelope_score:.3f} "
             f"energia={result.energy_score:.3f} "
             f"janelas={result.total_windows} "

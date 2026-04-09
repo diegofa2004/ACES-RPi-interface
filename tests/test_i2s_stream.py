@@ -172,6 +172,14 @@ class I2SStreamTests(unittest.TestCase):
             },
         )
 
+    def test_decode_tagged_i2s_word_sign_extends_18bit_payload(self):
+        decoded = i2s_stream.decode_tagged_i2s_word(0x0003FFDF)
+
+        self.assertEqual(decoded["payload"], -33)
+        self.assertEqual(decoded["tag"], 0)
+        self.assertEqual(decoded["packet_index"], 0)
+        self.assertEqual(decoded["reserved"], 0)
+
     def test_trim_incomplete_frames_discards_partial_tail(self):
         raw = b"\x00" * 19
         trimmed = i2s_stream.trim_incomplete_frames(raw, bytes_per_frame=8)

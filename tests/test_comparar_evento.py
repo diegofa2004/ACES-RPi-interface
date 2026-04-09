@@ -22,6 +22,8 @@ class CompararEventoHelperTests(unittest.TestCase):
         active_stop: int = 26,
         background: float = 0.5,
         peak_gain: float = 16.0,
+        broadband_noise: float = 0.0,
+        striped_noise: float = 0.0,
     ) -> np.ndarray:
         fft = np.full((total_frames, 256), background, dtype=np.float32)
         bins_per_band = 8
@@ -29,6 +31,12 @@ class CompararEventoHelperTests(unittest.TestCase):
         start = peak_band * bins_per_band
         stop = start + bins_per_band
         fft[active_start:active_stop, start:stop] += envelope[:, None] * np.float32(peak_gain)
+        if broadband_noise > 0.0:
+            rng = np.random.default_rng(0)
+            fft += rng.uniform(0.0, broadband_noise, size=fft.shape).astype(np.float32)
+        if striped_noise > 0.0:
+            rng = np.random.default_rng(1)
+            fft += rng.uniform(0.0, striped_noise, size=(total_frames, 1)).astype(np.float32)
         return fft
 
     def test_window_mean_helpers_match_naive_reference(self):
@@ -71,6 +79,8 @@ class CompararEventoHelperTests(unittest.TestCase):
         self.assertLessEqual(template.stop_frame, 28)
         self.assertGreaterEqual(template.frame_count, 8)
         self.assertLessEqual(template.frame_count, 24)
+        self.assertEqual(template.band_frames_salience.shape[0], template.frame_count)
+        self.assertGreater(float(np.max(template.band_frames_salience)), 0.0)
 
     def test_score_history_against_template_prefers_matching_signal(self):
         cfg = comparar_evento_module.DirectComparatorConfig(
@@ -114,6 +124,112 @@ class CompararEventoHelperTests(unittest.TestCase):
 
         self.assertEqual(result.valid_windows, 0)
         self.assertLess(result.score, 0.05)
+
+    def test_score_history_against_template_rejects_broadband_noise_with_matching_envelope(self):
+        cfg = comparar_evento_module.DirectComparatorConfig(
+            absolute_threshold=0.70,
+            max_search_frames=64,
+            max_reference_frames=24,
+        )
+        reference_fft = self._make_fft_pattern(
+            peak_band=6,
+            broadband_noise=4.0,
+            striped_noise=2.0,
+        )
+        template = comparar_evento_module.build_reference_template(reference_fft, config=cfg)
+
+        matching_history = np.concatenate(
+            [
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(
+                    peak_band=6,
+                    total_frames=32,
+                    active_start=8,
+                    active_stop=24,
+                    peak_gain=18.0,
+                    broadband_noise=4.0,
+                    striped_noise=2.0,
+                ),
+            ],
+            axis=0,
+        )
+        broadband_distractor = np.concatenate(
+            [
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(
+                    peak_band=6,
+                    total_frames=32,
+                    active_start=8,
+                    active_stop=24,
+                    peak_gain=0.0,
+                    broadband_noise=8.0,
+                    striped_noise=6.0,
+                ),
+            ],
+            axis=0,
+        )
+
+        matching = comparar_evento_module.score_history_against_template(matching_history, template, config=cfg)
+        distractor = comparar_evento_module.score_history_against_template(broadband_distractor, template, config=cfg)
+
+        self.assertGreater(matching.score, cfg.absolute_threshold)
+        self.assertLess(distractor.score, cfg.absolute_threshold)
+        self.assertGreater(matching.score, distractor.score + 0.20)
+        self.assertGreater(matching.dominant_score, distractor.dominant_score + 0.20)
+
+    def test_score_history_against_template_handles_heavy_noise_with_band_floor_rejection(self):
+        cfg = comparar_evento_module.DirectComparatorConfig(
+            absolute_threshold=0.45,
+            max_search_frames=64,
+            max_reference_frames=24,
+            noise_floor_percentile=25.0,
+            salience_floor_percentile=40.0,
+        )
+        reference_fft = self._make_fft_pattern(
+            peak_band=6,
+            broadband_noise=6.0,
+            striped_noise=4.0,
+        )
+        template = comparar_evento_module.build_reference_template(reference_fft, config=cfg)
+
+        matching_history = np.concatenate(
+            [
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(
+                    peak_band=6,
+                    total_frames=32,
+                    active_start=8,
+                    active_stop=24,
+                    peak_gain=18.0,
+                    broadband_noise=6.0,
+                    striped_noise=4.0,
+                ),
+            ],
+            axis=0,
+        )
+        broadband_distractor = np.concatenate(
+            [
+                np.full((24, 256), 0.4, dtype=np.float32),
+                self._make_fft_pattern(
+                    peak_band=6,
+                    total_frames=32,
+                    active_start=8,
+                    active_stop=24,
+                    peak_gain=0.0,
+                    broadband_noise=10.0,
+                    striped_noise=8.0,
+                ),
+            ],
+            axis=0,
+        )
+
+        matching = comparar_evento_module.score_history_against_template(matching_history, template, config=cfg)
+        distractor = comparar_evento_module.score_history_against_template(broadband_distractor, template, config=cfg)
+
+        self.assertGreater(matching.score, cfg.absolute_threshold)
+        self.assertLess(distractor.score, cfg.absolute_threshold)
+        self.assertGreater(matching.score, distractor.score + 0.25)
+        self.assertGreater(matching.dominant_score, distractor.dominant_score + 0.15)
 
 
 if __name__ == "__main__":

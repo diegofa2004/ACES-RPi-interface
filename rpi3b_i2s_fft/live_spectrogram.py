@@ -449,14 +449,14 @@ def main() -> int:
     parser.add_argument(
         "--smooth-frames",
         type=int,
-        default=1,
+        default=4,
         help="Temporal averaging window applied before display (1 keeps true frame-to-frame sharpness)",
     )
     parser.add_argument("--fps", type=float, default=12.0, help="Maximum redraw rate of the GUI/PNG output")
     parser.add_argument(
         "--dynamic-range-db",
         type=float,
-        default=70.0,
+        default=50.0,
         help="Automatic spectrogram color range in dB when --min-db is not specified",
     )
     parser.add_argument("--min-db", type=float, default=None, help="Fixed minimum dB shown on the plots")

@@ -29,10 +29,12 @@ class LiveSpectrogramTests(unittest.TestCase):
             max_freq=1.0,
             step_hz=1.0,
             history_seconds=2.0,
+            frame_duration_seconds=1.0,
             dynamic_range_db=40.0,
             min_db=None,
             max_db=None,
             smoothed_frames=1,
+            freq_scale="linear",
         )
 
         x_limits = spectrum_ax.get_xlim()

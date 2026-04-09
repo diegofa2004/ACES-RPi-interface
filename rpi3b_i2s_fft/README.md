@@ -190,7 +190,10 @@ cd rpi3b_i2s_fft
 
 This viewer does not depend on `fft.npy`; it reads the live device directly, keeps a
 rolling history window, and shows both the latest spectrum and the spectrogram.
+The default live profile now uses `--smooth-frames 4` and `--dynamic-range-db 50`
+to stay closer to the readability of `plotFFT.py`.
 For sharper time response, reduce `--smooth-frames` to `1`.
+For a rawer, more noise-revealing floor view, increase `--dynamic-range-db`.
 For a headless Raspberry Pi session, add `--backend Agg`; the script will keep updating
 `live_spectrogram_latest.png`.
 

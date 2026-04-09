@@ -29,7 +29,7 @@ class VerifyTransportStreamTests(unittest.TestCase):
         cfg = TaggedTransportConfig(frame_bins=4, useful_bins=4, bfpexp_pairs_required=1)
         line = (
             f"{_pair_line(512, 2, 1, 2).strip()} "
-            "kind=fft pkt=512/512 tag=fft/fft bin=0/0\n"
+            "dec=1/2 kind=fft pkt=512/512 tag=fft/fft bin=0/0\n"
         )
 
         summary = analyze_tagged_hex_stream([line], cfg, print_limit=0, printer=lambda _line: None)
