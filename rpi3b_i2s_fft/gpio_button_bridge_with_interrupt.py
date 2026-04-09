@@ -1,5 +1,6 @@
 import argparse
 import select
+import threading
 import time
 from pathlib import Path
 
@@ -8,16 +9,21 @@ try:
 except ImportError:  # pragma: no cover - optional dependency on target device
     gpiod = None
 
+try:
+    import RPi.GPIO as rpi_gpio  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency on target device
+    rpi_gpio = None
+
 
 DEFAULT_TRIGGER_FILE = Path(__file__).resolve().parent / "record_button.trigger"
 
 
 class GPIOButtonInterruptInput:
     def __init__(self, chip_path: str, line_offset: int):
-        if gpiod is None:
+        if gpiod is None and rpi_gpio is None:
             raise RuntimeError(
-                "GPIO button requested but python gpiod is not installed. "
-                "Install python3-libgpiod on the Raspberry Pi."
+                "GPIO button requested but neither RPi.GPIO nor python gpiod is installed. "
+                "Install RPi.GPIO or python3-libgpiod on the Raspberry Pi."
             )
 
         self.chip_path = chip_path
@@ -26,8 +32,28 @@ class GPIOButtonInterruptInput:
         self._line_request = None
         self._line = None
         self._gpio_api = None
+        self._edge_event = threading.Event()
+        self._edge_count = 0
+        self._edge_lock = threading.Lock()
+
+    def _on_rpi_gpio_edge(self, _channel: int) -> None:
+        with self._edge_lock:
+            self._edge_count += 1
+        self._edge_event.set()
 
     def open(self) -> None:
+        if rpi_gpio is not None:
+            rpi_gpio.setwarnings(False)
+            rpi_gpio.setmode(rpi_gpio.BCM)
+            rpi_gpio.setup(self.line_offset, rpi_gpio.IN)
+            rpi_gpio.add_event_detect(
+                self.line_offset,
+                rpi_gpio.BOTH,
+                callback=self._on_rpi_gpio_edge,
+            )
+            self._gpio_api = "rpi_gpio"
+            return
+
         chip = gpiod.Chip(self.chip_path)
         self._gpio_chip = chip
 
@@ -62,6 +88,9 @@ class GPIOButtonInterruptInput:
         self._gpio_api = "v1"
 
     def read_active(self) -> bool:
+        if self._gpio_api == "rpi_gpio":
+            return bool(rpi_gpio.input(self.line_offset)) if rpi_gpio is not None else False
+
         if self._gpio_api == "v1":
             if self._line is None:
                 return False
@@ -74,6 +103,9 @@ class GPIOButtonInterruptInput:
         return value == line_module.Value.ACTIVE
 
     def wait_for_edge(self, timeout_seconds: float) -> bool:
+        if self._gpio_api == "rpi_gpio":
+            return bool(self._edge_event.wait(timeout_seconds))
+
         if self._gpio_api == "v1":
             if self._line is None:
                 return False
@@ -97,6 +129,13 @@ class GPIOButtonInterruptInput:
         return bool(readable)
 
     def read_edge_events(self) -> int:
+        if self._gpio_api == "rpi_gpio":
+            with self._edge_lock:
+                count = self._edge_count
+                self._edge_count = 0
+                self._edge_event.clear()
+                return count
+
         if self._gpio_api == "v1":
             if self._line is None:
                 return 0
@@ -117,6 +156,20 @@ class GPIOButtonInterruptInput:
         return 0
 
     def close(self) -> None:
+        if self._gpio_api == "rpi_gpio" and rpi_gpio is not None:
+            try:
+                rpi_gpio.remove_event_detect(self.line_offset)
+            except RuntimeError:
+                pass
+            cleanup = getattr(rpi_gpio, "cleanup", None)
+            if callable(cleanup):
+                cleanup(self.line_offset)
+            self._edge_event.clear()
+            with self._edge_lock:
+                self._edge_count = 0
+            self._gpio_api = None
+            return
+
         if self._line_request is not None:
             release = getattr(self._line_request, "release", None)
             if callable(release):
