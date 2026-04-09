@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,25 @@ from tests.test_support import pack_raw_pairs, pack_tagged_pairs, pack_tagged_wo
 
 
 class AnalyzerFromFPGAFFTTests(unittest.TestCase):
+    def test_similarity_gpio_bridge_drives_led_and_releases_it_on_close(self):
+        fake_led = mock.Mock()
+
+        with mock.patch.object(analyzer_from_fpga_fft, "GPIOLedOutput", return_value=fake_led):
+            bridge = analyzer_from_fpga_fft.SimilarityGPIOBridge(
+                "/dev/gpiochip0",
+                24,
+                False,
+                0.0,
+            )
+            bridge.open()
+            bridge.set_active(True)
+            bridge.set_active(False)
+            bridge.close()
+
+        fake_led.open.assert_called_once()
+        self.assertEqual(fake_led.set_active.call_args_list, [mock.call(True), mock.call(False)])
+        fake_led.close.assert_called_once()
+
     def test_resolve_sync_cli_defaults_prefers_strict_defaults(self):
         args = SimpleNamespace(
             sync_mode=None,

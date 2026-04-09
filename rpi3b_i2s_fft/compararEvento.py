@@ -2,7 +2,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -442,7 +442,14 @@ def _write_similarity_state(active: bool) -> None:
     os.replace(SIMILARITY_STATE_TMP_FILENAME, SIMILARITY_STATE_FILENAME)
 
 
-def compararEvento(buffer2, buffer4, lock, get_lastEventTime, config: Optional[DirectComparatorConfig] = None):
+def compararEvento(
+    buffer2,
+    buffer4,
+    lock,
+    get_lastEventTime,
+    config: Optional[DirectComparatorConfig] = None,
+    similarity_callback: Optional[Callable[[bool], None]] = None,
+):
     del buffer2
     cfg = config or DirectComparatorConfig()
 
@@ -478,6 +485,8 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime, config: Optional[D
             if similarity_state is not False:
                 _write_similarity_state(False)
                 similarity_state = False
+                if similarity_callback is not None:
+                    similarity_callback(False)
 
             print(
                 f"referencia atualizada: frames={template.frame_count} "
@@ -529,8 +538,12 @@ def compararEvento(buffer2, buffer4, lock, get_lastEventTime, config: Optional[D
             if similarity_state is not True:
                 _write_similarity_state(True)
                 similarity_state = True
+                if similarity_callback is not None:
+                    similarity_callback(True)
         else:
             detectando = False
             if similarity_state is not False:
                 _write_similarity_state(False)
                 similarity_state = False
+                if similarity_callback is not None:
+                    similarity_callback(False)

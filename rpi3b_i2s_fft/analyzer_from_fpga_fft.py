@@ -41,6 +41,8 @@ try:
         resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
+    from .gpio_button_bridge_with_interrupt import GPIOButtonInterruptInput
+    from .led_sinal_igual import GPIOLedOutput
 except ImportError:
     from compararEvento import DirectComparatorConfig, compararEvento
     from fpga_fft_adapter import (
@@ -71,6 +73,8 @@ except ImportError:
         resolve_helper_tagged_realign_options,
         resolve_audio_device,
     )
+    from gpio_button_bridge_with_interrupt import GPIOButtonInterruptInput
+    from led_sinal_igual import GPIOLedOutput
 
 
 DEFAULT_AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE") or AUTO_AUDIO_DEVICE
@@ -89,6 +93,49 @@ DEFAULT_DEBUG_CAPTURE_SECONDS = 10.0
 DEFAULT_DEBUG_CHUNK_PAIRS = 1024
 DEFAULT_DEBUG_PREVIEW_PAIRS = 12
 DEBUG_BYTES_PER_PAIR = 8
+
+
+class SimilarityGPIOBridge:
+    def __init__(self, chip_path: str, line_offset: int, active_low: bool, hold_seconds: float):
+        self._led = GPIOLedOutput(chip_path, line_offset, active_low)
+        self._hold_seconds = max(0.0, float(hold_seconds))
+        self._lock = threading.Lock()
+        self._active = False
+        self._last_on_time = 0.0
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def open(self) -> None:
+        self._led.open()
+        if self._hold_seconds > 0.0:
+            self._thread = threading.Thread(target=self._hold_loop, daemon=True)
+            self._thread.start()
+
+    def set_active(self, active: bool) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if active:
+                self._last_on_time = now
+            if active == self._active:
+                return
+            self._led.set_active(active)
+            self._active = active
+
+    def _hold_loop(self) -> None:
+        while not self._stop_event.wait(0.05):
+            with self._lock:
+                should_drop = self._active and (time.monotonic() - self._last_on_time) >= self._hold_seconds
+            if should_drop:
+                self.set_active(False)
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        with self._lock:
+            self._active = False
+        self._led.close()
 
 
 def save_event_snapshot(evento: np.ndarray, fft: np.ndarray) -> None:
@@ -1091,6 +1138,40 @@ def main() -> int:
     )
     parser.add_argument("--frame-bins", type=int, default=512, help="Complex bins per FPGA FFT frame")
     parser.add_argument("--useful-bins", type=int, default=256, help="Bins kept for similarity")
+    parser.add_argument(
+        "--record-button-line",
+        type=int,
+        default=None,
+        help="GPIO input line that triggers event recording directly from the analyzer",
+    )
+    parser.add_argument(
+        "--record-button-active-low",
+        action="store_true",
+        help="Treat the record button as pressed when the GPIO input is low",
+    )
+    parser.add_argument(
+        "--record-button-debounce-ms",
+        type=float,
+        default=250.0,
+        help="Minimum time between GPIO button recording triggers",
+    )
+    parser.add_argument(
+        "--similarity-led-line",
+        type=int,
+        default=None,
+        help="GPIO output line driven high while the comparator sees a similar sound",
+    )
+    parser.add_argument(
+        "--similarity-led-active-low",
+        action="store_true",
+        help="Use this when the similarity LED turns on with a low GPIO level",
+    )
+    parser.add_argument(
+        "--similarity-led-hold-seconds",
+        type=float,
+        default=0.0,
+        help="Keep the similarity LED on for at least this many seconds after detection",
+    )
     parser.add_argument("--gpio-chip", default="/dev/gpiochip0", help="GPIO chip used for handshake")
     parser.add_argument(
         "--bfpexp-flag-line",
@@ -1289,6 +1370,14 @@ def main() -> int:
         parser.error("--frame-bins must fit inside the FFT packet-index range")
     if not 2 <= args.useful_bins <= args.frame_bins:
         parser.error("--useful-bins must satisfy 2 <= useful-bins <= frame-bins")
+    if args.record_button_line is not None and args.record_button_line < 0:
+        parser.error("--record-button-line must be non-negative")
+    if args.record_button_debounce_ms < 0.0:
+        parser.error("--record-button-debounce-ms must be non-negative")
+    if args.similarity_led_line is not None and args.similarity_led_line < 0:
+        parser.error("--similarity-led-line must be non-negative")
+    if args.similarity_led_hold_seconds < 0.0:
+        parser.error("--similarity-led-hold-seconds must be non-negative")
     if args.payload_bits <= 0:
         parser.error("--payload-bits must be positive")
     if args.packet_index_bits <= 0:
@@ -1474,6 +1563,34 @@ def main() -> int:
 
             time.sleep(0.10)
 
+    gpio_button = None
+    similarity_led = None
+
+    def watch_record_button_gpio() -> None:
+        assert gpio_button is not None
+        debounce_seconds = args.record_button_debounce_ms / 1000.0
+        last_pressed = (not gpio_button.read_active()) if args.record_button_active_low else gpio_button.read_active()
+        last_trigger_time = 0.0
+
+        while True:
+            if not gpio_button.wait_for_edge(1.0):
+                continue
+
+            gpio_button.read_edge_events()
+            raw_active = gpio_button.read_active()
+            pressed = (not raw_active) if args.record_button_active_low else raw_active
+            now = time.monotonic()
+
+            if pressed and (not last_pressed) and ((now - last_trigger_time) >= debounce_seconds):
+                if trigger_recording("gpio_button_irq"):
+                    last_trigger_time = now
+
+            last_pressed = pressed
+
+    def handle_similarity_state(active: bool) -> None:
+        if similarity_led is not None:
+            similarity_led.set_active(active)
+
     rx = FPGAFFTReceiver(cfg)
     try:
         rx.start()
@@ -1481,11 +1598,45 @@ def main() -> int:
         print(str(exc), flush=True)
         return 1
 
+    if args.record_button_line is not None:
+        try:
+            gpio_button = GPIOButtonInterruptInput(args.gpio_chip, args.record_button_line)
+            gpio_button.open()
+        except RuntimeError as exc:
+            rx.stop()
+            print(str(exc), flush=True)
+            return 1
+
+    if args.similarity_led_line is not None:
+        try:
+            similarity_led = SimilarityGPIOBridge(
+                args.gpio_chip,
+                args.similarity_led_line,
+                args.similarity_led_active_low,
+                args.similarity_led_hold_seconds,
+            )
+            similarity_led.open()
+        except RuntimeError as exc:
+            if gpio_button is not None:
+                gpio_button.close()
+            rx.stop()
+            print(str(exc), flush=True)
+            return 1
+
     threading.Thread(target=toggle_recording, daemon=True).start()
     threading.Thread(target=watch_record_trigger, daemon=True).start()
+    if gpio_button is not None:
+        threading.Thread(target=watch_record_button_gpio, daemon=True).start()
     threading.Thread(
         target=compararEvento,
-        args=(buffers["history_mfcc"], buffers["history_fft"], lock, lambda: state["last_event_time"], compare_config),
+        args=(
+            buffers["history_mfcc"],
+            buffers["history_fft"],
+            lock,
+            lambda: state["last_event_time"],
+            compare_config,
+            handle_similarity_state,
+        ),
         daemon=True,
     ).start()
 
@@ -1530,6 +1681,16 @@ def main() -> int:
         f"Comparator FFT floor: min_db={compare_config.min_db} dynamic_range_db={compare_config.dynamic_range_db}",
         flush=True,
     )
+    if gpio_button is not None:
+        print(
+            f"GPIO record button: chip={args.gpio_chip} line={args.record_button_line} active_low={bool(args.record_button_active_low)} debounce_ms={args.record_button_debounce_ms:.1f}",
+            flush=True,
+        )
+    if similarity_led is not None:
+        print(
+            f"GPIO similarity LED: chip={args.gpio_chip} line={args.similarity_led_line} active_low={bool(args.similarity_led_active_low)} hold={args.similarity_led_hold_seconds:.2f}s",
+            flush=True,
+        )
     print("Press ENTER to save an event like the pyserial flow.", flush=True)
     print(f"External record trigger file: {RECORD_TRIGGER_FILENAME}", flush=True)
     print("Comparison starts after a reference event is saved and the 15 s cooldown ends.", flush=True)
@@ -1563,6 +1724,10 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Stopping...", flush=True)
     finally:
+        if similarity_led is not None:
+            similarity_led.close()
+        if gpio_button is not None:
+            gpio_button.close()
         rx.stop()
 
     return 0

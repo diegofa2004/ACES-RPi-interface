@@ -39,6 +39,14 @@ Optional GPIO handshake wires (if used):
 - FPGA BFPEXP flag output -> RPi GPIO23 (pin 16) input
 - RPi GPIO24 (pin 18) output -> FPGA DONE input
 
+Optional local UI GPIO wires on the Raspberry Pi:
+
+- Push button -> RPi GPIO25 (pin 22) input for event recording trigger
+- Similarity LED -> RPi GPIO16 (pin 36) output for match indication
+- LED series resistor -> 220 ohm to 1 kohm recommended
+- Button wiring:
+  configure either external pull-up/pull-down in hardware, or use a wiring scheme where pressed/not-pressed logic is well defined for the selected `--record-button-active-low` setting
+
 Backup GPIO options (if 23/24 are unavailable):
 
 - GPIO25 (pin 22)
@@ -164,9 +172,42 @@ What happens in Terminal 1:
 
 1. The script starts reading FPGA FFT frames from I2S.
 2. It fills the circular buffers used by the local `compararEvento`.
-3. Press `Enter` once to save a reference event into `evento.npy` and `fft.npy`.
+3. Press `Enter` once, touch `record_button.trigger`, or press the configured GPIO record button to save a reference event into `evento.npy` and `fft.npy`.
 4. After the save, `compararEvento` waits for its built-in cooldown of 15 seconds.
 5. When the cooldown ends, comparison starts automatically as new frames keep arriving.
+
+### GPIO button + LED directly from the analyzer
+
+The analyzer can now read a local Raspberry Pi button through GPIO edge interrupts
+and can also drive a local GPIO LED when the live sound is considered similar to
+the saved event.
+
+Recommended example:
+
+```bash
+cd rpi3b_i2s_fft
+.venv/bin/python analyzer_from_fpga_fft.py \
+    --strict-sync -r 48828 --frame-bins 512 --useful-bins 256 \
+    --capture-backend alsa-c \
+    --record-button-line 25 --record-button-active-low --record-button-debounce-ms 250 \
+    --similarity-led-line 16 --similarity-led-hold-seconds 1.5
+```
+
+What these options do:
+
+- `--record-button-line`: GPIO input line used to arm event recording
+- `--record-button-active-low`: interpret a low input level as "button pressed"
+- `--record-button-debounce-ms`: debounce window applied to button presses
+- `--similarity-led-line`: GPIO output line that turns on when a similarity hit is active
+- `--similarity-led-active-low`: use this if your LED wiring turns on when the GPIO output goes low
+- `--similarity-led-hold-seconds`: minimum ON time after the last detection
+
+Important notes:
+
+- The button path uses GPIO edge interrupts, so it does not depend on a polling loop for normal operation.
+- The analyzer still supports `Enter` and the `record_button.trigger` file; the GPIO button is an additional trigger path, not a replacement.
+- The LED output is driven directly by the comparison state inside the analyzer, while `similaridade.flag` is still written for compatibility with the standalone monitor script.
+- If `python3-libgpiod` is not visible inside `.venv`, recreate the virtualenv with `--system-site-packages` or make the module available to that environment.
 
 Terminal 2 (optional, recommended when you want visualization):
 
